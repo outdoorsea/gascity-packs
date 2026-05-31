@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gastownhall/gascity/examples/slack/schema/rig_mappings.schema.json",
+  "title": "slack rig_mappings.json",
+  "description": "Authoritative schema for the Slack rig mapping registry persisted at <cityPath>/.gc/slack/rig_mappings.json. The on-disk JSON is the only contract between the gc CLI (writer, via 'gc slack map-rig') and the slack adapter (reader, via /slack/interactions). Composite primary key is the JSON object key, formatted '<workspace_id>:<rig_name>'. Per-channel mappings written by 'gc slack map-channel' (channel_mappings.json) take precedence over rig defaults; channel mapping wins. The adapter loads this file at startup and re-reads on SIGHUP (cby.23) — operators send `pkill -HUP gc-slack-adapter` (or restart the service) to pick up new bindings.",
+  "type": "object",
+  "additionalProperties": { "$ref": "#/$defs/slackRigMappingRecord" },
+  "$defs": {
+    "slackRigMappingRecord": {
+      "type": "object",
+      "required": ["workspace_id", "rig_name", "created_at", "updated_at"],
+      "anyOf": [
+        { "properties": { "channel_ids": { "type": "array", "minItems": 1 } }, "required": ["channel_ids"] },
+        { "properties": { "channel_patterns": { "type": "array", "minItems": 1 } }, "required": ["channel_patterns"] }
+      ],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "description": "Slack workspace (team) id, e.g. T0123456. Required component of the composite key."
+        },
+        "rig_name": {
+          "type": "string",
+          "description": "Operator-supplied rig name. Required component of the composite key. Must not contain whitespace, control characters, or path separators (/, \\)."
+        },
+        "channel_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "description": "Sorted, deduplicated list of Slack channel ids the rig owns. The adapter builds an inverted index (channel → rig) at load time so slash-command resolution is O(1). A channel may only appear in one rig record at a time within this store. Either channel_ids or channel_patterns (or both) must be non-empty."
+        },
+        "channel_patterns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9_*?\\[\\]^!-]+$",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "Sorted, deduplicated list of glob patterns matched against Slack channel NAMES (path.Match syntax restricted to a-z, 0-9, '-', '_', and the metacharacters * ? [ ] ^ !). The runtime resolver that matches names against patterns ships with the slash-command intake bead — for now this field is persisted, validated, and surfaced in `gc slack status`, but no resolver tier consumes it. Either channel_ids or channel_patterns (or both) must be non-empty."
+        },
+        "sling_target": {
+          "type": "string",
+          "description": "Qualified agent name of the form '<rig>/<role>' (e.g. 'mission-control/polecat') that the slack adapter passes to `gc sling --target` when dispatching for this rig. Optional in the schema for legacy-record tolerance: records written before cby.18.a omit this field. Required at use time — the adapter's resolver returns a fix-it error directing the operator to re-run `gc slack map-rig --sling-target ...` when this is empty. Role names are operator-supplied (ZFC: never hardcoded in Go)."
+        },
+        "fix_formula": {
+          "type": "string",
+          "description": "Molecule name the adapter spawns when this rig handles an inbound interaction (e.g. 'mol-slack-fix-issue'). Optional. The dispatch handler may fall back to a config-driven default when empty."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC3339 timestamp of the first successful binding for this composite key. Idempotent re-binds preserve this value."
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC3339 timestamp of the most recent successful binding for this composite key. Idempotent re-binds advance this in place."
+        }
+      }
+    }
+  }
+}

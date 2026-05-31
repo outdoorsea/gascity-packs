@@ -1,6 +1,6 @@
 ## Summary
 
-Adds `slack-pack` as a top-level pack alongside `discord` and `pr-review`.
+Adds `slack` as a top-level pack alongside `discord` and `pr-review`.
 After this lands, a city can wire Slack into its session graph by adding
 one stanza to `city.toml` and provisioning a small env file — no gascity
 binary changes required.
@@ -8,7 +8,7 @@ binary changes required.
 ## What the pack provides
 
 ```
-slack-pack/
+slack/
 ├── pack.toml          slack [[service]] (proxy_process)
 ├── adapter/           Slack ↔ gc HTTP/UDS bridge (Go module)
 ├── cli/               gc slack <verb> implementations (Go module)
@@ -45,9 +45,9 @@ a live Slack workspace or just build + test the pack standalone.
 ### Path A — build + test the pack standalone
 
 ```bash
-git clone -b feat/import-slack-pack \
+git clone -b feat/import-slack \
     https://github.com/sjarmak/gascity-packs.git
-cd gascity-packs/slack-pack
+cd gascity-packs/slack
 
 ( cd cli && go build -o gc-slack-cli . && go test -race ./... )
 ( cd adapter && go build -o gc-slack-adapter . && go test ./... )
@@ -64,14 +64,14 @@ python3 -m pytest tests/
 ```toml
 # In <your-city>/city.toml
 [imports.slack]
-source = "/abs/path/to/your/clone/of/gascity-packs/slack-pack"
+source = "/abs/path/to/your/clone/of/gascity-packs/slack"
 ```
 
 **2. Build the adapter binary into the pack tree** (the slack `[[service]]`
 expects `./adapter/gc-slack-adapter` relative to the pack root):
 
 ```bash
-cd /abs/path/to/your/clone/of/gascity-packs/slack-pack/adapter
+cd /abs/path/to/your/clone/of/gascity-packs/slack/adapter
 go build -o gc-slack-adapter .
 ```
 
@@ -147,13 +147,13 @@ plain Go binary — `set -a; source ~/.config/gc-slack-adapter/env; set +a;
 
 ## Test plan
 
-- [x] `cd slack-pack/cli && go build ./...` clean
-- [x] `cd slack-pack/cli && go vet ./...` clean
-- [x] `cd slack-pack/cli && go test -race ./...` (8 packages, all PASS)
-- [x] `cd slack-pack/cli && go mod tidy` no-op (no diff)
-- [x] `cd slack-pack/adapter && go build ./...` clean
-- [x] `cd slack-pack/adapter && go vet ./...` clean
-- [x] `cd slack-pack/adapter && go test ./...` PASS (full -race suite)
+- [x] `cd slack/cli && go build ./...` clean
+- [x] `cd slack/cli && go vet ./...` clean
+- [x] `cd slack/cli && go test -race ./...` (8 packages, all PASS)
+- [x] `cd slack/cli && go mod tidy` no-op (no diff)
+- [x] `cd slack/adapter && go build ./...` clean
+- [x] `cd slack/adapter && go vet ./...` clean
+- [x] `cd slack/adapter && go test ./...` PASS (full -race suite)
 - [x] `python3 -m pytest tests/ -x` (57 tests across 7 files PASS)
 - [x] All six `commands/<cmd>.sh` wrappers smoke-pass against
       `gc-slack-cli --help` (post-message, import-app, sync-commands,

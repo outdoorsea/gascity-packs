@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gastownhall/gascity/examples/slack/schema/apps.schema.json",
+  "title": "slack apps.json",
+  "description": "Authoritative schema for the Slack app registry persisted at <cityPath>/.gc/slack/apps.json. The on-disk JSON is the only contract between the gc CLI (writer) and the slack adapter (reader); both sides duplicate a small struct mirroring this schema. Composite primary key is the JSON object key, formatted '<workspace_id>:<app_id>'.",
+  "type": "object",
+  "additionalProperties": { "$ref": "#/$defs/slackAppRecord" },
+  "$defs": {
+    "slackAppRecord": {
+      "type": "object",
+      "required": ["workspace_id", "app_id", "imported_at"],
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "description": "Slack workspace (team) id, e.g. T0123456. Required component of the composite key."
+        },
+        "app_id": {
+          "type": "string",
+          "description": "Slack app id, e.g. A0123456. Assigned by Slack post-create. Required component of the composite key."
+        },
+        "bot_user_id": {
+          "type": "string",
+          "description": "Bot user id, e.g. U0123456. Optional at import time; populated post-OAuth (gc-cby.9)."
+        },
+        "display_name": {
+          "type": "string",
+          "description": "Display name from manifest.display_information.name."
+        },
+        "scopes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Bot scopes declared in manifest.oauth_config.scopes.bot. The slack adapter requires: commands, chat:write, chat:write.customize, channels:history, groups:history, im:history, mpim:history, files:read, files:write, reactions:write."
+        },
+        "slash_commands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Slash command names (e.g. '/gc') extracted from manifest.features.slash_commands. Used by 'gc slack sync-commands' (gc-cby.2) to register with Slack."
+        },
+        "signing_secret": {
+          "type": "string",
+          "description": "Slack request-signing secret. Optional at import time; populated post-OAuth (gc-cby.9) or via an explicit set-signing-secret verb. Required by /slack/interactions request verification (gc-cby.5)."
+        },
+        "manifest_path": {
+          "type": "string",
+          "description": "Filesystem path the manifest was imported from. Informational only — the source of truth is manifest_raw."
+        },
+        "manifest_raw": {
+          "type": ["object", "string", "null"],
+          "description": "Raw manifest preserved verbatim so future readers can re-parse fields the current struct ignores. Type is intentionally permissive: encoded as a JSON object today, but kept open so a future on-disk format change (e.g. base64 string) does not require a schema migration. Forward-compat: unknown manifest fields are silently ignored at import; persisting the raw lets later beads opt into them without a migration."
+        },
+        "imported_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC3339 timestamp of the most recent successful import. Idempotent re-imports advance this in place — they do not create new entries."
+        }
+      }
+    }
+  }
+}
