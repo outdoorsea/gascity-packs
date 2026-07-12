@@ -153,13 +153,16 @@ gc bd list --status=open --json --limit=0
 Filter for beads with an assignee (skip unassigned beads). This pass does not
 solve the controller race where orphaned work may already have been released to
 open/unassigned before witness observes it; that requires a separate
-worktree-salvage scan keyed by `metadata.work_dir`. Bound Gastown polecat
-assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
+worktree-salvage scan, which must enumerate `git worktree list --porcelain` —
+NEVER `metadata.work_dir`, which does not resolve (see Step 2 and lc-0fz). Bound
+Gastown polecat assignees use the shape `<rig>/{{binding_prefix}}<polecat-suffix>`.
 
-Get the full session roster for liveness checks:
+Get the full session roster for liveness checks. Session beads live in the TOWN
+ledger, so the bead read MUST be scoped with `-C "$GC_CITY"` — un-scoped it
+resolves to the RIG ledger and returns `[]` with rc=0, silently (lc-vyb):
 ```bash
 gc session list --state=all --json
-gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
+gc bd -C "$GC_CITY" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0
 ```
 
 For each bead with an assignee, check **session-ID liveness** — NOT
