@@ -100,6 +100,10 @@ if [ -z "$CURRENT_WISP" ]; then
     echo "REFUSING TO BURN: $_wisp_n in_progress wisps for $GC_AGENT: $_wisp_cands" >&2
   fi
 fi
+# DO NOT "fix" this to `bd query` / ephemeral=true. It is only accidentally safe:
+# the query can never match, so the pour below always runs. Let it see this agent's
+# own `open` wisp and it elects that wisp its own successor, skips the pour, then
+# burns it -- zero wisps, and the agent never wakes again, silently. See lc-bp7.
 ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=wisp --limit=1 --json | jq -r '.[0].id // empty')
 if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
   NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')

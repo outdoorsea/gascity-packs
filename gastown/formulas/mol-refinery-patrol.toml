@@ -1057,8 +1057,9 @@ If the cycle ended early (conflict rejection, no work found), note
 why and what state was left.
 
 This summary is not stored separately — it lives in the wisp's
-closing reason. The next session can find it via `gc bd list --type=wisp
---status=closed --limit=5` if it needs predecessor context."""
+closing reason. The next session can find it via `gc bd query
+'ephemeral=true AND status=closed' --limit=5` if it needs predecessor context.
+(`bd list` cannot see wisps: they are ephemeral, and there is no `wisp` type.)"""
 
 [[steps]]
 id = "next-iteration"

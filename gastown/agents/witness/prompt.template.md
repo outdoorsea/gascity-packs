@@ -167,6 +167,10 @@ nothing).
 # molecules — filter --type=molecule, never --type=wisp.
 WISP_IDS=$(
   gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --limit=0 --json | jq -r '.[].id'
+  # DO NOT "fix" this to `bd query` / ephemeral=true. It is only accidentally safe:
+  # the query can never match, so the pour below always runs. Let it see this agent's
+  # own `open` wisp and it elects that wisp its own successor, skips the pour, then
+  # burns it -- zero wisps, and the agent never wakes again, silently. See lc-bp7.
   gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id'
 )
 WISP=$(printf '%s\n' $WISP_IDS | sed -n '1p')           # keep one (prefers in_progress)
@@ -210,6 +214,10 @@ fi
 # first and burn the surplus so wisps never accumulate. Wisp roots are
 # molecules (never --type=wisp, which is not a valid bd type and matches
 # nothing).
+# DO NOT "fix" this to `bd query` / ephemeral=true. It is only accidentally safe:
+# the query can never match, so the pour below always runs. Let it see this agent's
+# own `open` wisp and it elects that wisp its own successor, skips the pour, then
+# burns it -- zero wisps, and the agent never wakes again, silently. See lc-bp7.
 OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --limit=0 --json | jq -r '.[].id')
 ASSIGNED_WISP=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
 for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
