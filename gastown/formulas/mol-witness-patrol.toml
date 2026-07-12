@@ -187,46 +187,76 @@ a NEW session with a different ID — the old one never comes back.
      `session_name`, `alias`, and `agent_name` — the exact identifier forms
      an assignee may take.
 
+   The two sources are NOT interchangeable, and the difference is load-bearing
+   (lc-vyb):
+   - `gc session list` is the ONLY source that yields pool/polecat identities.
+     These are the identities the orphan predicate actually acts on.
+   - The session-BEAD source only ever yields infrastructure identities
+     (witness / refinery / control-dispatcher). Step 2 below SKIPS those. It is
+     a redundant cross-check, never the roster.
+
+   Session beads live in the TOWN ledger. `gc bd list` from an agent home
+   resolves to the RIG ledger, which contains zero `type=session` beads, so the
+   un-scoped form returns `[]` with rc=0 — silently. Scope it with `-C "$GC_CITY"`.
+
    Stream both JSON blobs through temp files, never `--argjson` on argv: on a
    busy city the session `command` fields are large and overflow ARG_MAX
    (`argument list too long: jq`). Build the map once:
    ```bash
    SESSIONS_FILE=$(mktemp); SESSION_BEADS_FILE=$(mktemp)
    gc session list --state=all --json > "$SESSIONS_FILE"
-   gc bd list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE"
+   echo '[]' > "$SESSION_BEADS_FILE"
+   if [ -n "${GC_CITY:-}" ]; then
+     gc bd -C "$GC_CITY" list --type=session --label=gc:session --include-infra --include-gates --all --json --limit=0 > "$SESSION_BEADS_FILE"
+   fi
 
-   LIVENESS_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" --slurpfile session_beads "$SESSION_BEADS_FILE" '
+   SESSION_MAP=$(jq -n --slurpfile sessions "$SESSIONS_FILE" '
      def add($m; $key; $state; $closed):
        if (($key // "") | length) == 0 then $m
        else $m + {($key): (if $closed then "closed" else ($state // "") end)}
        end;
-     (reduce ($sessions[0].sessions // [])[] as $s ({};
+     reduce ($sessions[0].sessions // [])[] as $s ({};
          add(.; $s.id;         $s.state; ($s.closed // false))
        | add(.; $s.name;       $s.state; ($s.closed // false))
        | add(.; $s.session_name; $s.state; ($s.closed // false))
        | add(.; $s.alias;      $s.state; ($s.closed // false))
        | add(.; $s.agent_name; $s.state; ($s.closed // false))
-     )) as $from_sessions
-     | reduce ($session_beads[0] // [])[] as $b ($from_sessions;
-         add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))')
+     )')
+
+   LIVENESS_MAP=$(printf '%s' "$SESSION_MAP" | jq --slurpfile session_beads "$SESSION_BEADS_FILE" '
+     def add($m; $key; $state; $closed):
+       if (($key // "") | length) == 0 then $m
+       else $m + {($key): (if $closed then "closed" else ($state // "") end)}
+       end;
+     reduce ($session_beads[0] // [])[] as $b (.;
+       add(.; $b.metadata.configured_named_identity; $b.metadata.state; ($b.status == "closed")))')
 
    SESSION_COUNT=$(jq -r '(.sessions // []) | length' "$SESSIONS_FILE")
-   MAP_COUNT=$(printf '%s' "$LIVENESS_MAP" | jq -r 'length')
+   SESSION_MAP_COUNT=$(printf '%s' "$SESSION_MAP" | jq -r 'length')
    rm -f "$SESSIONS_FILE" "$SESSION_BEADS_FILE"
    ```
 
-   **Fail safe — never orphan on an empty map.** If the map is empty while
-   sessions exist, the schema has drifted again (the exact failure in
-   gc-3tn8g). An empty map resolves every assignee to `absent` and would
+   **Fail safe — never orphan on an empty session map.** If the SESSION-derived
+   map is empty while sessions exist, the schema has drifted again (the exact
+   failure in gc-3tn8g). Every assignee then resolves to `absent`, which would
    false-orphan live agents. ABORT recovery this cycle — do NOT classify any
    bead as orphaned — escalate, then continue to `check-refinery`:
    ```bash
-   if [ "${MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
-     echo "FAIL-SAFE: empty liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
+   if [ "${SESSION_MAP_COUNT:-0}" -eq 0 ] && [ "${SESSION_COUNT:-0}" -gt 0 ]; then
+     echo "FAIL-SAFE: empty session liveness map with $SESSION_COUNT live sessions — skipping orphan recovery (treat all assignees as live)."
      gc mail send mayor/ -s "WITNESS: orphan-recovery disabled — empty liveness map" -m "Built an empty assignee->state map from $SESSION_COUNT live sessions. gc session list --json schema likely drifted again (gc-3tn8g); skipping orphan recovery this cycle to avoid false-orphaning live agents. Re-check the recover-orphaned-beads liveness recipe."
      # Skip the rest of this step; proceed to check-refinery.
    fi
    ```
+
+   **Guard on SESSION_MAP_COUNT, never on the merged map's size.** The merged
+   map can be non-empty while containing ZERO pool identities — the session-bead
+   source alone supplies ~29 infra-only keys on this city. Keying the fail-safe
+   on the merged count therefore lets a `gc session list` schema drift sail
+   through a healthy-looking map that cannot match any polecat, and every live
+   polecat resolves `absent` -> orphaned -> its worktree is force-removed. A
+   non-empty map is not a loaded map. Only the session-derived half can clear
+   this gate.
 
    Resolve each bead's assignee against the prebuilt map:
    ```bash
@@ -257,12 +287,73 @@ lifecycle directly.
 The canonical work chain: `worktree → (push) → branch → (merge) → target`.
 Our job is to ensure work reaches the branch so it's schedulable.
 
-Read the bead metadata to find the worktree and branch:
+**Never resolve bead → directory out of bead metadata. Invert the lookup** (lc-0fz).
+Bead metadata has no `worktree` and no `branch` key at all — the old recipe read
+`.worktree` / `.branch`, which are ALWAYS empty. The real key is `gc.work_dir`,
+and even that records a bare bead-id path while the pool creates a SLUGIFIED
+directory, so the recorded path never exists either:
+
+    gc.work_dir = .../workers/<pool>/lc-ea9                         <- never exists
+    actual dir  = .../workers/<pool>/lc-ea9-verify-pre-flights-...  <- exists
+
+Every spelling therefore resolves to "no worktree", Case E fires unconditionally,
+and any uncommitted work in the real worktree is silently abandoned — at exactly
+the moment (a crashed polecat) when the worktree may hold the ONLY copy. Treat
+`gc.work_dir` as a HINT to be verified, never as authority.
+
+Enumerate ground truth from git, then match back to the bead. `git worktree list`
+run from ANY registered worktree lists them all, including the repo root:
 ```bash
-META=$(gc bd show <bead> --json | jq '.[0].metadata')
-WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
-BRANCH=$(echo "$META" | jq -r '.branch // empty')
+WT_DIRS=$(git -C "$RIG_ROOT" worktree list --porcelain | awk '/^worktree /{print $2}')
+
+# Ids that may name the dir: the bead itself, and the id inside the work_dir hint.
+# (The molecule root carries gc.work_dir, but the dir is named for the WORK bead —
+#  recovering lc-w7k must still find lc-ea9-<slug>/.)
+HINT=$(gc bd show <bead> --json | jq -r 'if type=="array" then .[0] else . end | .metadata."gc.work_dir" // empty')
+IDS=$(printf '%s\n%s\n' "<bead>" "$(basename "${HINT:-/}")" | grep -v '^/$' | sort -u)
+
+CANDIDATES=$(printf '%s' "$WT_DIRS" | while read -r d; do
+  b=$(basename "$d")
+  printf '%s' "$IDS" | while read -r id; do
+    [ -n "$id" ] || continue
+    case "$b" in "$id"|"$id"-*) echo "$d" ;; esac
+  done
+done | sort -u)
+N=$(printf '%s' "$CANDIDATES" | grep -c . || true)
 ```
+
+Classify on N — and **fail CLOSED when the worktree cannot be confidently
+attributed**. "Nothing to salvage" must be a fact you established, never a
+lookup you failed:
+
+| N | Meaning | Action |
+|---|---------|--------|
+| 0 | No registered worktree for this bead | Case E — genuinely nothing to salvage. Reset. |
+| 1 | Unambiguous | Salvage it (Cases A–D below). |
+| >1 | Ambiguous | **FAIL CLOSED** — skip, escalate, do NOT reset, do NOT remove. |
+
+```bash
+if [ "${N:-0}" -gt 1 ]; then
+  echo "AMBIGUOUS: bead <bead> matches $N worktrees — skipping salvage."
+  gc mail send mayor/ -s "WITNESS: ambiguous worktree for <bead>" -m "Bead <bead> matched $N registered worktrees; refusing to guess. No salvage, no reset, no removal. Needs a human."
+  # Skip this bead entirely. Do not fall through to Cases A-E.
+fi
+```
+
+Resolve the worktree and take the branch from **git**, never from metadata. Pool
+worktrees are recycled across cycles — a dir under `<pool>.brakeman/` can legally
+carry a `...fireman-...` branch — so the directory does not imply its owner and
+the branch must be read off the tree itself:
+```bash
+WORKTREE=$(printf '%s' "$CANDIDATES" | head -1)
+BRANCH=$(git -C "$WORKTREE" branch --show-current)   # empty when detached
+```
+
+Two branch guards before ANY push or removal:
+- **Detached HEAD** (`BRANCH` empty) → fail closed. Do not push, do not remove.
+- **`BRANCH` equals the base branch (`main`)** → this is NOT a feature branch.
+  Never push it and never delete a worktree on its account. Escalate instead.
+  (`gc.work_branch` is likewise `main` on these beads — it is not a feature branch.)
 
 Check the bead and worktree state, then act:
 
@@ -315,10 +406,15 @@ gc bd update <bead> --set-metadata branch=$BRANCH
 ```
 Skip to Step 3 (cleanup).
 
-**Case E: No worktree exists (`metadata.work_dir` missing or directory gone),
-no branch on origin.**
+**Case E: No worktree exists (N == 0 from the git enumeration above), no branch
+on origin.**
 Nothing to salvage. The bead goes back to pool and a new polecat
 starts fresh.
+
+Reach this case ONLY via `N == 0` — a bead that matched no *registered* worktree.
+Never reach it because a metadata path failed to resolve: that is the lc-0fz
+data-loss bug, where an unresolvable hint was read as positive evidence of
+absence and live work was reset out from under a crashed polecat.
 
 **Step 3: Verify work on main before resetting.**
 
