@@ -69,7 +69,16 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=wisp --limit=1 --json | jq -r '.[0].id // empty')
+  # wisps are ephemeral and `bd list` structurally excludes ephemerals (and there is
+  # no `wisp` bd type), so only `bd query` can see them. Do NOT copy this into the
+  # witness reconcile: it elects a successor by status and would burn its own (lc-bp7).
+  _wisp_cands=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" '[.[] | select((.assignee // "") == $id) | .id] | .[]')
+  _wisp_n=$(echo "$_wisp_cands" | awk 'NF' | wc -l | tr -d ' ')
+  if [ "$_wisp_n" -eq 1 ]; then
+    CURRENT_WISP=$(echo "$_wisp_cands" | awk 'NF' | head -1)
+  elif [ "$_wisp_n" -gt 1 ]; then
+    echo "REFUSING TO BURN: $_wisp_n in_progress wisps for $GC_AGENT: $_wisp_cands" >&2
+  fi
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
@@ -114,7 +123,16 @@ assign the next wisp, burn the current wisp, THEN request restart**:
 ```bash
 CURRENT_WISP=${GC_BEAD_ID:-}
 if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=wisp --limit=1 --json | jq -r '.[0].id // empty')
+  # wisps are ephemeral and `bd list` structurally excludes ephemerals (and there is
+  # no `wisp` bd type), so only `bd query` can see them. Do NOT copy this into the
+  # witness reconcile: it elects a successor by status and would burn its own (lc-bp7).
+  _wisp_cands=$(gc bd query --json 'ephemeral=true AND status=in_progress' --limit=0 | jq -r --arg id "$GC_AGENT" '[.[] | select((.assignee // "") == $id) | .id] | .[]')
+  _wisp_n=$(echo "$_wisp_cands" | awk 'NF' | wc -l | tr -d ' ')
+  if [ "$_wisp_n" -eq 1 ]; then
+    CURRENT_WISP=$(echo "$_wisp_cands" | awk 'NF' | head -1)
+  elif [ "$_wisp_n" -gt 1 ]; then
+    echo "REFUSING TO BURN: $_wisp_n in_progress wisps for $GC_AGENT: $_wisp_cands" >&2
+  fi
 fi
 NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
 if [ -z "$NEXT" ]; then
