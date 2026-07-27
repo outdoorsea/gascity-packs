@@ -243,8 +243,27 @@ if not verify < contained < metadata:
 PY
 }
 
+test_witness_salvage_reads_work_dir_metadata() {
+    # The polecat's branch-setup step records its worktree as `metadata.work_dir`
+    # (see agents/polecat/prompt.template.md). Salvage must read that same key.
+    # Reading `.worktree` yields an empty $WORKTREE for every bead, which makes
+    # Cases A-D unreachable and silently routes every orphan to Case E
+    # ("nothing to salvage"), discarding unpushed polecat work.
+    local formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+
+    grep -F "jq -r '.work_dir // empty'" "$formula" >/dev/null ||
+        fail "witness salvage must resolve the worktree from metadata.work_dir"
+    ! grep -F "jq -r '.worktree // empty'" "$formula" >/dev/null ||
+        fail "witness salvage must not regress to metadata.worktree; no bead carries that key"
+    # `gc.work_dir` is the rig root, not the bead's worktree — a plausible-looking
+    # but wrong "fix" that resolves to a non-existent path.
+    ! grep -F "jq -r '.gc.work_dir // empty'" "$formula" >/dev/null ||
+        fail "witness salvage must not read gc.work_dir; that is the rig root, not the worktree"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
+test_witness_salvage_reads_work_dir_metadata
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented

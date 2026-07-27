@@ -260,9 +260,15 @@ Our job is to ensure work reaches the branch so it's schedulable.
 Read the bead metadata to find the worktree and branch:
 ```bash
 META=$(gc bd show <bead> --json | jq '.[0].metadata')
-WORKTREE=$(echo "$META" | jq -r '.worktree // empty')
+WORKTREE=$(echo "$META" | jq -r '.work_dir // empty')
 BRANCH=$(echo "$META" | jq -r '.branch // empty')
 ```
+
+`work_dir` is the key the polecat actually writes in its branch-setup step —
+not `worktree`, and not the short form `gc.work_dir` (which resolves to the rig
+root, not the bead's worktree). Reading the wrong key yields an empty
+`$WORKTREE`, which silently routes every orphan to Case E and discards
+unpushed work.
 
 Check the bead and worktree state, then act:
 
