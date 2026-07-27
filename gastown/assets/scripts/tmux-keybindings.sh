@@ -25,9 +25,26 @@ fi
 # Make the wheel drive tmux copy-mode scrollback instead of leaking to the
 # focused app. Without this, "mouse on" (set in tmux-theme.sh) hands the wheel
 # to mouse-reporting TUIs — Claude Code scrolls its own history, a pager/shell
-# gets Up-arrows — and only a bare prompt reaches copy-mode. Force copy-mode
-# even over mouse-reporting apps (no mouse_any_flag check) so scrollback wins;
-# once in copy-mode the wheel passes through (-M) for normal scrolling, and -e
-# exits at the bottom. Shift+wheel still does native terminal selection.
-gcmux bind-key -T root WheelUpPane   if-shell -F -t= "#{pane_in_mode}" "send-keys -M" "copy-mode -e"
+# gets Up-arrows — and only a bare prompt reaches copy-mode; once in copy-mode
+# the wheel passes through (-M) for normal scrolling, and -e exits at the
+# bottom. Shift+wheel still does native terminal selection.
+#
+# LOCAL PATCH 2026-07-27 — mouse_any_flag check restored.
+# This line previously forced copy-mode over mouse-reporting apps too ("so
+# scrollback wins"). That intent is unreachable on the ALTERNATE SCREEN: a
+# full-screen TUI (Claude Code, vim, less) has no tmux scrollback by design, so
+# history_size is 0 and the forced copy-mode opens empty — the "[0/0], can't
+# scroll" symptom. Measured on a live Claude Code pane: alternate_on=1,
+# history_size=0, mouse_any_flag=1.
+#
+# These bindings are SERVER-GLOBAL and this script runs on every session
+# creation, so each new agent session re-applied the force to every pane on the
+# socket, including already-running ones.
+#
+# Kept as mouse_any_flag (not #{alternate_on}, which upstream PR #205 proposes)
+# deliberately: it must MATCH ~/.dotfiles/tmux/wheel.conf, which hooks re-source
+# on attach/session-created/pane-select. If the two predicates disagree,
+# behaviour depends on whichever fired last — the exact silent-drift hazard
+# wheel.conf's header warns about. Change both together or neither.
+gcmux bind-key -T root WheelUpPane   if-shell -F -t= "#{||:#{pane_in_mode},#{mouse_any_flag}}" "send-keys -M" "copy-mode -e"
 gcmux bind-key -T root WheelDownPane send-keys -M
