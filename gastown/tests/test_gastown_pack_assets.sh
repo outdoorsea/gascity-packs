@@ -203,15 +203,42 @@ PY
     ! printf '%s\n' "$direct_block" | grep -E '^[[:space:]]*git checkout \$TARGET([[:space:]]|$)' >/dev/null ||
         fail "direct refinery merge must not checkout target branch in the active worktree"
 
-    python3 - "$formula" <<'PY' || fail "direct refinery merge must verify origin before setting merged metadata"
+    # The SHA comparison above is vacuous on its own: MERGED_SHA is read from a
+    # worktree created at origin/$TARGET, so an aborted merge leaves it equal to
+    # REMOTE and the comparison passes. These three guards are what make the
+    # verification real.
+    [[ "$direct_block" == *'set -euo pipefail'* ]] ||
+        fail "direct refinery merge must use set -euo pipefail so a failed merge cannot reach the close"
+    [[ "$direct_block" == *'PRE_SHA=$(git -C "$MERGE_WT" rev-parse HEAD)'* ]] ||
+        fail "direct refinery merge must capture PRE_SHA before merging"
+    [[ "$direct_block" == *'[ "$MERGED_SHA" = "$PRE_SHA" ]'* ]] ||
+        fail "direct refinery merge must refuse a merge that advanced nothing"
+    [[ "$direct_block" == *'git merge-base --is-ancestor "$TEMP_SHA" "$REMOTE"'* ]] ||
+        fail "direct refinery merge must assert the work commit is contained in the pushed target"
+
+    python3 - "$formula" <<'PY' || fail "direct refinery merge guards are misordered: capture PRE_SHA before the merge, refuse a no-op before the push, and assert containment before the merged metadata write"
 import sys
 text = open(sys.argv[1], encoding="utf-8").read()
 start = text.index('**If MERGE_STRATEGY = "direct"')
 end = text.index('**If MERGE_STRATEGY = "mr"')
 block = text[start:end]
-verify = block.index('[ "$MERGED_SHA" != "$REMOTE" ]')
 metadata = block.index('--set-metadata merge_result=merged')
-if verify >= metadata:
+
+# Every gate must sit between its subject and the metadata write.
+pre_capture = block.index('PRE_SHA=$(git -C "$MERGE_WT" rev-parse HEAD)')
+merge = block.index('git -C "$MERGE_WT" merge --ff-only "$TEMP_SHA"')
+no_advance = block.index('[ "$MERGED_SHA" = "$PRE_SHA" ]')
+push = block.index('git -C "$MERGE_WT" push origin "HEAD:$TARGET"')
+verify = block.index('[ "$MERGED_SHA" != "$REMOTE" ]')
+contained = block.index('git merge-base --is-ancestor "$TEMP_SHA" "$REMOTE"')
+
+# PRE_SHA is only a witness if it is read before the merge mutates HEAD, and
+# the no-advance guard must fail closed before anything is pushed.
+if not pre_capture < merge < no_advance < push:
+    raise SystemExit(1)
+# The containment assertion is the only non-vacuous gate; it must run after the
+# post-push fetch that sets REMOTE and before the bead is closed as merged.
+if not verify < contained < metadata:
     raise SystemExit(1)
 PY
 }

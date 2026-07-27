@@ -768,11 +768,22 @@ Otherwise the branch has a verified real change and you continue to the merge.
 Run this as one script. It uses a temporary detached worktree for the
 target branch because the real target branch may already be checked out in
 the rig's main worktree. Do not replace this with `git checkout $TARGET`.
-The metadata write happens only after the remote target ref is verified at
-the merged SHA.
+The metadata write happens only after the merge is proven to have landed.
+
+Do NOT pipe any command in this script (no `| tee`, no `| head`). A failure
+inside a pipeline does not trip `set -e` — only the last command's status is
+seen — which is how a failed merge previously reached the close as a success.
+
+Verification is three independent gates, because comparing the remote to a
+value that was itself read from the remote proves nothing. `MERGED_SHA` is
+read from a worktree created at `origin/$TARGET`, so if the merge aborts it
+still equals `$REMOTE` and the SHA comparison passes vacuously. `PRE_SHA`
+catches a merge that advanced nothing, and the `--is-ancestor` check is the
+only gate that cannot pass vacuously: `$TEMP_SHA` comes from the branch, not
+from the target, so it is satisfied only if the work actually landed.
 
 ```bash
-set -e
+set -euo pipefail
 
 MERGE_PARENT=$(mktemp -d "${TMPDIR:-/tmp}/gascity-refinery-merge.XXXXXX")
 MERGE_WT="$MERGE_PARENT/target"
@@ -785,9 +796,15 @@ trap cleanup_merge_wt EXIT
 git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
 TEMP_SHA=$(git rev-parse temp)
 git worktree add --detach "$MERGE_WT" "origin/$TARGET"
+PRE_SHA=$(git -C "$MERGE_WT" rev-parse HEAD)
 git -C "$MERGE_WT" merge --ff-only "$TEMP_SHA"
 MERGED_SHA=$(git -C "$MERGE_WT" rev-parse HEAD)
 MERGED_SHORT=$(git -C "$MERGE_WT" rev-parse --short HEAD)
+if [ "$MERGED_SHA" = "$PRE_SHA" ]; then
+  echo "MERGE ADVANCED NOTHING — target worktree is still at $PRE_SHA after merging $TEMP_SHA (the merge did not apply). STOP. Do not mutate bead state."
+  gc runtime drain-ack
+  exit 1
+fi
 git -C "$MERGE_WT" push origin "HEAD:$TARGET"
 
 git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
@@ -797,6 +814,22 @@ if [ "$MERGED_SHA" != "$REMOTE" ]; then
   gc runtime drain-ack
   exit 1
 fi
+
+CONTAINED_STATUS=0
+git merge-base --is-ancestor "$TEMP_SHA" "$REMOTE" || CONTAINED_STATUS=$?
+case "$CONTAINED_STATUS" in
+  0) : ;;  # work commit is provably contained in the pushed target
+  1)
+    echo "MERGE NOT LANDED — $TEMP_SHA is not an ancestor of origin/$TARGET ($REMOTE). STOP. Do not mutate bead state."
+    gc runtime drain-ack
+    exit 1
+    ;;
+  *)
+    echo "git merge-base --is-ancestor errored (status $CONTAINED_STATUS); cannot verify the merge landed. STOP. Do not mutate bead state."
+    gc runtime drain-ack
+    exit 1
+    ;;
+esac
 
 gc bd update "$WORK" \
   --set-metadata merge_result=merged \
