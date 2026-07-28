@@ -2,7 +2,9 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-SCRIPT="$ROOT/gastown/assets/scripts/usage-stamp.sh"
+GASTOWN="$ROOT/gastown"
+SCRIPT="$GASTOWN/assets/scripts/usage-stamp.sh"
+WRAPPER="$GASTOWN/commands/usage-stamp/run.sh"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -276,6 +278,107 @@ test_uses_no_bash4_only_constructs() {
     return 0
 }
 
+# --- the `gc gastown usage-stamp` wrapper -----------------------------------
+#
+# The wrapper exists only to resolve the path, and that is exactly the part
+# that was wrong the first time: the formula reached for GC_PACK_DIR directly,
+# but GC_PACK_DIR is set by `gc` when `gc` invokes a pack command and is absent
+# from a plain agent session. The bug stamped nothing and said so in a log
+# nobody reads, so these tests pin the resolution contract, not the join.
+
+run_wrapper() {
+    set +e
+    OUT=$(GC_CITY_PATH="${WRAP_CITY-$CITY}" GC_PACK_DIR="${WRAP_PACK-$GASTOWN}" \
+        sh "$WRAPPER" "$@" 2>"$ERRFILE")
+    RC=$?
+    set -e
+}
+
+test_wrapper_is_executable() {
+    [ -x "$WRAPPER" ] || fail "$WRAPPER must be executable"
+}
+
+test_wrapper_rejects_missing_pack_context() {
+    # Invoked by path instead of through `gc`: GC_PACK_DIR is empty. This must
+    # fail loudly rather than exec'ing `bash /assets/scripts/usage-stamp.sh`.
+    WRAP_PACK="" run_wrapper bd-20
+    [ "$RC" -eq 2 ] || fail "missing GC_PACK_DIR must exit 2, got $RC"
+    grep -q "missing Gas City pack context" "$ERRFILE" ||
+        fail "the wrapper must name the missing pack context: $(cat "$ERRFILE")"
+}
+
+test_wrapper_rejects_missing_city_context() {
+    WRAP_CITY="" run_wrapper bd-21
+    [ "$RC" -eq 2 ] || fail "missing GC_CITY_PATH must exit 2, got $RC"
+}
+
+test_wrapper_reports_a_pack_without_the_script() {
+    # An older pack version that predates the join. Must not report "unmetered"
+    # — nothing was measured because nothing could run.
+    WRAP_PACK="$TMP" run_wrapper bd-22
+    [ "$RC" -eq 2 ] || fail "a pack missing the script must exit 2, got $RC"
+    grep -q "not found in this pack version" "$ERRFILE" ||
+        fail "the wrapper must say the script is missing: $(cat "$ERRFILE")"
+}
+
+test_wrapper_passes_arguments_through() {
+    # --dry-run and the bead id must survive the exec, and the underlying
+    # script's exit code must pass through unchanged (0 = measured).
+    usage_row gk-w gastown__polecat-gk-w claude-opus-5 100 20 5 3 >"$CITY/.gc/usage.jsonl"
+    run_wrapper bd-23 --session gk-w --dry-run
+    [ "$RC" -eq 0 ] || fail "wrapper should pass through exit 0, got $RC: $(cat "$ERRFILE")"
+    [ -z "$(updates)" ] || fail "--dry-run must survive the wrapper: $(updates)"
+    printf '%s' "$OUT" | grep -q "claude-opus-5" ||
+        fail "wrapper should relay the script's stdout, got: $OUT"
+}
+
+test_wrapper_passes_unmetered_exit_through() {
+    # Exit 1 is a real state, not an error to swallow. A caller distinguishing
+    # metered from unmetered depends on it surviving the wrapper.
+    : >"$CITY/.gc/usage.jsonl"
+    run_wrapper bd-24 --session gk-none --dry-run
+    [ "$RC" -eq 1 ] || fail "wrapper should pass through exit 1 (unmetered), got $RC"
+}
+
+# --- the callers actually invoke it the resolvable way ----------------------
+
+test_formula_invokes_the_command_not_the_path() {
+    local formula="$ROOT/gastown/formulas/mol-polecat-work.toml"
+    grep -Fq 'gc gastown usage-stamp "$WORK_BEAD_ID"' "$formula" ||
+        fail "mol-polecat-work must stamp spend via 'gc gastown usage-stamp'"
+    # The regression itself: GC_PACK_DIR is not in an agent's environment, so a
+    # formula step that expands it resolves to /assets/... and stamps nothing.
+    # Match the code construct, not the word — the prose below the snippet
+    # quotes the broken path on purpose, to say why it is broken.
+    ! grep -qE '^[[:space:]]*STAMP=' "$formula" ||
+        fail "formula must not resolve usage-stamp.sh into a path variable"
+    ! grep -qE '^[[:space:]]*(bash|sh|exec).*GC_PACK_DIR' "$formula" ||
+        fail "formula must not execute a script through ambient GC_PACK_DIR"
+}
+
+test_formula_does_not_gate_handoff_on_metering() {
+    grep -Fq 'gc gastown usage-stamp "$WORK_BEAD_ID" || true' \
+        "$ROOT/gastown/formulas/mol-polecat-work.toml" ||
+        fail "the stamp must be suffixed '|| true' — metering never blocks handoff"
+}
+
+test_polecat_prompt_documents_the_command() {
+    local prompt="$ROOT/gastown/agents/polecat/prompt.template.md"
+    grep -Fq 'gc gastown usage-stamp' "$prompt" ||
+        fail "the polecat prompt should name the command it will be told to run"
+    ! grep -Fq 'assets/scripts/usage-stamp.sh' "$prompt" ||
+        fail "the polecat prompt should not point polecats at an unresolvable path"
+}
+
+test_help_is_present_for_the_command() {
+    # `gc gastown` discovers commands from commands/<name>/run.sh and shows
+    # help.md; a command without help is invisible to anyone looking for it.
+    [ -r "$GASTOWN/commands/usage-stamp/help.md" ] ||
+        fail "commands/usage-stamp/help.md must exist"
+    grep -Fq 'UNMETERED IS NOT ZERO' "$GASTOWN/commands/usage-stamp/help.md" ||
+        fail "help must carry the unmetered-is-not-zero contract"
+}
+
 test_single_model_aggregates_and_stamps
 test_dominant_model_is_highest_output_and_breakdown_is_kept
 test_single_model_omits_breakdown
@@ -294,5 +397,15 @@ test_no_session_identity_fails_loud
 test_missing_city_fails_loud
 test_script_is_executable
 test_uses_no_bash4_only_constructs
+test_wrapper_is_executable
+test_wrapper_rejects_missing_pack_context
+test_wrapper_rejects_missing_city_context
+test_wrapper_reports_a_pack_without_the_script
+test_wrapper_passes_arguments_through
+test_wrapper_passes_unmetered_exit_through
+test_formula_invokes_the_command_not_the_path
+test_formula_does_not_gate_handoff_on_metering
+test_polecat_prompt_documents_the_command
+test_help_is_present_for_the_command
 
 echo "usage stamp tests passed"

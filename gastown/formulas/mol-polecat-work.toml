@@ -441,6 +441,34 @@ provided by the caller, `metadata.existing_pr` is preserved for refinery
 validation. The refinery records canonical `pr_url` only after verifying
 the PR is open and matches the branch, base, and origin repository.
 
+**5b. Stamp the token spend for this bead:**
+
+Your spend is already metered — the runtime writes a row per model call to
+`<city>/.gc/usage.jsonl`, keyed by your session. What is missing is the join
+to the bead you spent it on, and this is the last moment it is unambiguous:
+the session is yours, the work is done, and nobody else has touched the bead.
+
+```bash
+gc gastown usage-stamp "$WORK_BEAD_ID" || true   # never gate the handoff on metering
+```
+
+Invoke it through `gc`, not by path. The join lives in the gastown pack, which
+is materialized in a content-addressed cache, and `GC_PACK_DIR` is set only
+when `gc` itself invokes a pack command — it is NOT part of your session
+environment. A bare `"${GC_PACK_DIR:-}/assets/scripts/usage-stamp.sh"` resolves
+to `/assets/scripts/usage-stamp.sh` in an agent session, silently stamps
+nothing, and reads like it ran.
+
+Do NOT report token counts yourself. You cannot read your own usage
+accurately; the runtime records it exactly. Measurement belongs to whatever
+can measure.
+
+Exit 0 stamps `usage.model` plus the four token totals under the `usage.`
+prefix. Exit 1 means unmetered — it records `usage.status=unmetered` with a
+reason and writes no token fields, because a bead claiming 0 in / 0 out is
+indistinguishable from work that was genuinely free. Neither outcome blocks
+the handoff: metering is an observation, never a gate on work changing hands.
+
 **6. Reassign to refinery:**
 ```bash
 REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"

@@ -91,6 +91,7 @@ Work beads carry structured metadata for lifecycle tracking and handoff:
 | `existing_pr` | caller | Before dispatch | Existing PR URL to reuse instead of creating another PR |
 | `pr_url` | refinery | PR handoff | Canonical PR URL recorded after validation |
 | `rejection_reason` | refinery (on failure) | On reject | Why the merge was rejected |
+| `usage.*` | `gc gastown usage-stamp` (submit) | Late | Token spend joined from the runtime's usage sink |
 
 **On branch-setup:** You record `work_dir` and `branch` immediately.
 This enables crash recovery — the witness can find and salvage your work.
@@ -102,6 +103,20 @@ it for refinery to validate and canonicalize into `pr_url`.
 **On rejection:** The refinery puts the bead back in the pool with
 `rejection_reason` set and the branch intact. A new polecat picks it up,
 sees the existing branch and reason, and resumes instead of redoing everything.
+
+**On token spend:** You are the agent that spends the tokens, but you are not
+the one who counts them. The runtime already writes a row per model call to
+`<city>/.gc/usage.jsonl` keyed by your session; the submit step runs
+`gc gastown usage-stamp "$WORK_BEAD_ID"` to join those rows to your bead as
+`usage.model`, `usage.input_tokens`, `usage.output_tokens`,
+`usage.cache_read_tokens` and `usage.cache_creation_tokens`.
+
+Do NOT report token counts yourself, and do not estimate them into a note. You
+cannot read your own usage accurately and have no reason to try — the runtime
+records it exactly, and a guessed number is worse than no number because it
+still looks like data. If nothing was recorded (metering off, or a city that
+forwards usage out of process), the stamp writes `usage.status=unmetered` with
+a reason and no token fields. Unmetered is not zero.
 
 Read metadata:
 ```bash
