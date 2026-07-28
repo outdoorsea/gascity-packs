@@ -47,6 +47,38 @@ sync_worktree() {
     git -C "$WT" pull --rebase 2>/dev/null || true
 }
 
+scaffold_remember() {
+    # Give this workspace a writable hook-error log. See remember-scaffold.sh
+    # for why a missing .remember/logs/ silently disables the plugin's hooks
+    # instead of merely losing their output.
+    SCAFFOLD="$(dirname "$0")/remember-scaffold.sh"
+    # Tested with -f and run through `sh`, not tested with -x and executed
+    # directly: an -x guard turns a lost executable bit — a pack
+    # re-materialization, a `cp` without -p, a mode-dropping filesystem — into a
+    # silent no-op that removes this entire fix with no signal. That is the same
+    # failure class the fix exists to close. Absence still no-ops, for packs
+    # older than this script.
+    [ -f "$SCAFFOLD" ] || return 0
+
+    sh "$SCAFFOLD" "$WT" || true
+
+    # A polecat's own session does not run here — it runs in the per-bead
+    # worktree that mol-polecat-work cuts at $WT/worktrees/<bead-id>, and that
+    # directory is created by the formula, never by this script. The formula
+    # scaffolds it on creation; sweeping the existing ones here heals every
+    # worktree cut before that landed, on the agent's next pre_start.
+    #
+    # Scaffolded one at a time rather than as one argument list: `set --` would
+    # be the natural way to build that list, but it rewrites the positional
+    # parameters this script still reads, and an unmatched glob under `set -e`
+    # turns a false `[ -d ]` test into a startup failure.
+    for BEAD_WT in "$WT"/worktrees/*; do
+        if [ -d "$BEAD_WT" ]; then
+            sh "$SCAFFOLD" "$BEAD_WT" || true
+        fi
+    done
+}
+
 branch_name() {
     # Namescape worktree branches by target path so multiple cities or rigs
     # can share one underlying repo without colliding on global refs like
@@ -57,6 +89,10 @@ branch_name() {
 
 # Idempotent: skip if worktree already exists.
 if [ -d "$WT/.git" ] || [ -f "$WT/.git" ]; then
+    # Self-healing: every worktree created before this scaffold existed still
+    # reaches this branch on its next pre_start, so they are repaired in place
+    # rather than needing to be recreated.
+    scaffold_remember
     sync_worktree
     exit 0
 fi
@@ -157,6 +193,9 @@ trap - EXIT HUP INT TERM
 mkdir -p "$WT/.beads"
 echo "$RIG_ROOT/.beads" > "$WT/.beads/redirect"
 
+# Hook-error log directory for freshly created worktrees (see scaffold_remember).
+scaffold_remember
+
 # Submodule init (best-effort).
 git -C "$WT" submodule init 2>/dev/null || true
 
@@ -188,6 +227,7 @@ append_exclude ".beads/redirect"
 append_exclude ".beads/hooks/"
 append_exclude ".beads/formulas/"
 append_exclude ".logs/"
+append_exclude ".remember/"
 append_exclude "worktrees/"
 append_exclude "__pycache__/"
 append_exclude ".claude/"

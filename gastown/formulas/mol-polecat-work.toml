@@ -110,6 +110,23 @@ Record immediately so restarts and witness recovery can find it:
 gc bd update "$WORK_BEAD_ID" --set-metadata work_dir="$WORKTREE_PATH"
 ```
 
+**Whichever path you took**, make the worktree able to record hook errors
+before you start working in it:
+```bash
+mkdir -p "$(pwd)/.remember/logs" "$(pwd)/.remember/tmp"
+[ -e "$(pwd)/.remember/.gitignore" ] || printf '*\n' > "$(pwd)/.remember/.gitignore"
+```
+Your session runs in THIS worktree, so this is the directory the `remember`
+plugin's hooks resolve against. The plugin registers its hooks with the stderr
+redirect baked into the command string, and the shell opens that append target
+before forking — so a missing `.remember/logs/` does not lose a log line, it
+stops the hook from running at all. The hook it stops is the one that records
+hook errors, so every hook failure goes silently missing. The plugin cannot
+self-heal: the script that would create the directory is the one the missing
+directory prevents from running. Keep this in sync with
+`assets/scripts/remember-scaffold.sh`, which does the same job at pre_start for
+agent workspaces.
+
 Worktrees are scoped to the work bead (not the agent name) so that:
 - An agent can pick up new work even if an old worktree is being recovered
 - Multiple orphaned worktrees can coexist without collision
