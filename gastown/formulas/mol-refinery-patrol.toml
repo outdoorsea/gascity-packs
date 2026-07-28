@@ -377,11 +377,25 @@ description = """
 **Config: target_branch = {{target_branch}}**
 **Config: delete_merged_branches = {{delete_merged_branches}}**
 
+Three merge strategies exist. Pick by target-branch protection, not by habit:
+
+| Strategy | Pushes to `$TARGET`? | Waits for checks? | Merges? | Closes bead? |
+|---|---|---|---|---|
+| `direct` | yes, `git push` | no | yes (ff-only) | yes |
+| `mr` (alias `pr`) | no | no | no | yes — PR-open IS the handoff |
+| `pr-merge` | no | yes, required checks | yes, via `gh pr merge` | only after the merge is verified |
+
+`direct` is only legal against an UNPROTECTED target. A protected branch
+rejects `git push origin HEAD:$TARGET` outright, so a refinery that keeps
+choosing `direct` stops landing work entirely. `mr` does not fill that gap:
+it treats PR-open as terminal, never waits for checks, and never merges.
+`pr-merge` is the mode that actually lands work on a protected branch.
+
 Read the merge target and merge strategy from the work bead metadata:
 ```bash
 BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
-MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // "direct"')
+MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // empty')
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
 ORIGIN_REPO_ERROR=""
 if command -v gh >/dev/null 2>&1; then
@@ -401,12 +415,110 @@ else
       ;;
   esac
 fi
-if [ "$MERGE_STRATEGY" = "pr" ]; then
-  MERGE_STRATEGY="mr"
+case "$MERGE_STRATEGY" in
+  pr) MERGE_STRATEGY="mr" ;;
+  pr_merge|pr-land) MERGE_STRATEGY="pr-merge" ;;
+esac
+
+# Probe target-branch protection. Sets three globals; call it directly (NOT in
+# `$( )`) so the assignments survive.
+#
+#   TARGET_PROTECTED       true | false | unknown | unknown_no_gh
+#   TARGET_PROTECTION_JSON the /protection payload when readable, else empty
+#   REQUIRED_CONTEXTS      newline-separated required status-check contexts
+#
+# Two endpoints, because neither alone is sufficient:
+#   * `branches/$T/protection` returns the rule detail we need to know WHICH
+#     checks are required, but it 404s for a non-admin token even on a branch
+#     that IS protected — a 404 alone must never be read as "unprotected".
+#   * `branches/$T` needs only pull access and reports `.protected`, which is
+#     true for classic protection AND for rulesets. It disambiguates the 404
+#     but carries no context list.
+TARGET_PROTECTED="unknown"
+TARGET_PROTECTION_JSON=""
+REQUIRED_CONTEXTS=""
+probe_target_protection() {
+  ptp_target="$1"
+  TARGET_PROTECTED="unknown"
+  TARGET_PROTECTION_JSON=""
+  REQUIRED_CONTEXTS=""
+  if ! command -v gh >/dev/null 2>&1; then
+    TARGET_PROTECTED="unknown_no_gh"
+    return 0
+  fi
+  if [ -z "$ORIGIN_REPO" ]; then
+    return 0
+  fi
+  if TARGET_PROTECTION_JSON=$(gh api "repos/$ORIGIN_REPO/branches/$ptp_target/protection" 2>/dev/null); then
+    TARGET_PROTECTED="true"
+    # Classic protection exposes required contexts in two shapes depending on
+    # repo age: `.contexts[]` (legacy strings) and `.checks[].context`.
+    REQUIRED_CONTEXTS=$(printf '%s\n' "$TARGET_PROTECTION_JSON" \
+      | jq -r '[(.required_status_checks.contexts // [])[], (.required_status_checks.checks // [])[].context] | unique | .[]' 2>/dev/null)
+    return 0
+  fi
+  TARGET_PROTECTION_JSON=""
+  ptp_flag=$(gh api "repos/$ORIGIN_REPO/branches/$ptp_target" --jq '.protected' 2>/dev/null)
+  case "$ptp_flag" in
+    true) TARGET_PROTECTED="true" ;;
+    false) TARGET_PROTECTED="false" ;;
+    *) TARGET_PROTECTED="unknown" ;;
+  esac
+  return 0
+}
+probe_target_protection "$TARGET"
+echo "target=$TARGET protected=$TARGET_PROTECTED required_contexts=$(printf '%s' "$REQUIRED_CONTEXTS" | tr '\\n' ',')"
+
+# Resolve the strategy. A protected target NEVER resolves to `direct` — that
+# is the whole point of this gate, and the direct script carries a second
+# independent guard in case this one is bypassed on a restart.
+if [ -z "$MERGE_STRATEGY" ]; then
+  case "$TARGET_PROTECTED" in
+    true)
+      MERGE_STRATEGY="pr-merge"
+      echo "$TARGET is protected; defaulting merge_strategy=pr-merge."
+      ;;
+    unknown)
+      # gh works but the probe failed (transient API error, odd permissions).
+      # Fail closed to pr-merge: opening and merging a PR is correct on an
+      # unprotected branch too, whereas a direct push to a protected branch
+      # is simply rejected.
+      MERGE_STRATEGY="pr-merge"
+      echo "Could not determine protection for $TARGET; failing closed to merge_strategy=pr-merge."
+      ;;
+    *)
+      # unknown_no_gh keeps the historical default: pr-merge needs gh for
+      # `gh pr checks` / `gh pr merge`, so promoting it here would trade a
+      # clean push rejection for a broken PR flow.
+      MERGE_STRATEGY="direct"
+      ;;
+  esac
+elif [ "$MERGE_STRATEGY" = "direct" ] && [ "$TARGET_PROTECTED" = "true" ]; then
+  echo "metadata.merge_strategy=direct is invalid for protected $TARGET; using merge_strategy=pr-merge."
+  MERGE_STRATEGY="pr-merge"
 fi
+
 if [ -n "$EXISTING_PR" ] && [ "$MERGE_STRATEGY" = "direct" ]; then
   echo "metadata.existing_pr requires pull-request handoff; using merge_strategy=mr."
   MERGE_STRATEGY="mr"
+fi
+
+# `mr` and `pr-merge` share the PR create/verify machinery below.
+PR_MODE=false
+case "$MERGE_STRATEGY" in
+  mr|pr-merge) PR_MODE=true ;;
+esac
+
+if [ "$MERGE_STRATEGY" = "pr-merge" ] && ! command -v gh >/dev/null 2>&1; then
+  echo "merge_strategy=pr-merge requires the gh CLI (gh pr checks / gh pr merge); the REST fallback cannot wait on checks or merge."
+  gc mail send mayor/ -s "ESCALATION: pr-merge needs gh CLI" -m "Work bead: $WORK
+Branch: $BRANCH
+Target: $TARGET (protected=$TARGET_PROTECTED)
+The refinery resolved merge_strategy=pr-merge but gh is not installed on this host.
+Install gh, or set metadata.merge_strategy=mr to hand the PR to a human."
+  echo "STOP. Do not mutate bead state."
+  gc runtime drain-ack
+  exit 1
 fi
 
 block_existing_pr() {
@@ -498,6 +610,34 @@ halt_false_completion() {
   echo "STOP. Bead left blocked + escalated to mayor/witness. NEVER silent retry."
   gc runtime drain-ack
   exit 1
+}
+
+block_pr_checks() {
+  # pr-merge terminal-blocked path: required checks are red, or the PR could
+  # not be merged. Unlike block_existing_pr (bad config -> human) this is
+  # fixable code, so it mirrors handle-failures and returns the bead to the
+  # polecat pool with the reason attached.
+  #
+  # HARD RULES, in order of how badly each one has burned us:
+  #   * NEVER push to $TARGET here. Red checks are exactly the case branch
+  #     protection exists to stop; routing around it defeats the gate.
+  #   * NEVER retry the push, and NEVER --force. A rejected push is a verdict,
+  #     not a transient error.
+  #   * NEVER close the bead. Work that did not land must stay open.
+  #   * NEVER delete $BRANCH. The PR still points at it, and the next polecat
+  #     resumes that branch instead of redoing the work.
+  bpc_reason="$1"
+  gc bd update $WORK \
+    --status=open \
+    --assignee="" \
+    --set-metadata merge_result=blocked \
+    --set-metadata rejection_reason="$bpc_reason" \
+    --set-metadata pr_url="${PR_URL:-}" \
+    --set-metadata pr_number="${PR_NUMBER:-}" \
+    --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+  gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "PR BLOCKED: $WORK — $bpc_reason (PR ${PR_URL:-unknown}); bead returned to pool, branch kept."
+  echo "BLOCKED: $WORK — $bpc_reason"
+  echo "Bead returned to the polecat pool with rejection_reason set. Branch $BRANCH and PR ${PR_URL:-unknown} left intact."
 }
 
 pr_lookup_missing() {
@@ -596,7 +736,7 @@ lookup_pr_info() {
     | jq '{url:.html_url, number, state:(.state | ascii_upcase), headRefName:.head.ref, baseRefName:.base.ref, headRepositoryOwner:{login:.head.repo.owner.login}, headRepository:{name:.head.repo.name}}'
 }
 
-if [ "$MERGE_STRATEGY" = "mr" ] && [ -n "$EXISTING_PR" ]; then
+if [ "$PR_MODE" = "true" ] && [ -n "$EXISTING_PR" ]; then
   if [ -z "$BRANCH" ] || [ "$BRANCH" = "null" ]; then
     block_existing_pr "metadata.existing_pr is set but metadata.branch is missing."
   fi
@@ -650,7 +790,7 @@ if [ "$MERGE_STRATEGY" = "mr" ] && [ -n "$EXISTING_PR" ]; then
   fi
 fi
 
-if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
+if [ "$PR_MODE" = "true" ] && [ -z "$ORIGIN_REPO" ]; then
   [ -n "$ORIGIN_REPO_ERROR" ] && echo "$ORIGIN_REPO_ERROR"
   echo "Could not resolve origin repository for pull-request handoff. STOP. Debug and retry without mutating bead state."
   gc runtime drain-ack
@@ -658,7 +798,7 @@ if [ "$MERGE_STRATEGY" = "mr" ] && [ -z "$ORIGIN_REPO" ]; then
 fi
 ```
 
-**If MERGE_STRATEGY = "direct" (default):**
+**If MERGE_STRATEGY = "direct" (unprotected targets only):**
 
 **0. Merge-state gate (already-merged short-circuit + false-completion guard):**
 
@@ -788,6 +928,26 @@ if [ "$MERGED_SHA" = "$PRE_SHA" ]; then
   gc runtime drain-ack
   exit 1
 fi
+
+# Second, independent protected-target guard. Strategy resolution should have
+# already routed a protected $TARGET to pr-merge, so reaching here means that
+# gate was bypassed — a stale metadata.merge_strategy, a restart that skipped
+# the resolution block, or protection enabled mid-patrol. Re-probe from
+# scratch rather than trusting a variable that may not have survived: a
+# direct push to a protected branch is exactly the failure this bead fixes.
+# The probe no-ops when gh is unavailable, preserving the pre-gh behaviour of
+# letting GitHub reject the push.
+if command -v gh >/dev/null 2>&1 && [ -n "${ORIGIN_REPO:-}" ]; then
+  DIRECT_PROTECTED=$(gh api "repos/$ORIGIN_REPO/branches/$TARGET" --jq '.protected' 2>/dev/null || echo unknown)
+  if [ "$DIRECT_PROTECTED" = "true" ]; then
+    echo "REFUSING direct push: $TARGET is a protected branch and merge_strategy=direct has no legal route to it."
+    echo "Set metadata.merge_strategy=pr-merge (or clear it and let strategy resolution pick) and re-run."
+    echo "Do NOT disable protection, add a bypass, or use --force. STOP. Do not mutate bead state."
+    gc runtime drain-ack
+    exit 1
+  fi
+fi
+
 git -C "$MERGE_WT" push origin "HEAD:$TARGET"
 
 git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
@@ -838,10 +998,16 @@ git branch -d temp || git branch -D temp || true
 ```
 If delete_merged_branches = "true": `git push origin --delete $BRANCH`
 
-**If MERGE_STRATEGY = "mr":**
+**If MERGE_STRATEGY = "mr" OR "pr-merge" (i.e. `$PR_MODE` = true):**
 
-Refinery does NOT land the branch directly. Instead it publishes a pull
-request and treats PR creation as the terminal handoff for this work bead.
+Refinery does NOT land the branch directly. It publishes a pull request.
+Steps 0-3 are identical for both strategies; they diverge at step 4:
+
+- `mr` stops there. PR creation IS the terminal handoff — a human takes it
+  from the open PR, and the bead closes as `merge_result=pull_request`.
+- `pr-merge` continues through steps 4a-4c: wait for required checks, merge
+  the PR, verify `$TARGET` actually advanced, and only then close the bead.
+  This is the mode that lands work on a protected branch.
 
 **0. Refuse a 0-diff branch (false-completion guard):**
 
@@ -1062,7 +1228,11 @@ fi
 ```
 If this command fails or prints empty output: STOP. Debug and retry. Do NOT continue.
 
-**4. Record PR metadata and close the work bead:**
+**4. `mr` ONLY — Record PR metadata and close the work bead:**
+
+Skip this entire step when `MERGE_STRATEGY = "pr-merge"`; go to 4a. For
+`pr-merge` the PR is a means, not the deliverable, and closing here would
+report work as handed off while `$TARGET` never moved.
 
 Run as a single chained command so the metadata write cannot be skipped
 when the close-reason already names the PR. Both the `--set-metadata`
@@ -1082,12 +1252,232 @@ gc bd update $WORK \
 gc bd close $WORK --reason "Pull request ready: $PR_URL"
 ```
 
+**4a. `pr-merge` ONLY — Wait for the required checks to settle:**
+
+Waiting happens inside `gh pr checks --watch`, which blocks until every
+required check reaches a terminal state. Do NOT hand-roll a `sleep` polling
+loop: some agent harnesses refuse a foreground `sleep`, and a loop that is
+silently skipped turns "wait for green" into "merge immediately".
+
+Bound the wait so a check that is never scheduled cannot hold the refinery
+open forever. `timeout(1)` is not present on every host (it is GNU
+coreutils; macOS ships it only via Homebrew as `timeout`/`gtimeout`), so
+degrade to an unbounded watch with a loud warning rather than failing.
+
+`gh pr checks` exit codes are load-bearing and easy to misread:
+
+| Exit | Meaning | Action |
+|---|---|---|
+| 0 | every required check passed | merge |
+| 8 | still pending | keep watching |
+| 124 | our `timeout` fired | blocked, report pending checks |
+| 1 | **either** a check failed **or** zero checks were reported | must disambiguate — see below |
+
+That last row is the trap. `gh` exits 1 for "CI is red" and for "this repo
+has no required checks at all", which are opposite verdicts. Disambiguate on
+stdout, not on the exit code: a real failure yields JSON rows with
+`bucket == "fail"`, whereas nothing-reported yields empty stdout and a "no
+required checks reported" message on stderr.
+
+```bash
+CHECKS_TIMEOUT=${REFINERY_CHECKS_TIMEOUT_SECONDS:-1800}
+CHECKS_INTERVAL=${REFINERY_CHECKS_INTERVAL_SECONDS:-30}
+
+run_bounded_checks() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$CHECKS_TIMEOUT" gh pr checks "$PR_NUMBER" --required --watch --interval "$CHECKS_INTERVAL"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$CHECKS_TIMEOUT" gh pr checks "$PR_NUMBER" --required --watch --interval "$CHECKS_INTERVAL"
+  else
+    echo "WARNING: no timeout(1) on PATH; watching required checks unbounded." >&2
+    gh pr checks "$PR_NUMBER" --required --watch --interval "$CHECKS_INTERVAL"
+  fi
+}
+
+run_bounded_checks
+WATCH_STATUS=$?
+
+CHECKS_ERR=$(mktemp)
+CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --required --json name,state,bucket,link 2>"$CHECKS_ERR")
+CHECKS_STATUS=$?
+CHECKS_ERROR=$(cat "$CHECKS_ERR")
+rm -f "$CHECKS_ERR"
+
+FAILED_NAMES=""
+PENDING_NAMES=""
+if [ -n "$CHECKS_JSON" ]; then
+  FAILED_NAMES=$(printf '%s' "$CHECKS_JSON" | jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | unique | join(", ")' 2>/dev/null)
+  PENDING_NAMES=$(printf '%s' "$CHECKS_JSON" | jq -r '[.[] | select(.bucket == "pending") | .name] | unique | join(", ")' 2>/dev/null)
+fi
+
+CHECKS_VERDICT=""
+CHECKS_DETAIL=""
+if [ "$WATCH_STATUS" -eq 124 ]; then
+  CHECKS_VERDICT="timeout"
+  CHECKS_DETAIL="${PENDING_NAMES:-unknown}"
+elif [ -n "$FAILED_NAMES" ]; then
+  CHECKS_VERDICT="red"
+  CHECKS_DETAIL="$FAILED_NAMES"
+elif [ "$CHECKS_STATUS" -eq 0 ] && [ -n "$CHECKS_JSON" ]; then
+  CHECKS_VERDICT="green"
+elif [ -z "$CHECKS_JSON" ] && printf '%s' "$CHECKS_ERROR" | grep -qi 'no .*checks reported'; then
+  # gh sees no required checks. Believe it only if branch protection also
+  # lists none — otherwise protection demands contexts that were never
+  # scheduled, and merging would be merging past an unenforced gate.
+  if [ -n "$REQUIRED_CONTEXTS" ]; then
+    CHECKS_VERDICT="unscheduled"
+    CHECKS_DETAIL=$(printf '%s' "$REQUIRED_CONTEXTS" | tr '\\n' ',' | sed 's/,$//')
+  else
+    CHECKS_VERDICT="none"
+  fi
+elif [ "$CHECKS_STATUS" -eq 8 ] || [ -n "$PENDING_NAMES" ]; then
+  CHECKS_VERDICT="timeout"
+  CHECKS_DETAIL="${PENDING_NAMES:-unknown}"
+else
+  CHECKS_VERDICT="error"
+  CHECKS_DETAIL="$CHECKS_ERROR"
+fi
+
+echo "checks verdict=$CHECKS_VERDICT detail=$CHECKS_DETAIL (watch=$WATCH_STATUS query=$CHECKS_STATUS)"
+
+case "$CHECKS_VERDICT" in
+  green)
+    echo "PROCEED: required checks green for PR #$PR_NUMBER."
+    ;;
+  none)
+    echo "PROCEED: neither gh nor branch protection reports a required check for $TARGET; nothing to wait on."
+    ;;
+  red)
+    block_pr_checks "required checks failing: $CHECKS_DETAIL"
+    echo "SKIP steps 4b and 4c. Go to step 5 Cleanup."
+    ;;
+  timeout)
+    block_pr_checks "required checks did not finish within ${CHECKS_TIMEOUT}s; still pending: $CHECKS_DETAIL"
+    echo "SKIP steps 4b and 4c. Go to step 5 Cleanup."
+    ;;
+  unscheduled)
+    block_pr_checks "branch protection requires checks that were never reported on this PR: $CHECKS_DETAIL"
+    echo "SKIP steps 4b and 4c. Go to step 5 Cleanup."
+    ;;
+  *)
+    echo "Could not read required checks for PR #$PR_NUMBER: $CHECKS_DETAIL"
+    echo "STOP. Do not mutate bead state, do not merge, do not push."
+    gc runtime drain-ack
+    exit 1
+    ;;
+esac
+```
+
+**If the verdict was `red`, `timeout`, or `unscheduled`:** `block_pr_checks`
+has already set `merge_result=blocked` + `rejection_reason` and returned the
+bead to the polecat pool. Do NOT run 4b or 4c. Do NOT push to `$TARGET`, do
+NOT retry, do NOT `--force`, do NOT delete `$BRANCH`. Go to step 5 Cleanup,
+then let **patrol-summary** and **next-iteration** run so the patrol
+continues with the next branch.
+
+**4b. `pr-merge` ONLY — Merge the pull request:**
+
+Capture `$TARGET` and the PR head BEFORE merging. Both are needed by 4c, and
+`PR_HEAD_SHA` in particular is the only verification input that does not
+come from `$TARGET` — it is what makes the containment check in 4c
+non-vacuous.
+
+```bash
+git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
+PRE_MERGE_SHA=$(git rev-parse "origin/$TARGET")
+PR_HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid -q '.headRefOid')
+if [ -z "$PR_HEAD_SHA" ]; then
+  echo "Could not read head SHA for PR #$PR_NUMBER. STOP. Do not mutate bead state."
+  gc runtime drain-ack
+  exit 1
+fi
+
+MERGE_ERR=$(mktemp)
+gh pr merge "$PR_NUMBER" --merge \
+  --subject "Merge PR #$PR_NUMBER: $ISSUE_TITLE ($WORK)" \
+  >"$MERGE_ERR" 2>&1
+PR_MERGE_STATUS=$?
+PR_MERGE_OUTPUT=$(cat "$MERGE_ERR")
+rm -f "$MERGE_ERR"
+echo "$PR_MERGE_OUTPUT"
+
+if [ "$PR_MERGE_STATUS" -ne 0 ]; then
+  block_pr_checks "gh pr merge failed for PR #$PR_NUMBER: $PR_MERGE_OUTPUT"
+  echo "SKIP step 4c. Go to step 5 Cleanup."
+fi
+```
+
+A `gh pr merge` failure is a verdict from the branch's own protection rules
+— a missing approving review, an out-of-date branch, a required
+conversation unresolved. It is NOT a transient error. Report it and stop.
+Never respond by pushing to `$TARGET`, disabling protection, adding the
+refinery to a bypass list, or re-running with `--admin`/`--force`.
+
+**4c. `pr-merge` ONLY — Verify the merge landed, then record and close:**
+
+GitHub reporting a successful merge is not proof that `$TARGET` moved, and
+the merge ref can lag the API response by a beat. Re-fetch and prove it with
+two gates:
+
+1. `$TARGET` advanced (`POST_MERGE_SHA != PRE_MERGE_SHA`) — catches a merge
+   that reported success but applied nothing.
+2. `PR_HEAD_SHA` is an ancestor of the new `$TARGET` — the non-vacuous gate.
+   Gate 1 compares two values both read from `$TARGET`, so it can pass on an
+   unrelated concurrent push; `PR_HEAD_SHA` comes from the PR branch, so
+   gate 2 is satisfied only if THIS work actually landed.
+
+Retry the fetch a bounded number of times to absorb the propagation lag,
+using `gh pr checks`-free polling via `git fetch` alone (no `sleep`: each
+`git fetch` round-trip is itself the delay).
+
+```bash
+MERGE_VERIFY_TRIES=${REFINERY_MERGE_VERIFY_TRIES:-10}
+POST_MERGE_SHA=""
+VERIFY_OK=false
+i=0
+while [ "$i" -lt "$MERGE_VERIFY_TRIES" ]; do
+  i=$((i + 1))
+  git fetch origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}" >/dev/null 2>&1 || true
+  POST_MERGE_SHA=$(git rev-parse "origin/$TARGET" 2>/dev/null || echo "")
+  if [ -n "$POST_MERGE_SHA" ] && [ "$POST_MERGE_SHA" != "$PRE_MERGE_SHA" ] \
+     && git merge-base --is-ancestor "$PR_HEAD_SHA" "$POST_MERGE_SHA" 2>/dev/null; then
+    VERIFY_OK=true
+    break
+  fi
+done
+
+if [ "$VERIFY_OK" != "true" ]; then
+  echo "MERGE NOT VERIFIED — origin/$TARGET is ${POST_MERGE_SHA:-unreadable} (was $PRE_MERGE_SHA); $PR_HEAD_SHA is not provably contained after $i attempts."
+  echo "gh pr merge reported success, so do NOT re-merge and do NOT push. STOP. Do not mutate bead state; a later patrol re-evaluates via the already-merged gate."
+  gc runtime drain-ack
+  exit 1
+fi
+
+MERGED_SHORT=$(git rev-parse --short "$POST_MERGE_SHA")
+gc bd update $WORK \
+  --set-metadata merge_result=merged \
+  --set-metadata merged_sha="$POST_MERGE_SHA" \
+  --set-metadata merged_target="$TARGET" \
+  --set-metadata pr_url="$PR_URL" \
+  --set-metadata pr_number="$PR_NUMBER" \
+  --unset-metadata rejection_reason && \
+gc bd close $WORK --reason "Merged to $TARGET at $MERGED_SHORT via PR #$PR_NUMBER: $PR_URL"
+```
+
+If the verification script exits non-zero: STOP. Do NOT write merge
+metadata, close the bead, or delete the source branch.
+
 **5. Cleanup:**
 ```bash
 git checkout "$TARGET"
 git branch -d temp
 ```
-Do NOT delete `$BRANCH` in mr mode — GitHub pull requests need the source branch.
+Do NOT delete `$BRANCH` in `mr` mode — the open pull request needs it.
+
+Do NOT delete `$BRANCH` in `pr-merge` mode either when the bead was blocked
+— the PR is still open and the next polecat resumes that branch. Only after
+a verified merge, and only if delete_merged_branches = "true", may you run
+`git push origin --delete $BRANCH`.
 
 **If MERGE_STRATEGY = "local":**
 
@@ -1097,11 +1487,21 @@ Leave the work bead assigned to refinery and escalate to mayor for manual handli
 gc mail send mayor/ -s "ESCALATION: unsupported merge_strategy=local" -m "Work bead: $WORK
 Branch: $BRANCH
 Target: $TARGET
-The Gastown example refinery supports direct and mr/pr merge strategies only."
+The Gastown example refinery supports direct, mr/pr, and pr-merge strategies only."
 ```
 Do NOT close the bead, delete the branch, or burn the wisp until a human decides how to proceed.
 
-**GATE**: direct mode requires verified target push. mr mode requires verified PR URL. Bead closure only happens after the selected handoff is confirmed."""
+**GATE**: `direct` requires an unprotected target AND a verified target push.
+`mr` requires a verified PR URL. `pr-merge` requires green (or absent)
+required checks, a successful `gh pr merge`, AND a re-fetched `$TARGET` that
+provably contains the PR head. Bead closure only happens after the selected
+handoff is confirmed.
+
+**FORBIDDEN, in every mode**: disabling branch protection, `git push --force`
+or `--force-with-lease` to `$TARGET`, `gh pr merge --admin`, adding the
+refinery to a protection bypass list, or editing CI config (e.g.
+`continue-on-error`) to turn a red check green. A protected branch rejecting
+your push is the system working. Report it and return the bead to the pool."""
 
 [[steps]]
 id = "patrol-summary"
