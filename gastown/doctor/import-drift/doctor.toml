@@ -1,0 +1,8 @@
+description = 'the installed gastown pin is current with the branch it was cut from, so agents load the formulas and commands that were actually fixed'
+
+# No `fix` key on purpose. Advancing an import pin edits city.toml (or a rig's
+# [rigs.imports] entry) and then needs `gc import install` plus `gc reload` —
+# a versioning decision with a restart attached, not something `gc doctor --fix`
+# should do behind an operator's back. Note this is also why there is no
+# fix.sh in this directory: a sibling fix.sh is auto-discovered and would opt
+# the check into --fix without any manifest change.
