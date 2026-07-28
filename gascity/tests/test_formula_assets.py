@@ -468,6 +468,36 @@ THIRD_PARTY_BUILD_PACKS = {
 }
 
 
+# Wall-clock ceiling for the claim/run.sh subprocess tests. It exists to turn a
+# regression into unbounded retries into a failure instead of a hung suite -- the
+# assertions on exit code, stderr and recorded call counts are what actually verify
+# boundedness, so this budget wants headroom rather than precision. run.sh shells out
+# to python3 once per JSON field it reads, so a 3-attempt run pays a dozen-plus
+# interpreter startups; at the ~150ms each that /usr/bin/python3 costs on macOS that
+# is ~2s of pure startup, against a fraction of it on CI's python3. The former 2s
+# budget therefore failed locally while passing in CI.
+CLAIM_COMMAND_TIMEOUT_SECONDS = 30
+
+
+def hermetic_env() -> dict[str, str]:
+    """Base subprocess environment with ambient Gas Town session state stripped.
+
+    A running `gc` session exports a large GC_*/BEADS_* family describing *that*
+    session. The pack commands exercised below read those same names -- `claim/run.sh`
+    derives its expected route from `${GC_TEMPLATE:-${GC_AGENT:-}}` -- so inheriting
+    the caller's environment silently overrides whatever a test meant to set up. A
+    polecat worktree exports GC_TEMPLATE=<rig>/gastown.polecat, which wins over the
+    test's GC_AGENT and makes the claim fail with a route mismatch; CI exports
+    neither and the test passes.
+
+    Stripping the family wholesale (rather than popping known offenders, which is how
+    GC_TEMPLATE was missed) is safe because CI already runs this suite with none of
+    them set: no passing test can depend on an ambient value. Spread this in place of
+    `os.environ` and declare every GC_*/BEADS_* variable the script should see.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith(("GC_", "BEADS_"))}
+
+
 def methodology_selector_defaults(expected: dict) -> dict[str, str]:
     return {
         "planning_formula": expected["planning_formula"],
@@ -758,7 +788,7 @@ class FormulaAssetTests(unittest.TestCase):
             )
             fake_gc.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_AGENT": "gc.implementation-worker",
                 "GC_PACK_DIR": str(root),
@@ -808,7 +838,7 @@ class FormulaAssetTests(unittest.TestCase):
             )
             fake_gc.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_PACK_DIR": str(root),
                 "GC_PACK_NAME": "gc",
@@ -850,7 +880,7 @@ class FormulaAssetTests(unittest.TestCase):
             fake_sleep.write_text("#!/bin/sh\n/bin/sleep 0.05\n", encoding="utf-8")
             fake_sleep.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_AGENT": "gc.implementation-worker",
                 "GC_PACK_DIR": str(root),
@@ -859,7 +889,11 @@ class FormulaAssetTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
             result = subprocess.run(
-                [str(command)], capture_output=True, env=env, text=True, timeout=2
+                [str(command)],
+                capture_output=True,
+                env=env,
+                text=True,
+                timeout=CLAIM_COMMAND_TIMEOUT_SECONDS,
             )
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -888,14 +922,15 @@ class FormulaAssetTests(unittest.TestCase):
             )
             fake_gc.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "GC_PACK_DIR": str(root),
                 "GC_PACK_NAME": "gc",
                 "GC_TEST_CALLS": str(calls),
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
-            for key in ("BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"):
-                env.pop(key, None)
+            # No assignee is declared on purpose: hermetic_env() leaves BEADS_ACTOR,
+            # GC_SESSION_NAME, GC_SESSION_ID and GC_AGENT unset, which is what drives
+            # run.sh down the "missing expected assignee" rejection path asserted below.
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -922,7 +957,7 @@ class FormulaAssetTests(unittest.TestCase):
             )
             fake_gc.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_PACK_DIR": str(root),
                 "GC_PACK_NAME": "gc",
@@ -955,14 +990,15 @@ class FormulaAssetTests(unittest.TestCase):
             )
             fake_gc.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "GC_PACK_DIR": str(root),
                 "GC_PACK_NAME": "gc",
                 "GC_TEST_CALLS": str(calls),
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
-            for key in ("BEADS_ACTOR", "GC_SESSION_NAME", "GC_SESSION_ID", "GC_AGENT"):
-                env.pop(key, None)
+            # No assignee is declared on purpose: hermetic_env() leaves BEADS_ACTOR,
+            # GC_SESSION_NAME, GC_SESSION_ID and GC_AGENT unset, which is what drives
+            # run.sh down the "missing expected assignee" rejection path asserted below.
             result = subprocess.run([str(command)], capture_output=True, env=env, text=True)
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -993,7 +1029,7 @@ class FormulaAssetTests(unittest.TestCase):
             )
             fake_gc.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_AGENT": "gc.implementation-worker",
                 "GC_PACK_DIR": str(root),
@@ -1002,7 +1038,11 @@ class FormulaAssetTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
             result = subprocess.run(
-                [str(command)], capture_output=True, env=env, text=True, timeout=2
+                [str(command)],
+                capture_output=True,
+                env=env,
+                text=True,
+                timeout=CLAIM_COMMAND_TIMEOUT_SECONDS,
             )
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -1040,7 +1080,7 @@ class FormulaAssetTests(unittest.TestCase):
             fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_sleep.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_AGENT": "gc.implementation-worker",
                 "GC_PACK_DIR": str(root),
@@ -1099,7 +1139,7 @@ class FormulaAssetTests(unittest.TestCase):
             fake_sleep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_sleep.chmod(0o755)
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "BEADS_ACTOR": "worker",
                 "GC_AGENT": "gc.implementation-worker",
                 "GC_PACK_DIR": str(root),
@@ -1108,7 +1148,11 @@ class FormulaAssetTests(unittest.TestCase):
                 "PATH": f"{bin_dir}:/usr/bin:/bin",
             }
             result = subprocess.run(
-                [str(command)], capture_output=True, env=env, text=True, timeout=2
+                [str(command)],
+                capture_output=True,
+                env=env,
+                text=True,
+                timeout=CLAIM_COMMAND_TIMEOUT_SECONDS,
             )
             call_lines = calls.read_text(encoding="utf-8").splitlines()
 
@@ -3975,7 +4019,7 @@ description = "Override sink that writes the base triage report contract."
             fake_gc.chmod(0o755)
 
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_DIR": str(show_dir),
                 "GC_BEAD_ID": bead_id,
@@ -4033,7 +4077,7 @@ description = "Override sink that writes the base triage report contract."
             fake_gc.chmod(0o755)
 
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_JSON": str(show_path),
                 "BD_PARENT_SHOW_JSON": str(parent_show_path),
@@ -4542,7 +4586,7 @@ description = "Override sink that writes the base triage report contract."
             )
 
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_JSON": str(show_json),
                 "BD_LIST_JSON": str(list_json),
@@ -4638,7 +4682,7 @@ description = "Override sink that writes the base triage report contract."
             )
 
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_JSON": str(show_json),
                 "BD_LIST_JSON": str(list_json),
@@ -4714,7 +4758,7 @@ description = "Override sink that writes the base triage report contract."
             )
 
             env = {
-                **os.environ,
+                **hermetic_env(),
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
                 "BD_SHOW_JSON": str(show_json),
                 "BD_LIST_JSON": str(list_json),

@@ -17,6 +17,25 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts"))
 import github_intake_service as service
 
 
+def strip_ambient_gastown_env() -> None:
+    """Drop GC_*/BEADS_* variables inherited from a live Gas Town session.
+
+    A running `gc` session exports a large GC_*/BEADS_* family describing *that*
+    session (GC_BIN, GC_TEMPLATE, GC_SESSION_NAME, BEADS_ACTOR, ...). The service
+    under test reads several of those names directly -- `gc_bd_command` builds its
+    argv from `os.environ.get("GC_BIN", "gc")` -- so inheriting them makes command
+    assertions depend on where the suite runs: CI has none of them set and sees the
+    bare "gc" default, while a polecat worktree has GC_BIN pointing at an absolute
+    path. Clear the whole family so each test declares the variables it exercises.
+
+    Stripping the family (rather than popping known offenders one at a time) is safe
+    because CI already runs this suite with none of them set: no passing test can
+    depend on an ambient value.
+    """
+    for key in [key for key in os.environ if key.startswith(("GC_", "BEADS_"))]:
+        del os.environ[key]
+
+
 class DummyWebhookHandler:
     def __init__(self, body: bytes, headers: dict[str, str]) -> None:
         self.headers = headers
@@ -41,6 +60,7 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self._old_environ = os.environ.copy()
+        strip_ambient_gastown_env()
         os.environ["GC_CITY_ROOT"] = self.tempdir.name
 
     def tearDown(self) -> None:
@@ -59,6 +79,41 @@ class GitHubIntakeServiceTests(unittest.TestCase):
         self.assertEqual(service.rig_from_target("product/polecat"), "product")
         self.assertEqual(service.rig_from_target("product/polecat-2"), "product")
         self.assertEqual(service.rig_from_target("polecat"), "")
+
+    def test_gc_bd_command_defaults_to_bare_gc_without_gc_bin(self) -> None:
+        self.assertEqual(
+            service.gc_bd_command("/city", "show", "bd-1"),
+            ["gc", "--city", "/city", "bd", "show", "bd-1"],
+        )
+
+    def test_gc_bd_command_honors_gc_bin_override(self) -> None:
+        with mock.patch.dict(os.environ, {"GC_BIN": "/opt/gc/bin/gc"}):
+            self.assertEqual(
+                service.gc_bd_command("/city", "show", "bd-1"),
+                ["/opt/gc/bin/gc", "--city", "/city", "bd", "show", "bd-1"],
+            )
+
+    def test_strip_ambient_gastown_env_clears_session_family(self) -> None:
+        # CI runs with no GC_*/BEADS_* set, so it cannot observe a missing scrub in
+        # setUp. Simulate a polecat session here so the helper stays guarded.
+        ambient = {
+            "GC_BIN": "/ambient/bin/gc",
+            "GC_TEMPLATE": "ambient/gastown.polecat",
+            "GC_SESSION_NAME": "ambient-session",
+            "BEADS_ACTOR": "ambient-actor",
+            "PATH": "/usr/bin:/bin",
+        }
+        with mock.patch.dict(os.environ, ambient):
+            strip_ambient_gastown_env()
+
+            self.assertEqual(
+                [key for key in os.environ if key.startswith(("GC_", "BEADS_"))], []
+            )
+            self.assertEqual(os.environ["PATH"], "/usr/bin:/bin")
+            self.assertEqual(
+                service.gc_bd_command("/city", "show", "bd-1"),
+                ["gc", "--city", "/city", "bd", "show", "bd-1"],
+            )
 
     def test_extract_json_output_accepts_dict_and_list_shapes(self) -> None:
         self.assertEqual(service.extract_json_output('{"id":"bd-1"}')["id"], "bd-1")
