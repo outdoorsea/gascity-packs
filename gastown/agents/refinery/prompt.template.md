@@ -66,20 +66,19 @@ external observers (witness, mayor) only catch on a slow patrol cycle.
 
 ### 1. ALWAYS pour the next wisp before burning the current one
 
+"Pour" here means **`ensure`**, never a bare pour. Pouring unconditionally is
+what leaked three open wisps onto a live refinery: every restart that already
+had a queued successor added another. `ensure` reuses the queued wisp when one
+exists and pours only when none does.
+
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not burning."
+CURRENT_WISP=$(gc gastown wisp-reconcile current) || exit 1
+# --except keeps `ensure` from handing back the wisp you are about to burn.
+NEXT=$(gc gastown wisp-reconcile ensure mol-refinery-patrol --except "$CURRENT_WISP" \
+         --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}) || {
+  echo "Could not guarantee exactly one next refinery wisp; not burning."
   exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not burning."
-  exit 1
-fi
+}
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
@@ -112,19 +111,12 @@ shortcuts or summarizing prematurely. If context feels heavy, then **pour and
 assign the next wisp, burn the current wisp, THEN request restart**:
 
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-NEXT=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-if [ -z "$NEXT" ]; then
-  echo "Could not pour next refinery wisp; not requesting restart."
+CURRENT_WISP=$(gc gastown wisp-reconcile current) || exit 1
+NEXT=$(gc gastown wisp-reconcile ensure mol-refinery-patrol --except "$CURRENT_WISP" \
+         --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}) || {
+  echo "Could not guarantee exactly one next refinery wisp; not requesting restart."
   exit 1
-fi
-if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-  echo "Could not assign next refinery wisp; not requesting restart."
-  exit 1
-fi
+}
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
@@ -173,12 +165,19 @@ for ORPHAN in $ORPHANS; do
   # surfaces beads the inbox missed.
 done
 
-# Step 1: Check for an in-progress patrol wisp
-{{ .AssignedInProgressQuery }}
+# Step 1: Reconcile your patrol wisps to exactly one, and resume it.
+# `startup` keeps an in_progress wisp over a queued one and burns the surplus.
+# Checking without reconciling is how this refinery accumulated three open
+# wisps: each restart that could not see the one it already owned poured
+# another.
+WISP=$(gc gastown wisp-reconcile startup) || exit 1
 
-# If none found, pour one (root-only — no child step beads) and assign it
-WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$WISP" --assignee="$GC_AGENT"
+# Step 2: Own none? Pour exactly one and assign it.
+if [ -z "$WISP" ]; then
+  WISP=$(gc gastown wisp-reconcile ensure mol-refinery-patrol \
+           --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}) || exit 1
+fi
+echo "patrol wisp: $WISP"
 ```
 
 Then follow the formula. The step descriptions below are your instructions —
@@ -308,8 +307,9 @@ alert the witness, not `gc mail send`.
 
 | Want to... | Correct command |
 |------------|----------------|
-| Pour next wisp | `gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}` |
-| Burn current wisp | Follow Patrol Lifecycle Discipline Rule 1: pour next wisp, validate `NEXT`, assign it to `$GC_AGENT`, then burn `$CURRENT_WISP`. Never run a standalone burn. |
+| Pour next wisp | `gc gastown wisp-reconcile ensure mol-refinery-patrol --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}` (never a bare `gc bd mol wisp` — that pours a duplicate) |
+| Reconcile wisps to one | `gc gastown wisp-reconcile startup` |
+| Burn current wisp | Follow Patrol Lifecycle Discipline Rule 1: `ensure` the next wisp, confirm it exited 0, then burn `$CURRENT_WISP`. Never run a standalone burn. |
 | Find assigned work | `gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee="$GC_AGENT" --status=open` |
 | Snapshot event position | `gc events --seq` |
 | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |

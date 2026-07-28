@@ -1,8 +1,11 @@
 description = """
 Witness patrol loop. Poured as a root-only wisp on startup:
 
-  gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}'
-  gc bd update $WISP --assignee=$GC_AGENT
+  gc gastown wisp-reconcile ensure mol-witness-patrol --var binding_prefix='{{binding_prefix}}'
+
+That command pours AND assigns, and pours only if the agent does not
+already own a wisp. Never bootstrap with a bare `gc bd mol wisp` — an
+unguarded pour leaks a wisp on every restart.
 
 Each wisp is ONE iteration: check for work, patrol, pour the next
 iteration. On crash, re-read the formula steps and determine where
@@ -628,23 +631,42 @@ is already assigned — the new session resumes from context.
 Reuse an already-queued wisp instead of pouring a duplicate. A prior cycle
 may have poured a next wisp without burning, or a restart may have raced —
 keep one open patrol wisp and burn any surplus, so wisps never accumulate.
-Wisp roots are `issue_type=molecule` (never `--type=wisp`, which is not a
-valid gc bd type and matches nothing).
+
+`gc gastown wisp-reconcile ensure` is the single implementation of that rule; do not
+hand-roll the query here. It reconciles the queued wisps to one and pours only
+if none is queued.
+
+`--except "$CURRENT"` is load-bearing, not defensive. A wisp is NOT reliably
+moved to in_progress while you run it, so the wisp you are running now can
+still be `open` — pick it as your own successor, burn it in step 3, and you
+are left with ZERO wisps and a patrol loop that dies silently. That is worse
+than the duplicate leak: a leak accumulates recoverable surplus, this stops
+the engine.
 ```bash
-OPEN_WISPS=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=0 --json | jq -r '.[].id')
-NEXT=$(printf '%s\n' $OPEN_WISPS | sed -n '1p')
-for extra in $(printf '%s\n' $OPEN_WISPS | sed '1d'); do
-  gc bd mol burn "$extra" --force
-done
-if [ -z "$NEXT" ]; then
-  NEXT=$(gc bd mol wisp mol-witness-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-  gc bd update "$NEXT" --assignee="$GC_AGENT"
-fi
+CURRENT=$(gc gastown wisp-reconcile current) || {
+  echo "Could not resolve the current wisp; not pouring and not burning."
+  exit 1
+}
+NEXT=$(gc gastown wisp-reconcile ensure mol-witness-patrol \
+         --except "$CURRENT" --var binding_prefix='{{binding_prefix}}') || {
+  echo "wisp-reconcile could not guarantee exactly one next wisp — not burning this one."
+  exit 1
+}
+echo "next wisp: $NEXT"
 ```
 
+A non-zero exit means "do not pour and do not burn", never "nothing found".
+Leaving this wisp open is recoverable and visible; burning it without a
+successor stops the patrol loop silently.
+
 **3. Burn this wisp:**
+
+Only after `ensure` succeeded above. Burn `$CURRENT` from step 2 — resolving
+the id again by hand risks burning something else.
 ```bash
-gc bd mol burn <this-wisp-id> --force
+if [ -n "$CURRENT" ]; then
+  gc bd mol burn "$CURRENT" --force
+fi
 ```
 
 **4. Exit this turn:**

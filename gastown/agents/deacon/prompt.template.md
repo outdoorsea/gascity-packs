@@ -60,9 +60,16 @@ Your formula: `mol-deacon-patrol`
 # Step 2: Nothing? Check mail for attached work
 gc mail inbox
 
-# Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
-NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+# Step 3: Still nothing? Reconcile to exactly one patrol wisp, pouring only
+# if you own none. Never pour unconditionally — that is what leaks a wisp on
+# every restart. `wisp-reconcile` keys off $GC_AGENT for both the query and
+# the assignment; assigning to $GC_ALIAS while querying $GC_AGENT is its own
+# silent leak whenever the two differ.
+WISP=$(gc gastown wisp-reconcile startup) || exit 1
+if [ -z "$WISP" ]; then
+  WISP=$(gc gastown wisp-reconcile ensure mol-deacon-patrol --var binding_prefix={{ .BindingPrefix }}) || exit 1
+fi
+echo "patrol wisp: $WISP"
 
 # Step 4: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
@@ -87,34 +94,17 @@ without running `next-iteration` (crash recovery or formula misread).
 If `next-iteration` already ran, do not pour again; run `gc hook`.
 
 ```bash
-CURRENT_WISP=${GC_BEAD_ID:-}
-if [ -z "$CURRENT_WISP" ]; then
-  CURRENT_WISP=$(gc bd list --assignee="$GC_AGENT" --status=in_progress --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-fi
-ASSIGNED_WISP=$(gc bd list --assignee="$GC_AGENT" --status=open --type=molecule --include-infra --limit=1 --json | jq -r '.[0].id // empty')
-if [ -n "$CURRENT_WISP" ] && [ -z "$ASSIGNED_WISP" ]; then
-  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not pour next deacon wisp; not burning."
-    exit 1
-  fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign next deacon wisp; not burning."
-    exit 1
-  fi
-  gc bd mol burn "$CURRENT_WISP" --force
-elif [ -n "$CURRENT_WISP" ]; then
-  gc bd mol burn "$CURRENT_WISP" --force
-elif [ -z "$ASSIGNED_WISP" ]; then
-  NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id // empty')
-  if [ -z "$NEXT" ]; then
-    echo "Could not bootstrap next deacon wisp."
-    exit 1
-  fi
-  if ! gc bd update "$NEXT" --assignee="$GC_AGENT"; then
-    echo "Could not assign bootstrap deacon wisp."
-    exit 1
-  fi
+CURRENT=$(gc gastown wisp-reconcile current) || exit 1
+# --except "$CURRENT" is load-bearing. A wisp is NOT reliably moved to
+# in_progress while you run it, so the one you are running can still be
+# 'open' — choose it as your own successor, burn it below, and you are left
+# with ZERO wisps and a patrol loop that dies silently.
+NEXT=$(gc gastown wisp-reconcile ensure mol-deacon-patrol \
+         --except "$CURRENT" --var binding_prefix={{ .BindingPrefix }}) || exit 1
+echo "next wisp: $NEXT"
+# Burn only once a successor is guaranteed. Nothing to burn on a bootstrap.
+if [ -n "$CURRENT" ]; then
+  gc bd mol burn "$CURRENT" --force
 fi
 gc hook
 ```
@@ -194,7 +184,8 @@ Individual stuck agents don't need escalation — the warrant system handles the
 
 | Want to... | Correct command |
 |------------|----------------|
-| Pour next wisp | `gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{ .BindingPrefix }}'` |
+| Pour next wisp | `gc gastown wisp-reconcile ensure mol-deacon-patrol --var binding_prefix='{{ .BindingPrefix }}'` (never a bare `gc bd mol wisp` — that pours a duplicate) |
+| Reconcile wisps to one | `gc gastown wisp-reconcile startup` |
 | Read formula recipe | `gc bd formula show mol-deacon-patrol` (NOT `gc bd mol show` — that's for poured instances) |
 | Context exhaustion | `gc runtime request-restart` |
 | Request target restart | `gc session kill <target>` |

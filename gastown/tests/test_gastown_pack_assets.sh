@@ -320,11 +320,105 @@ test_polecat_stall_requires_proof_of_life_not_just_a_timestamp() {
         fail "the shutdown dance must treat a rising token counter as proof of life"
 }
 
+# Every patrol agent must own exactly one wisp. That rule was copy-pasted shell
+# in six files and drifted apart in three independent ways at once — bare `bd`
+# instead of `gc bd`, `--type=wisp` instead of `--type=molecule`, and a missing
+# `--include-infra` — each one silently returning nothing, so the agent
+# concluded "no wisp exists" and poured a duplicate on every restart. Two of
+# the six carried no reconcile query at all and simply poured.
+#
+# The fix was to delete all six copies in favour of `gc gastown wisp-reconcile`.
+# This test is what keeps them deleted: without it the next hand-rolled query
+# reintroduces the leak, and a leak is invisible until someone counts wisps.
+test_wisp_reconcile_is_the_only_implementation() {
+    local cmd="$GASTOWN/commands/wisp-reconcile/run.sh"
+    local script="$GASTOWN/assets/scripts/wisp-reconcile.sh"
+    local doc hits
+
+    [[ -f "$script" ]] || fail "missing assets/scripts/wisp-reconcile.sh"
+    [[ -f "$cmd" ]] || fail "missing commands/wisp-reconcile/run.sh"
+    [[ -x "$cmd" ]] || fail "commands/wisp-reconcile/run.sh must be executable"
+    [[ -f "$GASTOWN/commands/wisp-reconcile/help.md" ]] ||
+        fail "missing commands/wisp-reconcile/help.md"
+
+    for doc in "$GASTOWN"/formulas/mol-*-patrol.toml \
+               "$GASTOWN"/agents/witness/prompt.template.md \
+               "$GASTOWN"/agents/refinery/prompt.template.md \
+               "$GASTOWN"/agents/deacon/prompt.template.md; do
+        # A hand-rolled RECONCILE listing is the original defect: assignee +
+        # molecule type is the shape that answers "which wisps do I own", and
+        # there is exactly one correct spelling of it, in the script. Listing
+        # molecules for other reasons (e.g. closed wisps for predecessor
+        # context) is unrelated and stays allowed.
+        ! grep -E 'gc bd list[^|]*--assignee[^|]*--type=molecule' "$doc" >/dev/null ||
+            fail "${doc#$GASTOWN/}: hand-rolls the wisp reconcile query; call 'gc gastown wisp-reconcile' instead"
+        # Not a valid gc bd type — matches nothing, silently. Only flag it in
+        # an actual command; prose explaining why it was wrong is welcome.
+        ! grep -E 'gc bd [a-z]+[^|]*--type=wisp' "$doc" >/dev/null ||
+            fail "${doc#$GASTOWN/}: filters --type=wisp, which matches nothing"
+        # An unguarded pour leaks a wisp per restart; `ensure` reuses instead.
+        ! grep -E 'gc bd mol wisp mol-[a-z]+-patrol' "$doc" >/dev/null ||
+            fail "${doc#$GASTOWN/}: pours a patrol wisp directly; use 'wisp-reconcile ensure'"
+        # GC_PACK_DIR is set for pack COMMANDS, never in an agent's shell, so
+        # this path resolves to /assets/... and the fail-closed guard behind it
+        # halts the patrol loop on its first cycle — worse than the leak.
+        ! grep -F 'GC_PACK_DIR' "$doc" | grep -F 'wisp-reconcile' >/dev/null ||
+            fail "${doc#$GASTOWN/}: resolves wisp-reconcile via \$GC_PACK_DIR, which is unset in an agent shell"
+    done
+
+    # The three patrol formulas must actually call it — a guard that greps only
+    # for absence would pass on a file that reconciles nothing at all.
+    for doc in "$GASTOWN"/formulas/mol-witness-patrol.toml \
+               "$GASTOWN"/formulas/mol-refinery-patrol.toml \
+               "$GASTOWN"/formulas/mol-deacon-patrol.toml; do
+        grep -F 'gc gastown wisp-reconcile ensure' "$doc" >/dev/null ||
+            fail "${doc#$GASTOWN/}: never calls 'gc gastown wisp-reconcile ensure'"
+    done
+
+    # `ensure` must never hand back the wisp the caller is about to burn. A
+    # patrol loop that selects itself as its own successor burns to zero wisps
+    # and dies silently — strictly worse than the duplicate leak.
+    #
+    # The script defaults --except to $GC_BEAD_ID, which holds only where the
+    # runtime injected it. Every successor call therefore resolves the id with
+    # `current` and passes it explicitly, so the guard survives an unset
+    # GC_BEAD_ID.
+    #
+    # Checked per CALL SITE, not per file. An earlier version of this test
+    # grepped the whole file for '--except' and was vacuous: the prose
+    # explaining why the flag matters satisfied it, so dropping the flag from
+    # the actual command still passed.
+    #
+    # `NEXT=` is what distinguishes a successor call from a bootstrap one.
+    # Bootstrap calls assign to `WISP=` and correctly carry no --except —
+    # an agent with no wisp has nothing to exclude and nothing to burn.
+    local folded call
+    for doc in "$GASTOWN"/formulas/mol-witness-patrol.toml \
+               "$GASTOWN"/formulas/mol-refinery-patrol.toml \
+               "$GASTOWN"/formulas/mol-deacon-patrol.toml \
+               "$GASTOWN"/agents/refinery/prompt.template.md \
+               "$GASTOWN"/agents/deacon/prompt.template.md \
+               "$GASTOWN"/agents/witness/prompt.template.md; do
+        # Fold backslash continuations first: three of these calls wrap across
+        # lines, and a per-line grep would never see their flags.
+        folded=$(awk '{while (/\\$/ && (getline nxt) > 0) {sub(/\\$/, ""); $0 = $0 nxt} print}' "$doc")
+        hits=$(printf '%s\n' "$folded" | grep -cE 'NEXT=.*wisp-reconcile ensure' || true)
+        [[ "$hits" -gt 0 ]] ||
+            fail "${doc#$GASTOWN/}: no 'NEXT=... wisp-reconcile ensure' call; the successor pour is missing"
+        while IFS= read -r call; do
+            [[ -n "$call" ]] || continue
+            [[ "$call" == *--except* ]] ||
+                fail "${doc#$GASTOWN/}: 'NEXT=... wisp-reconcile ensure' without --except; it can return the wisp being burned"
+        done <<<"$(printf '%s\n' "$folded" | grep -E 'NEXT=.*wisp-reconcile ensure' || true)"
+    done
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_witness_salvage_reads_work_dir_metadata
 test_polecat_health_check_is_measured_not_improvised
 test_polecat_stall_requires_proof_of_life_not_just_a_timestamp
+test_wisp_reconcile_is_the_only_implementation
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented
