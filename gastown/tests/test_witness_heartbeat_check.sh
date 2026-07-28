@@ -40,10 +40,29 @@ run_check() {
     ERR=$(cat "$ERRFILE")
 }
 
+# epoch_utc — epoch seconds -> RFC3339 UTC. GNU spells this `date -d @<epoch>`;
+# BSD/macOS spells it `date -r <epoch>`. The flavour is probed once here rather
+# than with a per-call `||` chain for two reasons: a chain that falls through
+# both arms yields an empty string, which turns every assertion below into a
+# confusing parse failure instead of a clear one; and GNU's `-r` means "mtime of
+# FILE", so a BSD-first chain would silently print a file's mtime on GNU if a
+# file named like the epoch happened to exist. Probe GNU first, fail loud if
+# neither works.
+if date -u -d '@0' +%Y >/dev/null 2>&1; then
+    epoch_utc() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ; }
+elif date -u -r 0 +%Y >/dev/null 2>&1; then
+    epoch_utc() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ; }
+else
+    echo "FAIL: no usable date(1) — neither GNU '-d @<epoch>' nor BSD '-r <epoch>'" >&2
+    exit 1
+fi
+
 ts_ago() {
-    # Seconds ago -> RFC3339 UTC. GNU date here; the script under test is what
-    # needs BSD portability, not this Linux-only CI test.
-    date -u -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%SZ
+    epoch_utc "$(( $(date -u +%s) - $1 ))"
+}
+
+ts_ahead() {
+    epoch_utc "$(( $(date -u +%s) + $1 ))"
 }
 
 tmp=$(mktemp -d)
@@ -117,7 +136,7 @@ test_fractional_seconds_parse() {
 }
 
 test_future_heartbeat_is_clock_skew_not_stale() {
-    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$(date -u -d "@$(( $(date -u +%s) + 3600 ))" +%Y-%m-%dT%H:%M:%SZ)")"
+    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$(ts_ahead 3600)")"
     [ "$RC" -eq 0 ] || fail "a future heartbeat is skew, not staleness, got $RC ($OUT)"
     printf '%s' "$OUT" | grep -q '^fresh	alpha	alpha/witness	asleep	0	' ||
         fail "a future heartbeat should clamp to age 0, got: $OUT"
