@@ -68,6 +68,10 @@ default = ""
 description = "Seconds to sleep before re-checking. Replaces former event-watch loop which hot-spun on cache-reconcile firehose."
 default = "60"
 
+[vars.polecat_stale_min]
+description = "Minutes of polecat silence — no file write under the worktree, no bead update — before check-polecat-health's deterministic pass marks the bead stale. Stale is a candidate for a proof-of-life peek, never a warrant on its own. The default leaves an order of magnitude over the longest common legitimate silence (one build/vet/test cycle inside a single tool call, ~4 minutes on this fleet) while still surfacing a genuine multi-hour wedge within one patrol cycle. Raise it for rigs whose test suites run long."
+default = "45"
+
 [[steps]]
 id = "check-inbox"
 title = "Context check, then mail"
@@ -453,29 +457,117 @@ The controller detects dead agents and restarts them. But a polecat can
 be alive and stuck — infinite loop, blocked on something, or just not
 progressing. The controller can't detect this; it's a work-layer judgment.
 
-**Step 1: Find active polecat work beads:**
+**Config: polecat_stale_min = {{polecat_stale_min}}**
+
+**Step 1: Deterministic first pass — measure freshness, never eyeball it.**
+
+Run this before forming any judgment, and do not compute staleness any other
+way. Improvised timestamp arithmetic is how this step filed a false warrant
+against a healthy polecat (gp-9ly): a `stat` returned a LOCAL-time mtime, the
+improvisation formatted it with a `Z` suffix, and compared it against a UTC
+`now`. On a PDT host that is a 7-hour error — a file touched 4 minutes earlier
+read as ~7h stale, and a polecat running an ordinary 4-minute build/vet/test
+cycle was written up as looping.
+
 ```bash
-gc bd list --status=in_progress --json --limit=0
+CHECK="${GC_PACK_DIR:-}/assets/scripts/polecat-progress-check.sh"
+if [ -x "$CHECK" ]; then
+  GASTOWN_POLECAT_STALE_MIN={{polecat_stale_min}} bash "$CHECK"; echo "progress check exit: $?"
+else
+  echo "polecat-progress-check.sh not resolvable under GC_PACK_DIR — nothing was measured; see the fallback rule below."
+fi
 ```
-Filter for beads assigned to polecat-pattern agents in YOUR rig.
 
-**Step 2: For each, assess progress:**
+The check selects the beads for you: `in_progress`, assignee matching the
+polecat role as a delimited token, from your own rig's ledger — so it never
+reaches into another rig's polecats. For each, the heartbeat is the NEWER of
+the bead's `updated_at` and the newest file mtime under `metadata.work_dir`.
+Either signal alone misleads: a polecat editing files for an hour without
+touching bd looks stale by bead time, and a polecat mid `go test` touches no
+files at all.
 
-Check the work bead's `UpdatedAt` timestamp and the polecat's molecule
-wisp freshness. Consider:
+It reads those mtimes as raw epoch integers and compares epoch to epoch; the
+only formatting happens under `date -u`. **Never format a local mtime with a
+`Z` suffix** — a `Z` is a claim the value is UTC. If you ever need a timestamp
+by hand, take the bare epoch (`stat -f %m FILE` on macOS, `stat -c %Y FILE` on
+Linux) or render UTC explicitly with `date -u -r <epoch> +%Y-%m-%dT%H:%M:%SZ`.
+Never pass a file path to `date -r`: it means epoch seconds on BSD and a
+filename on GNU, so it is unportable in opposite directions.
 
-- **Recently updated** → making progress, skip
-- **Stale but agent is in a long tool call** → might be fine, use judgment
-- **Very stale, no wisp progress** → likely stuck
+Exit 0 means every in-flight polecat is fresh. Exit 1 means findings, one TSV
+row per bead — verdict, bead, assignee, age_seconds, heartbeat, source,
+commits, dirty:
 
-There are no hardcoded thresholds. Consider the nature of the work, the
-time elapsed, and whether the agent shows any signs of activity. This is
-judgment work — exactly why an LLM does it, not Go code.
+| verdict | meaning | action |
+|---------|---------|--------|
+| `fresh` | file or bead activity inside the window | nothing |
+| `stale` | no activity in the window — a candidate, NOT a verdict | must be confirmed by Step 2 before anything else |
+| `no-heartbeat` | no usable timestamp at all | do NOT warrant on this alone. A freshly-spawned polecat has none yet; only a no-heartbeat that persists across cycles is a signal |
 
-**Step 3: For stuck polecats, file a warrant (deduped).**
+Exit 2 means the check could not run — bad config, an unreadable bead list, or
+no usable `stat`. That is "progress was NOT measured", not health. File no
+warrants on timestamp grounds this cycle, and escalate the breakage:
+
+```bash
+gc mail send mayor/ -s "WITNESS: polecat progress check cannot run" -m "<the check's stderr>"
+```
+
+The same rule applies if the script is not resolvable at all: you have no
+staleness measurement this cycle. Proof of life (Step 2) is still available and
+is then the only basis on which you may act.
+
+**Step 2: Confirm every `stale` verdict with a live proof-of-life peek.**
+
+A `stale` row means only "no file wrote and no bead updated inside the window".
+A polecat blocked in a single long tool call — a big test suite, a cold module
+download, a slow rebase — produces exactly that while working perfectly. The
+timestamp is a candidate signal; the live session is the evidence.
+
+Peek the target twice, with a gap between:
+
+```bash
+gc session peek "$TARGET_SESSION" --lines 40
+sleep 30
+gc session peek "$TARGET_SESSION" --lines 40
+```
+
+A working session's footer carries an elapsed timer and a token counter, e.g.
+`✻ Swirling… (5m 49s · ↓ 12.8k tokens)`.
+
+**A rising token counter, or an advancing narrative — new tool calls, new
+output — between the two peeks is decisive proof of life and OVERRIDES the
+`stale` verdict.** It is a direct observation of the agent working; a timestamp
+is only an inference about it. When the two disagree, the observation wins: do
+not file a warrant, and do not split the difference by filing one anyway with a
+hedged reason.
+
+Only a target that is unchanged across both peeks — same counter, same last
+line, no new output — has failed confirmation and may proceed to Step 3.
+
+**Step 3: Rule out normal mid-flight state before calling it stuck.**
+
+None of the following is evidence of a stall:
+
+- **A large uncommitted diff with zero commits.** That is the ordinary shape of
+  a long-lived polecat that has not reached its commit step yet. The `dirty`
+  and `commits` columns are reported so you can recognize this state, not so
+  you can judge it. Many dirty paths with `commits` at 0 is a polecat
+  mid-implementation, working exactly as designed.
+- **A repeating build/test cadence.** Successive `go build` / `go test` runs a
+  few minutes apart are a healthy verification loop. It is only an infinite
+  loop if the narrative does not advance — same command, same failure, no new
+  reasoning — across peeks taken well apart.
+- **Silence during one long tool call.** Step 2 is what settles this.
+
+**Step 4: For confirmed-stuck polecats, file a warrant (deduped).**
 
 Do NOT kill the agent directly. File a warrant bead and let the dog pool
 handle the shutdown dance (multi-stage interrogation with due process).
+
+A `stale` row alone never justifies a warrant. Reaching this step requires
+both a `stale` verdict from Step 1 and a failed proof-of-life confirmation
+from Step 2, and the `reason` must record both so the dog — and anyone
+auditing a pardon later — can see which evidence was actually gathered.
 
 First check for an existing open warrant against the same target — a second
 warrant spawns a second shutdown dance racing the first (duplicate kills,
@@ -491,7 +583,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
 else
   gc bd create --type=task \
     --title="Stuck: <session-name>" \
-    --metadata '{"target":"<session-name>","reason":"No progress on <bead> for <duration>","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
+    --metadata '{"target":"<session-name>","reason":"No progress on <bead>: heartbeat <age_seconds>s stale (window {{polecat_stale_min}}m), and token counter unchanged across two peeks 30s apart","requester":"witness","gc.routed_to":"{{binding_prefix}}dog"}' \
     --label=warrant
 fi
 ```
@@ -499,15 +591,17 @@ fi
 The dog pool picks up the warrant and runs `mol-shutdown-dance`, which
 gives the polecat 3 chances to prove it's alive before killing it.
 
-**Step 4: Log assessment:**
+**Step 5: Log assessment:**
 
 Note which polecats were checked and their status for observability.
 Don't escalate to mayor for individual stuck polecats — the warrant
 system handles it. Only escalate if you see a pattern (many stuck
 polecats, systemic issue).
 
-**Exit criteria:** All active polecat work beads assessed. Warrants
-filed for stuck agents. Or no stuck polecats found. Continue to
+**Exit criteria:** Every in-flight polecat measured by the deterministic
+check, every `stale` verdict either overridden by proof of life or escalated
+to a warrant, and no warrant filed on a timestamp alone. Or no stale
+polecats found. Continue to
 `next-iteration` — do NOT exit the wisp here. The `next-iteration` step
 is the only place that pours the next wisp and burns this one."""
 

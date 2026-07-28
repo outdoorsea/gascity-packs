@@ -261,9 +261,70 @@ test_witness_salvage_reads_work_dir_metadata() {
         fail "witness salvage must not read gc.work_dir; that is the rig root, not the worktree"
 }
 
+test_polecat_health_check_is_measured_not_improvised() {
+    # gp-9ly: check-polecat-health used to say "there are no hardcoded
+    # thresholds... this is judgment work", handing the witness a staleness
+    # question with no command to run. The witness improvised `date`
+    # arithmetic, formatted a LOCAL-time mtime with a `Z` suffix, compared it
+    # against a UTC now, and read 4 minutes of healthy work as ~7h stale. A
+    # warrant was filed against a polecat that was working correctly.
+    local formula check
+    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+    check="$GASTOWN/assets/scripts/polecat-progress-check.sh"
+
+    [[ -x "$check" ]] ||
+        fail "polecat-progress-check.sh must exist and be executable; the formula guards on [ -x ]"
+    grep -F 'assets/scripts/polecat-progress-check.sh' "$formula" >/dev/null ||
+        fail "check-polecat-health must run the deterministic progress check, not improvise timestamp math"
+    grep -F 'GASTOWN_POLECAT_STALE_MIN={{polecat_stale_min}}' "$formula" >/dev/null ||
+        fail "the staleness window must come from the formula var, not a number invented per cycle"
+    grep -F '[vars.polecat_stale_min]' "$formula" >/dev/null ||
+        fail "polecat_stale_min must be declared so the window is configurable per rig"
+    ! grep -F 'There are no hardcoded thresholds' "$formula" >/dev/null ||
+        fail "check-polecat-health must not regress to threshold-free eyeballing; that phrasing invited the gp-9ly improvisation"
+
+    # A `Z` suffix is a claim the value is UTC. Any format string in the
+    # formula that emits one must be produced under `date -u` — formatting a
+    # local time and appending `Z` is the original bug, in prose form.
+    local offenders
+    offenders=$(grep -n '%H:%M:%SZ' "$formula" | grep -v 'date -u' || true)
+    [[ -z "$offenders" ]] ||
+        fail "every Z-suffixed timestamp format in the witness formula must be under 'date -u'; offending lines: $offenders"
+    grep -F 'Never format a local mtime with a' "$formula" >/dev/null ||
+        fail "the formula must state the local-mtime-with-Z prohibition outright"
+}
+
+test_polecat_stall_requires_proof_of_life_not_just_a_timestamp() {
+    # The other half of gp-9ly: a timestamp is an inference, a live peek is an
+    # observation. A rising token counter must be able to overrule staleness,
+    # and ordinary mid-flight state must not read as a stall.
+    local formula dance
+    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+    dance="$GASTOWN/formulas/mol-shutdown-dance.toml"
+
+    grep -F 'OVERRIDES the' "$formula" >/dev/null ||
+        fail "proof of life must be stated as overriding the stale verdict, not merely weighed against it"
+    grep -F 'rising token counter' "$formula" >/dev/null ||
+        fail "the formula must name the token counter as the concrete proof-of-life signal"
+    grep -F 'gc session peek "$TARGET_SESSION" --lines 40' "$formula" >/dev/null ||
+        fail "the confirmation peek must be a runnable command, not an instruction to 'use judgment'"
+    grep -F 'A `stale` row alone never justifies a warrant' "$formula" >/dev/null ||
+        fail "warrant filing must be gated on a failed proof-of-life confirmation"
+    grep -F 'A large uncommitted diff with zero commits' "$formula" >/dev/null ||
+        fail "normal mid-flight state (dirty tree, no commits) must be named as NOT evidence of a stall"
+    grep -F 'progress was NOT measured' "$formula" >/dev/null ||
+        fail "a check that cannot run must read as unmeasured, never as health"
+
+    # The dog is the last gate before a kill; it needs the same concrete tell.
+    grep -F 'rising counter' "$dance" >/dev/null ||
+        fail "the shutdown dance must treat a rising token counter as proof of life"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_witness_salvage_reads_work_dir_metadata
+test_polecat_health_check_is_measured_not_improvised
+test_polecat_stall_requires_proof_of_life_not_just_a_timestamp
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented

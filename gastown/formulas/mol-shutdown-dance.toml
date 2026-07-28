@@ -157,6 +157,13 @@ Also check for any sign of active work (new tool calls, output being
 generated). Use judgment — explicit "ALIVE" is definitive, but active
 output also indicates the agent is functioning.
 
+A working session's footer carries an elapsed timer and a token counter, e.g.
+`✻ Swirling… (5m 49s · ↓ 12.8k tokens)`. A counter that has risen since the
+peek in `receive-warrant` is proof of life on its own: an agent deep in a long
+tool call cannot answer a nudge, but it is plainly working and must be
+pardoned, not killed. Treat a rising counter exactly as you would an explicit
+ALIVE.
+
 **4. If ALIVE or active:**
 - Close warrant: `gc bd close "$GC_BEAD_ID" --reason "Session responded at attempt 1"`
 - Nudge requester: `gc session nudge "$requester_endpoint" "DOG_DONE: $target - PARDONED after attempt 1"`
