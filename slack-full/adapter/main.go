@@ -1777,7 +1777,7 @@ func confineFileUploadPath(root, path string) (string, error) {
 
 // confinedUploadPath is confineFileUploadPath's full-detail form: it
 // additionally returns the canonical root and the root-relative path,
-// which openBeneath needs for its component walk.
+// which openBeneath needs for its confined open.
 func confinedUploadPath(root, path string) (rootAbs, pathAbs, rel string, err error) {
 	if root == "" {
 		return "", "", "", errors.New("FILE_UPLOAD_ROOT is empty")
@@ -1820,11 +1820,11 @@ func confinedUploadPath(root, path string) (rootAbs, pathAbs, rel string, err er
 }
 
 // readConfinedFile reads realPath after re-asserting that it lies under
-// root, then opens it with openBeneath's component-wise walk so neither
-// a leaf symlink nor a parent directory swapped for a symlink in the
-// TOCTOU window between the caller's EvalSymlinks resolution and the
-// read can redirect the open outside root (gc-cby.10; the parent-swap
-// residual race was gpk-1ta4).
+// root, then opens it with openBeneath's confined open so neither a leaf
+// symlink nor a parent directory swapped for a symlink in the TOCTOU
+// window between the caller's EvalSymlinks resolution and the read can
+// redirect the open outside root (gc-cby.10; the parent-swap residual
+// race was gpk-1ta4).
 //
 // realPath should be the filepath.EvalSymlinks-resolved canonical path
 // the caller has already verified with confineFileUploadPath; the

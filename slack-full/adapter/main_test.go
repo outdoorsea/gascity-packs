@@ -21,7 +21,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -2235,8 +2234,18 @@ func TestHandlePublishFile(t *testing.T) {
 // readConfinedFile helper that closes the gc-cby.10 TOCTOU window —
 // reading a regular file inside the upload root must succeed and return
 // the file's bytes verbatim.
+//
+// The temp dir is canonicalized for the same reason as
+// TestConfineFileUploadPath: readConfinedFile's confinement check
+// EvalSymlinks-resolves the root but not the path, so on a platform whose
+// temp root is reached through a symlink (macOS /var -> /private/var) an
+// unresolved dir makes filepath.Rel return a "../"-prefixed result and
+// the positive case fails as "outside root".
 func TestReadConfinedFileReadsRealFile(t *testing.T) {
 	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	path := filepath.Join(dir, "real.txt")
 	want := []byte("hello world")
 	if err := os.WriteFile(path, want, 0o600); err != nil {
@@ -2255,13 +2264,28 @@ func TestReadConfinedFileReadsRealFile(t *testing.T) {
 // TestReadConfinedFileRejectsSymlink covers the gc-cby.10 residual TOCTOU.
 // In production the call site has already EvalSymlinks-resolved the path
 // to a canonical target with no symlinks; if a symlink appears at the leaf
-// between the confinement re-check and the read, an attacker would have
-// swapped the inode in the race window. O_NOFOLLOW makes that swap visible
-// as ELOOP rather than silent arbitrary-read. Both Linux and macOS return
-// ELOOP from open(2) with O_NOFOLLOW on a symlink — errors.Is unwraps
-// through *os.PathError to the underlying syscall.Errno.
+// between the confinement re-check and the read, an attacker has swapped
+// the inode in the race window. The swap must surface as an error instead
+// of a silent arbitrary read.
+//
+// The link is absolute, which os.OpenInRoot refuses unconditionally. The
+// assertion is on the observable outcome — an error, and no bytes — rather
+// than on a specific errno: the previous component-wise walk set
+// O_NOFOLLOW and so produced ELOOP, but os.OpenInRoot reports a
+// confinement failure as a *fs.PathError wrapping an unexported "path
+// escapes from parent" error for which the standard library exports no
+// sentinel to match with errors.Is. Asserting on the message text instead
+// would couple this test to stdlib wording across Go releases.
+//
+// A *relative* leaf symlink resolving inside the root is followed rather
+// than refused; that case is pinned in
+// TestOpenBeneathFollowsInRootSymlinkButNotAbsoluteOnes, and it reaches
+// only a file already readable by its real path, so confinement holds.
 func TestReadConfinedFileRejectsSymlink(t *testing.T) {
 	dir := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	target := filepath.Join(dir, "target.txt")
 	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
 		t.Fatalf("write target: %v", err)
@@ -2271,12 +2295,16 @@ func TestReadConfinedFileRejectsSymlink(t *testing.T) {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	_, err := readConfinedFile(dir, link)
+	got, err := readConfinedFile(dir, link)
 	if err == nil {
 		t.Fatal("readConfinedFile(symlink): want error, got nil — TOCTOU window unclosed")
 	}
-	if !errors.Is(err, syscall.ELOOP) {
-		t.Errorf("readConfinedFile(symlink) error = %v, want ELOOP", err)
+	if len(got) != 0 {
+		t.Errorf("readConfinedFile(symlink) returned %d bytes with its error, want none", len(got))
+	}
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		t.Errorf("readConfinedFile(symlink) error = %v (%T), want a *os.PathError from the confined open", err, err)
 	}
 }
 
