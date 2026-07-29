@@ -25,31 +25,31 @@ fail() {
     exit 1
 }
 
-# Emit the single fenced bash block of the merge-push step that contains
-# ANCHOR, with {{vars}} rendered from the formula's own defaults the way the
-# formula engine would render them.
+# Emit the single fenced bash block of STEP that contains ANCHOR, with
+# {{vars}} rendered from the formula's own defaults the way the formula engine
+# would render them.
 #
 # Requiring EXACTLY one match is deliberate: if the step is reorganised and an
 # anchor goes missing or turns ambiguous, the test dies loudly instead of
 # quietly exercising nothing.
-extract_block() {
-    python3 - "$FORMULA" "$1" <<'PY'
+extract_step_block() {
+    python3 - "$FORMULA" "$1" "$2" <<'PY'
 import re
 import sys
 import tomllib
 
-formula, anchor = sys.argv[1], sys.argv[2]
+formula, step_id, anchor = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(formula, "rb") as handle:
     data = tomllib.load(handle)
 
-step = next(s for s in data["steps"] if s["id"] == "merge-push")
+step = next(s for s in data["steps"] if s["id"] == step_id)
 blocks = [
     b for b in re.findall(r"```bash\n(.*?)```", step["description"], re.S)
     if anchor in b
 ]
 if len(blocks) != 1:
     sys.exit(
-        f"expected exactly 1 merge-push bash block containing {anchor!r}, "
+        f"expected exactly 1 {step_id} bash block containing {anchor!r}, "
         f"found {len(blocks)}"
     )
 
@@ -62,16 +62,39 @@ sys.stdout.write(rendered)
 PY
 }
 
+# Most blocks under test live in merge-push; keep the short spelling for them.
+extract_block() {
+    extract_step_block merge-push "$1"
+}
+
 # `gc` stub: reads bead JSON from a file, records every mutation as one line in
 # $GC_LOG so tests can assert on what the formula did (and did not) write.
 # Dispatch and log lines are both spelled as the full `gc bd ...` command, so
 # assertions below match the same string the stub writes.
+#
+# `gc bd list` is served from two files so one sandbox can answer both queries
+# the find-work step makes, told apart by the awaiting_merge filter:
+#   GC_LIST_AWAITING  the --metadata-field=awaiting_merge=true query
+#   GC_LIST_WORK      the --has-metadata-key=branch work-selection query
+# Both default to an empty array rather than empty output -- `jq` errors on an
+# empty stdin, and a test must not pass because jq died.
 write_gc_stub() {
     cat >"$1/gc" <<'SH'
 #!/usr/bin/env sh
 case "gc $1 $2" in
     "gc bd show")
         cat "$GC_BEAD_JSON"
+        exit 0
+        ;;
+    "gc bd list")
+        case "$*" in
+            *awaiting_merge=true*)
+                if [ -n "${GC_LIST_AWAITING:-}" ]; then cat "$GC_LIST_AWAITING"; else printf '[]\n'; fi
+                ;;
+            *)
+                if [ -n "${GC_LIST_WORK:-}" ]; then cat "$GC_LIST_WORK"; else printf '[]\n'; fi
+                ;;
+        esac
         exit 0
         ;;
 esac
@@ -91,6 +114,9 @@ SH
 #   GH_CHECKS_JSON      stdout of `gh pr checks --json ...`
 #   GH_CHECKS_ERR       stderr of the same
 #   GH_CHECKS_EXIT      its exit status
+#   GH_PR_VIEW_JSON     stdout of `gh pr view --json state,mergedAt,...`;
+#                       unset => the command answers nothing, which is how a
+#                       test reaches the git-side merge_landed fallback
 write_gh_stub() {
     cat >"$1/gh" <<'SH'
 #!/usr/bin/env sh
@@ -116,6 +142,11 @@ case "$1" in
         ;;
     pr)
         case "$2" in
+            view)
+                [ -n "${GH_PR_VIEW_JSON:-}" ] || exit 1
+                printf '%s\n' "$GH_PR_VIEW_JSON"
+                exit 0
+                ;;
             checks)
                 case "$*" in
                     *--watch*) exit "${GH_WATCH_EXIT:-0}" ;;
@@ -151,7 +182,8 @@ new_sandbox() {
     export GC_LOG GC_BEAD_JSON GC_RIG
     # Unset per-scenario knobs so a previous test cannot leak into the next.
     unset GH_PROTECTION_JSON GH_PROTECTED_FLAG GH_WATCH_EXIT \
-        GH_CHECKS_JSON GH_CHECKS_ERR GH_CHECKS_EXIT
+        GH_CHECKS_JSON GH_CHECKS_ERR GH_CHECKS_EXIT GH_PR_VIEW_JSON \
+        GC_LIST_AWAITING GC_LIST_WORK
 }
 
 # Bead with the given merge_strategy ("" = unset, i.e. let the formula decide).
@@ -450,6 +482,233 @@ test_no_required_checks_anywhere_proceeds() {
     ! grep -q "merge_result=blocked" "$GC_LOG" || fail "an empty required set must not block"
 }
 
+# ---------------------------------------------------------------------------
+# `mr` mode: a published PR parks the bead, it does not complete it.
+#
+# The bug these lock down: `mr` used to close the work bead the moment the PR
+# verified as OPEN. A closed bead leaves `gc bd ready`, pool-demand queries and
+# orphan scans in the same instant, so a green PR nobody merged had no open
+# bead, no assignee and no sling -- nothing re-dispatched it and nothing merged
+# it. Three PRs stranded that way in one day; measured against the GitHub API,
+# beads closed 40-78 minutes before their PR merged, and one never merged.
+# ---------------------------------------------------------------------------
+
+# An `mr` bead already parked at awaiting_merge, as find-work will find it.
+# since_epoch/stale shape the staleness arithmetic; fork is the recorded fork
+# point the git-side predicate needs to tell "landed" from "empty branch".
+write_awaiting_bead() {
+    aw_since="$1"
+    aw_stale_field=""
+    [ -n "${2:-}" ] && aw_stale_field=",\"awaiting_merge_stale\":\"$2\""
+    aw_fork_field=""
+    [ -n "${3:-}" ] && aw_fork_field=",\"fork_sha\":\"$3\""
+    cat >"$GC_BEAD_JSON" <<JSON
+[{"id":"bd-1","title":"Fix the thing",
+  "metadata":{"branch":"polecat/bd-1","target":"main","merge_strategy":"mr",
+    "awaiting_merge":"true","pr_number":"42",
+    "pr_url":"https://github.com/acme/widgets/pull/42",
+    "awaiting_merge_since_epoch":"$aw_since"$aw_stale_field$aw_fork_field}}]
+JSON
+    GC_LIST_AWAITING="$SANDBOX/awaiting.json"
+    printf '[{"id":"bd-1"}]\n' >"$GC_LIST_AWAITING"
+    export GC_LIST_AWAITING
+}
+
+# Run the find-work re-check. Optional $1 = directory to run it in, so a test
+# can point it at a real git repo for the content-aware fallback.
+run_recheck_block() {
+    extract_step_block find-work 'AWAITING_MERGE_RECHECK' >"$SANDBOX/recheck.sh"
+    (cd "${1:-$SANDBOX}" && PATH="$BIN:$PATH" GC_AGENT=testrig/refinery \
+        bash "$SANDBOX/recheck.sh" >"$SANDBOX/recheck.out" 2>&1)
+}
+
+assert_not_closed() {
+    ! grep -q "gc bd close" "$GC_LOG" ||
+        fail "$1: an unmerged PR must never close the bead, log: $(cat "$GC_LOG")"
+    ! grep -q "merge_result=merged" "$GC_LOG" ||
+        fail "$1: an unmerged PR must never record a merge, log: $(cat "$GC_LOG")"
+}
+
+test_mr_parks_bead_open_instead_of_closing_on_pr_open() {
+    # The headline regression. Publishing the PR is the whole of `mr`'s work,
+    # and it must still leave an OPEN, findable bead behind.
+    new_sandbox
+    write_bead mr
+    extract_block 'AWAITING_MERGE_PARK' >"$SANDBOX/park.sh"
+    PATH="$BIN:$PATH" WORK=bd-1 TARGET=main PR_NUMBER=42 \
+        PR_URL=https://github.com/acme/widgets/pull/42 \
+        bash "$SANDBOX/park.sh" >"$SANDBOX/park.out" 2>&1 ||
+        fail "parking an mr bead should succeed: $(cat "$SANDBOX/park.out")"
+
+    assert_not_closed "mr park"
+    grep -q "awaiting_merge=true" "$GC_LOG" ||
+        fail "a published PR must park the bead at awaiting_merge, log: $(cat "$GC_LOG")"
+    grep -q -- "--status=open" "$GC_LOG" ||
+        fail "the parked bead must stay open so gc bd ready and patrols still see it"
+    grep -q "pr_url=https://github.com/acme/widgets/pull/42" "$GC_LOG" ||
+        fail "the parked bead must carry the PR URL as its tracking handle"
+    # Staleness arithmetic needs an epoch: parsing RFC3339 back to epoch needs
+    # date -d on GNU and date -j -f on BSD, and the refinery runs on both.
+    grep -qE "awaiting_merge_since_epoch=[0-9]+" "$GC_LOG" ||
+        fail "the parked bead must record a machine-comparable epoch, log: $(cat "$GC_LOG")"
+}
+
+test_recheck_closes_bead_once_github_reports_merged() {
+    # The other half of the contract: the poll must actually close landed work,
+    # or "never close early" would just become "never close".
+    new_sandbox
+    write_awaiting_bead "$(date -u +%s)"
+    export GH_PR_VIEW_JSON='{"state":"MERGED","mergedAt":"2026-07-28T21:42:50Z","mergeCommitOid":"abc123def456"}'
+
+    run_recheck_block
+    grep -q "gc bd close" "$GC_LOG" ||
+        fail "a merged PR must close its bead, log: $(cat "$GC_LOG")"
+    grep -q "merge_result=merged" "$GC_LOG" ||
+        fail "a merged PR must record merge_result=merged"
+    grep -q "merged_sha=abc123def456" "$GC_LOG" ||
+        fail "the close must carry the merge commit as forensics, log: $(cat "$GC_LOG")"
+    grep -q -- "--unset-metadata awaiting_merge" "$GC_LOG" ||
+        fail "closing must clear awaiting_merge so the bead stops being polled"
+}
+
+test_recheck_leaves_unmerged_pr_open() {
+    # mergedAt null is a real verdict, not a missing answer: leave it alone.
+    new_sandbox
+    write_awaiting_bead "$(date -u +%s)"
+    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommitOid":""}'
+
+    run_recheck_block
+    assert_not_closed "unmerged"
+    grep -q "still unmerged" "$SANDBOX/recheck.out" ||
+        fail "an unmerged PR should be reported as left open, got: $(cat "$SANDBOX/recheck.out")"
+    ! grep -q "awaiting_merge_stale=true" "$GC_LOG" ||
+        fail "a PR published seconds ago must not escalate as stale"
+}
+
+# A repo where the branch's work LANDED as a rebase: the same patch sits on
+# main under a different SHA, so the branch tip is not an ancestor of main.
+# This is the shape the refinery itself creates -- it rebases before publishing
+# -- and the shape that SHA ancestry gets wrong.
+setup_rebased_landing_repo() {
+    ORIGIN="$SANDBOX/origin.git"
+    REPO="$SANDBOX/rebased"
+    git init -q --bare "$ORIGIN"
+    git init -q "$REPO"
+    git -C "$REPO" config user.email t@example.com
+    git -C "$REPO" config user.name Tester
+    git -C "$REPO" remote add origin "$ORIGIN"
+    echo base >"$REPO/file.txt"
+    git -C "$REPO" add file.txt
+    git -C "$REPO" commit -qm base
+    git -C "$REPO" branch -M main
+    git -C "$REPO" push -q origin main
+    FORK_SHA=$(git -C "$REPO" rev-parse main)
+
+    git -C "$REPO" checkout -q -b polecat/bd-1
+    echo work >"$REPO/feature.txt"
+    git -C "$REPO" add feature.txt
+    git -C "$REPO" commit -qm "the work"
+    git -C "$REPO" push -q origin polecat/bd-1
+
+    # main moves on, then takes the same patch under a new SHA.
+    git -C "$REPO" checkout -q main
+    echo other >"$REPO/other.txt"
+    git -C "$REPO" add other.txt
+    git -C "$REPO" commit -qm "unrelated"
+    git -C "$REPO" cherry-pick polecat/bd-1 >/dev/null
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" fetch -q origin
+}
+
+test_recheck_detects_rebased_landing_without_github() {
+    # With no answer from the API, the git fallback has to be content-aware.
+    new_sandbox
+    setup_rebased_landing_repo
+    write_awaiting_bead "$(date -u +%s)" "" "$FORK_SHA"
+    unset GH_PR_VIEW_JSON   # gh answers nothing => fall through to git
+
+    # Non-vacuity: the check the formula must NOT rely on says "not merged"
+    # for this branch. Without this assertion the test could pass on ancestry.
+    ! git -C "$REPO" merge-base --is-ancestor origin/polecat/bd-1 origin/main ||
+        fail "fixture is wrong: the rebased branch must NOT be an ancestor of main"
+
+    run_recheck_block "$REPO"
+    grep -q "gc bd close" "$GC_LOG" ||
+        fail "a rebased-and-landed branch must close, log: $(cat "$GC_LOG")\nout: $(cat "$SANDBOX/recheck.out")"
+    grep -q "merge_result=merged" "$GC_LOG" ||
+        fail "a rebased-and-landed branch must record merge_result=merged"
+}
+
+test_recheck_leaves_unlanded_branch_open_without_github() {
+    # Control for the test above: same fallback, work genuinely not on main.
+    # Without this, a predicate that always returned "landed" would look right.
+    new_sandbox
+    setup_rebased_landing_repo
+    # Add a second, un-landed commit so the branch is no longer fully upstream.
+    git -C "$REPO" checkout -q polecat/bd-1
+    echo more >"$REPO/unlanded.txt"
+    git -C "$REPO" add unlanded.txt
+    git -C "$REPO" commit -qm "not landed anywhere"
+    git -C "$REPO" push -q origin polecat/bd-1
+    git -C "$REPO" fetch -q origin
+    write_awaiting_bead "$(date -u +%s)" "" "$FORK_SHA"
+    unset GH_PR_VIEW_JSON
+
+    run_recheck_block "$REPO"
+    assert_not_closed "unlanded branch"
+}
+
+test_recheck_escalates_a_stale_pr_exactly_once() {
+    # Leaving the bead open is only half of "make it loud". A PR nobody merges
+    # has to surface -- but nagging every patrol iteration is how alerts get
+    # ignored, so the escalation fires once, on the transition.
+    new_sandbox
+    write_awaiting_bead "$(( $(date -u +%s) - 7200 ))"
+    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommitOid":""}'
+
+    run_recheck_block
+    assert_not_closed "stale"
+    grep -q "awaiting_merge_stale=true" "$GC_LOG" ||
+        fail "a 2h-unmerged PR must be flagged stale, log: $(cat "$GC_LOG")"
+    grep -q "session nudge.*witness" "$GC_LOG" ||
+        fail "going stale must escalate to the witness, log: $(cat "$GC_LOG")"
+
+    # Second pass, bead already flagged: silence.
+    new_sandbox
+    write_awaiting_bead "$(( $(date -u +%s) - 7200 ))" true
+    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommitOid":""}'
+    run_recheck_block
+    ! grep -q "session nudge" "$GC_LOG" ||
+        fail "an already-flagged stale PR must not re-escalate every patrol"
+}
+
+test_awaiting_bead_never_starves_the_merge_queue() {
+    # Parked beads stay open and assigned to the refinery on purpose, so a
+    # naive --limit=1 work query would hand back the same waiting-on-a-human PR
+    # forever and every other branch would queue behind it.
+    new_sandbox
+    extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
+    GC_LIST_WORK="$SANDBOX/work.json"
+    export GC_LIST_WORK
+    cat >"$GC_LIST_WORK" <<'JSON'
+[{"id":"bd-parked","metadata":{"branch":"polecat/bd-parked","awaiting_merge":"true"}},
+ {"id":"bd-fresh","metadata":{"branch":"polecat/bd-fresh"}}]
+JSON
+    selected=$(PATH="$BIN:$PATH" GC_AGENT=testrig/refinery bash -c \
+        '. "$1/select.sh"; printf "%s\n" "$WORK"' _ "$SANDBOX")
+    [ "$selected" = "bd-fresh" ] ||
+        fail "work selection must skip the parked bead and take fresh work, got: '$selected'"
+
+    # Only parked work: the refinery must go idle, not re-process the PR.
+    cat >"$GC_LIST_WORK" <<'JSON'
+[{"id":"bd-parked","metadata":{"branch":"polecat/bd-parked","awaiting_merge":"true"}}]
+JSON
+    selected=$(PATH="$BIN:$PATH" GC_AGENT=testrig/refinery bash -c \
+        '. "$1/select.sh"; printf "%s\n" "$WORK"' _ "$SANDBOX")
+    [ -z "$selected" ] ||
+        fail "a queue of only parked beads must select nothing, got: '$selected'"
+}
+
 test_protected_target_never_resolves_to_direct
 test_unprotected_target_keeps_direct
 test_missing_gh_preserves_legacy_direct_default
@@ -460,5 +719,12 @@ test_timed_out_checks_block_without_retry
 test_required_checks_never_scheduled_block
 test_green_required_checks_proceed_to_merge
 test_no_required_checks_anywhere_proceeds
+test_mr_parks_bead_open_instead_of_closing_on_pr_open
+test_recheck_closes_bead_once_github_reports_merged
+test_recheck_leaves_unmerged_pr_open
+test_recheck_detects_rebased_landing_without_github
+test_recheck_leaves_unlanded_branch_open_without_github
+test_recheck_escalates_a_stale_pr_exactly_once
+test_awaiting_bead_never_starves_the_merge_queue
 
 echo "PASS: $(basename "${BASH_SOURCE[0]}")"

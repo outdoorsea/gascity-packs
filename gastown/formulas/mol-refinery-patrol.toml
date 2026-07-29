@@ -26,9 +26,18 @@ Merge strategy is per-work-bead metadata:
 - `direct` (default): fast-forward merge to target and push
 - `mr` / `pr`: publish a GitHub pull request instead of landing directly
 
-In `mr` mode, refinery treats PR publication as the terminal handoff for
-the direct-bead workflow: it records the PR URL on the work bead and
-closes the bead once the PR is verified.
+In `mr` mode, refinery publishes the pull request and hands the merge to a
+human — but publication is NOT a completion. The bead stays OPEN carrying
+`awaiting_merge=true` and the PR URL, and `find-work` re-checks every
+awaiting bead each patrol, closing only the ones whose merge is VERIFIED
+landed.
+
+Closing on PR-open is what this replaces. A closed bead leaves `gc bd ready`,
+pool-demand queries, and orphan scans at the same instant, so a green PR
+that nobody merges has no open bead, no assignee, and no sling pointing at
+it — nothing re-dispatches it and nothing merges it. It fails silently.
+Three green PRs stranded that way in one day in rig tallyup; two were
+rescued only because a witness patrol happened to notice.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
@@ -80,6 +89,10 @@ default = "false"
 [vars.event_timeout]
 description = "Seconds to sleep before re-checking for work. Replaces former event-watch loop which hot-spun on cache-reconcile firehose."
 default = "60"
+
+[vars.awaiting_merge_stale_seconds]
+description = "Seconds an `mr` PR may sit unmerged before the refinery escalates it once to the witness. 0 disables the escalation."
+default = "3600"
 
 [[steps]]
 id = "validate-identity"
@@ -166,12 +179,174 @@ title = "Find next work bead assigned to me or wait"
 needs = ["check-inbox"]
 description = """
 **Config: event_timeout = {{event_timeout}}**
+**Config: awaiting_merge_stale_seconds = {{awaiting_merge_stale_seconds}}**
 
-Search for work beads assigned to you with branch metadata:
+**1. Re-check every bead parked at `awaiting_merge` (do this FIRST):**
+
+`mr` mode publishes a pull request and leaves the bead OPEN with
+`awaiting_merge=true` until a human merges it. This block is the other half
+of that contract: it is the ONLY place an `mr` bead closes, and it runs on
+every patrol, so a PR that goes green and gets merged an hour after
+publication is still noticed. Skipping it strands the bead forever.
+
+This is a cheap poll by construction: it re-reads merge state and nothing
+else. It does NOT rebase, force-push, re-run tests, or touch the PR — doing
+any of that on a poll would reset the PR's checks every patrol iteration.
+
+```bash
+# --- AWAITING_MERGE_RECHECK ---
+merge_landed() {
+  # Content-aware "did this branch's work land on the target?" predicate.
+  #
+  # SHA ancestry alone is WRONG here, and getting it wrong is how PRs went
+  # missing: the refinery rebases before publishing, and GitHub rewrites the
+  # commits again on a squash or rebase merge, so
+  # `git merge-base --is-ancestor origin/$BRANCH origin/$TARGET` answers "no"
+  # for work that demonstrably landed. `git cherry` compares PATCH IDs rather
+  # than SHAs -- it prints `-` for a commit whose diff is already upstream and
+  # `+` for one that is not -- so it survives both rewrites.
+  #
+  #   exit 0 = every commit on the branch is present in the target
+  #   exit 1 = at least one commit is missing, or the branch carries no
+  #            verified commits at all (never evidence of a merge)
+  #   exit 2 = could not evaluate -> fail closed; the caller must not close
+  #
+  # Known blind spot: a squash merge of a MULTI-commit branch collapses N
+  # patches into one, so no per-commit patch-id matches and this returns 1.
+  # That is the conservative direction (bead stays open), and the GitHub
+  # `mergedAt` check below is the authoritative signal that covers it.
+  ml_target="$1"
+  ml_branch="$2"
+  ml_fork="$3"
+  ml_out=$(git cherry "$ml_target" "$ml_branch" 2>/dev/null) || return 2
+  if [ -z "$ml_out" ]; then
+    # The target already contains every branch commit by SHA. That is either a
+    # landed branch or an empty one, and an empty branch is trivially
+    # "contained" because its tip IS the fork point. Require recorded evidence
+    # of >=1 real commit to tell them apart; without it, stay conservative.
+    [ -n "$ml_fork" ] || return 1
+    ml_count=$(git rev-list --count "$ml_fork..$ml_branch" 2>/dev/null) || return 2
+    [ "$ml_count" -ge 1 ] || return 1
+    return 0
+  fi
+  # Commits the target lacks by SHA still count as landed when every one of
+  # them has an equivalent patch upstream ('-'), which is what a rebase-merge
+  # leaves behind. A single '+' means something has not landed.
+  printf '%s\\n' "$ml_out" | grep -q '^+' && return 1
+  return 0
+}
+
+# A rig that overrides the var to empty must not crash the patrol on the
+# arithmetic below; treat "unset" as "escalation disabled".
+STALE_AFTER="{{awaiting_merge_stale_seconds}}"
+[ -n "$STALE_AFTER" ] || STALE_AFTER=0
+NOW_EPOCH=$(date -u +%s)
+
+# `--limit=0` is unlimited: every parked bead gets polled, not just the first.
+AWAITING=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \\
+  --exclude-type=epic --metadata-field=awaiting_merge=true --limit=0 --json)
+# An unreadable query is not an empty queue, but it must not feed `jq` an empty
+# stdin either -- that errors out noisily and looks like "nothing parked".
+[ -n "$AWAITING" ] || AWAITING='[]'
+
+for AW in $(printf '%s' "$AWAITING" | jq -r '.[].id'); do
+  AW_JSON=$(gc bd show "$AW" --json)
+  AW_PR=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.pr_number // empty')
+  AW_URL=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.pr_url // empty')
+  AW_BRANCH=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.branch // empty')
+  AW_TARGET=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.target // "{{target_branch}}"')
+  AW_FORK=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.fork_sha // empty')
+  AW_SINCE=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.awaiting_merge_since_epoch // empty')
+  AW_STALE=$(printf '%s' "$AW_JSON" | jq -r '.[0].metadata.awaiting_merge_stale // empty')
+
+  # (a) Ask GitHub first. `mergedAt` is authoritative and rewrite-proof: it is
+  # true regardless of how the merge was performed, including the multi-commit
+  # squash that the git-side predicate cannot see.
+  AW_MERGED_AT=""
+  AW_MERGE_SHA=""
+  AW_API_ANSWERED=false
+  if [ -n "$AW_PR" ] && command -v gh >/dev/null 2>&1; then
+    AW_PR_JSON=$(gh pr view "$AW_PR" --json state,mergedAt,mergeCommitOid 2>/dev/null || printf '')
+    if [ -n "$AW_PR_JSON" ]; then
+      AW_API_ANSWERED=true
+      AW_MERGED_AT=$(printf '%s' "$AW_PR_JSON" | jq -r '.mergedAt // empty' 2>/dev/null)
+      AW_MERGE_SHA=$(printf '%s' "$AW_PR_JSON" | jq -r '.mergeCommitOid // empty' 2>/dev/null)
+    fi
+  fi
+
+  # (b) The API is authoritative in BOTH directions, so consult git only when
+  # it did not answer at all (no gh, no token, PR number lost). A readable
+  # "mergedAt: null" is a real "not merged" verdict, and letting a git error
+  # override it would skip the staleness escalation below on a PR we know is
+  # sitting there. A git tool error is likewise not a merge -- leave the bead
+  # alone and let the next patrol retry rather than guessing.
+  if [ -z "$AW_MERGED_AT" ] && [ "$AW_API_ANSWERED" != "true" ] && [ -n "$AW_BRANCH" ]; then
+    git fetch origin "+refs/heads/${AW_BRANCH}:refs/remotes/origin/${AW_BRANCH}" \\
+                     "+refs/heads/${AW_TARGET}:refs/remotes/origin/${AW_TARGET}" >/dev/null 2>&1 || true
+    merge_landed "origin/$AW_TARGET" "origin/$AW_BRANCH" "$AW_FORK"
+    case "$?" in
+      0)
+        AW_MERGED_AT="git-verified"
+        AW_MERGE_SHA=$(git rev-parse "origin/$AW_TARGET" 2>/dev/null || printf '')
+        ;;
+      1) : ;;
+      *)
+        echo "AWAITING_MERGE: could not evaluate merge state for $AW (git error); leaving it open for the next patrol."
+        continue
+        ;;
+    esac
+  fi
+
+  # (c) Verified landed -> this is the close the mr path owes. Write the
+  # forensics and the close as one chained command so a closed bead can never
+  # lack the merge breadcrumbs that prove why it closed.
+  if [ -n "$AW_MERGED_AT" ]; then
+    if gc bd update "$AW" \\
+         --set-metadata merge_result=merged \\
+         --set-metadata merged_target="$AW_TARGET" \\
+         --set-metadata merged_sha="${AW_MERGE_SHA:-unknown}" \\
+         --unset-metadata awaiting_merge \\
+         --unset-metadata awaiting_merge_since \\
+         --unset-metadata awaiting_merge_since_epoch \\
+         --unset-metadata awaiting_merge_stale \\
+         --unset-metadata rejection_reason && \\
+       gc bd close "$AW" --reason "Merged to $AW_TARGET via PR ${AW_URL:-#$AW_PR} (verified at $AW_MERGED_AT)"; then
+      echo "AWAITING_MERGE: $AW merged and closed (PR ${AW_URL:-#$AW_PR}, $AW_MERGED_AT)."
+    else
+      echo "AWAITING_MERGE: $AW is merged but the close did not land; bead stays open. A later patrol retries."
+    fi
+    continue
+  fi
+
+  # (d) Still unmerged. That is legal -- a human owns the merge -- but it must
+  # not be silent forever. Escalate EXACTLY ONCE, when it first crosses the
+  # staleness threshold, so a stuck PR surfaces without the patrol nagging on
+  # every iteration.
+  if [ "$STALE_AFTER" -gt 0 ] && [ -n "$AW_SINCE" ] && [ "$AW_STALE" != "true" ] \\
+     && [ $((NOW_EPOCH - AW_SINCE)) -ge "$STALE_AFTER" ]; then
+    gc bd update "$AW" --set-metadata awaiting_merge_stale=true
+    gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "AWAITING MERGE $(( (NOW_EPOCH - AW_SINCE) / 60 ))m: $AW — PR ${AW_URL:-#$AW_PR} is published and unmerged; bead deliberately left open."
+    echo "AWAITING_MERGE: $AW stale ($(( (NOW_EPOCH - AW_SINCE) / 60 ))m unmerged); escalated once to witness."
+  else
+    echo "AWAITING_MERGE: $AW still unmerged (PR ${AW_URL:-#$AW_PR}); left open."
+  fi
+done
+```
+
+**2. Select the next work bead:**
+
+Search for work beads assigned to you with branch metadata, skipping the
+`awaiting_merge` beads step 1 just polled:
 ```bash
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
-  --exclude-type=epic --has-metadata-key=branch --limit=1 --json | jq -r '.[0].id // empty')
+  --exclude-type=epic --has-metadata-key=branch --limit=0 --json \
+  | jq -r '[.[] | select((.metadata.awaiting_merge // "") != "true")][0].id // empty')
 ```
+
+The `awaiting_merge` filter is load-bearing, not cosmetic. These beads stay
+open and assigned to the refinery on purpose, so a plain `--limit=1` query
+would keep handing back the same parked PR and starve every other branch in
+the queue — the merge queue would livelock behind one PR waiting on a human.
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
 database. Without it, `gc bd list` routes to the HQ database and never
@@ -381,15 +556,19 @@ Three merge strategies exist. Pick by target-branch protection, not by habit:
 
 | Strategy | Pushes to `$TARGET`? | Waits for checks? | Merges? | Closes bead? |
 |---|---|---|---|---|
-| `direct` | yes, `git push` | no | yes (ff-only) | yes |
-| `mr` (alias `pr`) | no | no | no | yes — PR-open IS the handoff |
+| `direct` | yes, `git push` | no | yes (ff-only) | yes, after a verified push |
+| `mr` (alias `pr`) | no | no | no — a human does | NO. Parks at `awaiting_merge`; `find-work` closes it once the merge lands |
 | `pr-merge` | no | yes, required checks | yes, via `gh pr merge` | only after the merge is verified |
 
 `direct` is only legal against an UNPROTECTED target. A protected branch
 rejects `git push origin HEAD:$TARGET` outright, so a refinery that keeps
 choosing `direct` stops landing work entirely. `mr` does not fill that gap:
-it treats PR-open as terminal, never waits for checks, and never merges.
-`pr-merge` is the mode that actually lands work on a protected branch.
+it never waits for checks and never merges — it publishes a PR and waits
+for a human. `pr-merge` is the mode that actually lands work on a protected
+branch.
+
+No strategy closes a bead on anything short of a verified merge. `mr` used
+to, and the PRs it closed over stopped being tracked by anything.
 
 Read the merge target and merge strategy from the work bead metadata:
 ```bash
@@ -1013,9 +1192,11 @@ Steps 0-3 are identical for both strategies; they diverge at step 4:
 
 The same predicate covers the empty-PR / 0-commit concern: do not publish a
 pull request for a branch that introduces no change vs its merge-base. The
-PR handoff closes the bead, so an empty PR is the same false completion as
-an empty direct merge. A tool error (status 2) is not an empty branch — stop
-without mutating bead state rather than halt-escalating a healthy branch.
+refinery closes the bead on a verified merge of that PR, so an empty PR is
+the same false completion as an empty direct merge — it just arrives later,
+once someone merges the nothing it contains. A tool error (status 2) is not
+an empty branch — stop without mutating bead state rather than
+halt-escalating a healthy branch.
 ```bash
 branch_has_real_change "origin/$TARGET" temp
 BHRC_STATUS=$?
@@ -1228,29 +1409,52 @@ fi
 ```
 If this command fails or prints empty output: STOP. Debug and retry. Do NOT continue.
 
-**4. `mr` ONLY — Record PR metadata and close the work bead:**
+**4. `mr` ONLY — Park the bead at `awaiting_merge`. Do NOT close it:**
 
 Skip this entire step when `MERGE_STRATEGY = "pr-merge"`; go to 4a. For
 `pr-merge` the PR is a means, not the deliverable, and closing here would
 report work as handed off while `$TARGET` never moved.
 
-Run as a single chained command so the metadata write cannot be skipped
-when the close-reason already names the PR. Both the `--set-metadata`
-write and the `gc bd close` are required — `pr_url` and `pr_number`
-are the only forensic breadcrumbs tying a closed bead to its pull
-request. `--unset-metadata rejection_reason` clears any stale rejection
-field from an earlier rejected/reworked attempt before the successful
-close.
+**An open pull request is not a merge, so it is not a completion.** This
+step used to close the bead the moment the PR verified as OPEN, and that is
+the defect this formula now fixes. A closed bead leaves `gc bd ready`,
+pool-demand queries, and orphan scans in the same instant, so a PR that
+nobody merges loses every tracking handle at once: no open bead, no
+assignee, no sling. Nothing re-dispatches it and nothing merges it, and
+because the PR is green the whole time, nothing looks wrong. Measured
+against the GitHub API in rig tallyup, beads closed 40-78 minutes before
+their PR merged, and one never merged at all.
+
+So record the PR and PARK the bead: leave it OPEN, still assigned to the
+refinery, marked `awaiting_merge=true`. Step 1 of `find-work` polls it on
+every patrol and closes it once the merge is VERIFIED landed. Until then it
+stays visible to `gc bd ready` and to every patrol that scans open work.
+
+`awaiting_merge_since_epoch` carries the seconds-since-epoch that
+`find-work` does staleness arithmetic on; parsing an RFC3339 stamp back to
+epoch portably needs `date -d` on GNU and `date -j -f` on BSD/macOS, and
+the refinery runs on both. `awaiting_merge_since` is the same instant kept
+human-readable for whoever reads the bead.
 
 ```bash
-gc bd update $WORK \
-  --set-metadata merge_result=pull_request \
-  --set-metadata pr_url="$PR_URL" \
-  --set-metadata pr_number="$PR_NUMBER" \
-  --set-metadata merged_target="$TARGET" \
-  --unset-metadata rejection_reason && \
-gc bd close $WORK --reason "Pull request ready: $PR_URL"
+# --- AWAITING_MERGE_PARK ---
+gc bd update $WORK \\
+  --status=open \\
+  --set-metadata merge_result=pull_request_open \\
+  --set-metadata pr_url="$PR_URL" \\
+  --set-metadata pr_number="$PR_NUMBER" \\
+  --set-metadata merged_target="$TARGET" \\
+  --set-metadata awaiting_merge=true \\
+  --set-metadata awaiting_merge_since="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
+  --set-metadata awaiting_merge_since_epoch="$(date -u +%s)" \\
+  --unset-metadata rejection_reason
+echo "AWAITING_MERGE: $WORK parked open at $PR_URL; find-work closes it once the merge is verified."
 ```
+
+**FORBIDDEN in `mr` mode**: `gc bd close $WORK` here, or any
+`merge_result=merged` write. The merge has not happened yet — a human has
+not touched the PR. Recording one is a false completion, and it is the
+exact bug that stranded three green PRs in a day.
 
 **4a. `pr-merge` ONLY — Wait for the required checks to settle:**
 
@@ -1492,10 +1696,16 @@ The Gastown example refinery supports direct, mr/pr, and pr-merge strategies onl
 Do NOT close the bead, delete the branch, or burn the wisp until a human decides how to proceed.
 
 **GATE**: `direct` requires an unprotected target AND a verified target push.
-`mr` requires a verified PR URL. `pr-merge` requires green (or absent)
-required checks, a successful `gh pr merge`, AND a re-fetched `$TARGET` that
-provably contains the PR head. Bead closure only happens after the selected
-handoff is confirmed.
+`mr` requires a verified PR URL to PARK the bead, and a verified merge —
+GitHub `mergedAt`, or content-aware git evidence — before `find-work` may
+close it. `pr-merge` requires green (or absent) required checks, a successful
+`gh pr merge`, AND a re-fetched `$TARGET` that provably contains the PR head.
+
+**Bead closure requires a merge that has been verified to have landed. A
+published pull request is not one.** The verification must be content-aware:
+the refinery rebases and GitHub rewrites again on squash/rebase merges, so
+`git merge-base --is-ancestor` reports "not merged" for work that landed.
+Match patch IDs (`git cherry`), or trust the API's `mergedAt`.
 
 **FORBIDDEN, in every mode**: disabling branch protection, `git push --force`
 or `--force-with-lease` to `$TARGET`, `gh pr merge --admin`, adding the

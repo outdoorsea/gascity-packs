@@ -131,7 +131,16 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
         "gh pr create",
         "--set-metadata pr_url=\"$PR_URL\"",
-        "gc bd close $WORK --reason \"Pull request ready: $PR_URL\"",
+        # `mr` parks the bead at awaiting_merge instead of closing it on
+        # PR-open, and find-work polls it to a verified close. Pin all three
+        # halves: the park, the content-aware merge check, and the
+        # work-selection skip that keeps a parked bead from starving the
+        # queue. Closing on PR-open dropped green PRs out of every safety net
+        # at once, so a regression here is silent by construction.
+        "--set-metadata awaiting_merge=true",
+        'merge_landed "origin/$AW_TARGET" "origin/$AW_BRANCH" "$AW_FORK"',
+        'git cherry "$ml_target" "$ml_branch"',
+        'select((.metadata.awaiting_merge // "") != "true")',
     ),
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
