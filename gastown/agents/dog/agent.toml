@@ -2,6 +2,9 @@ scope = "city"
 wake_mode = "fresh"
 work_dir = ".gc/agents/dogs/{{.AgentBase}}"
 nudge = "Check your hook for work assignments."
+# Plain work_dir, not a worktree, so nothing else scaffolds it: without
+# .remember/logs the remember plugin's hooks are dropped, not merely unlogged.
+pre_start = ["{{.ConfigDir}}/assets/scripts/remember-scaffold.sh --create {{.WorkDir}}"]
 idle_timeout = "2h"
 min_active_sessions = 0
 max_active_sessions = 3
