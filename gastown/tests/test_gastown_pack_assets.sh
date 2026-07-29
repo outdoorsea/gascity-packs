@@ -268,14 +268,30 @@ test_polecat_health_check_is_measured_not_improvised() {
     # arithmetic, formatted a LOCAL-time mtime with a `Z` suffix, compared it
     # against a UTC now, and read 4 minutes of healthy work as ~7h stale. A
     # warrant was filed against a polecat that was working correctly.
-    local formula check
+    local formula check cmd
     formula="$GASTOWN/formulas/mol-witness-patrol.toml"
     check="$GASTOWN/assets/scripts/polecat-progress-check.sh"
+    cmd="$GASTOWN/commands/progress-check/run.sh"
 
-    [[ -x "$check" ]] ||
-        fail "polecat-progress-check.sh must exist and be executable; the formula guards on [ -x ]"
-    grep -F 'assets/scripts/polecat-progress-check.sh' "$formula" >/dev/null ||
-        fail "check-polecat-health must run the deterministic progress check, not improvise timestamp math"
+    [[ -x "$check" ]] || fail "missing or non-executable assets/scripts/polecat-progress-check.sh"
+    [[ -x "$cmd" ]] || fail "missing or non-executable commands/progress-check/run.sh"
+    [[ -f "$GASTOWN/commands/progress-check/help.md" ]] ||
+        fail "missing commands/progress-check/help.md"
+
+    # gp-3qb: this step used to resolve the check as
+    # "${GC_PACK_DIR:-}/assets/scripts/polecat-progress-check.sh". GC_PACK_DIR is
+    # set by `gc` for pack COMMANDS and is unset in an agent's shell, so the path
+    # expanded to "/assets/scripts/...", the `[ -x ]` guard in front of it failed,
+    # and the step fell back to the eyeballing gp-9ly exists to prevent. The
+    # earlier version of this very test asserted the path form and the `[ -x ]`
+    # guard as the contract, which is why the suite stayed green over a check
+    # that never ran.
+    grep -F 'gc gastown progress-check' "$formula" >/dev/null ||
+        fail "check-polecat-health must run the check as 'gc gastown progress-check'"
+    ! grep -F 'GC_PACK_DIR' "$formula" | grep -F 'progress-check' >/dev/null ||
+        fail "the progress check must not be resolved via \$GC_PACK_DIR; it is unset in an agent shell"
+    grep -F 'GC_PACK_DIR' "$cmd" >/dev/null ||
+        fail "commands/progress-check/run.sh must resolve the check through GC_PACK_DIR"
     grep -F 'GASTOWN_POLECAT_STALE_MIN={{polecat_stale_min}}' "$formula" >/dev/null ||
         fail "the staleness window must come from the formula var, not a number invented per cycle"
     grep -F '[vars.polecat_stale_min]' "$formula" >/dev/null ||
@@ -292,6 +308,56 @@ test_polecat_health_check_is_measured_not_improvised() {
         fail "every Z-suffixed timestamp format in the witness formula must be under 'date -u'; offending lines: $offenders"
     grep -F 'Never format a local mtime with a' "$formula" >/dev/null ||
         fail "the formula must state the local-mtime-with-Z prohibition outright"
+}
+
+test_no_formula_step_executes_through_ambient_gc_pack_dir() {
+    # The bug class behind gp-fid (usage-stamp), gp-px5 (parked-check) and gp-3qb
+    # (witness-heartbeat-check and polecat-progress-check): GC_PACK_DIR is set by
+    # `gc` when `gc` invokes a pack command, and by a pack.toml service or an
+    # oversight-rig order. It is NOT in an agent's environment, and a formula step
+    # is prose an agent shells out by hand in its own session. So
+    # "${GC_PACK_DIR:-}/assets/scripts/x.sh" expands to "/assets/scripts/x.sh",
+    # and when it sits behind an `[ -x ]` guard the failure is downgraded to a
+    # skip that prints a considered-sounding fallback. Four separate checks
+    # shipped dead this way.
+    #
+    # Each of those was caught only after it had been silently no-op in
+    # production, so this guard covers the class rather than the instances: no
+    # step body may mention GC_PACK_DIR at all. Route it through a pack command.
+    #
+    # Scoped to FENCED CODE BLOCKS. The prose around these snippets quotes the
+    # broken path on purpose — that is how the pack records why it is broken —
+    # and a whole-description match would forbid explaining the bug. Fencing is
+    # also what makes this construct-agnostic: it catches a path variable of any
+    # name, a bare `bash "$GC_PACK_DIR/..."`, and a `cat` of a pack-relative doc,
+    # none of which a name-based pattern like `^CHECK=` would see.
+    local offenders
+    offenders=$(python3 - "$GASTOWN" <<'PY'
+import glob, os, sys, tomllib
+
+offenders = []
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "formulas", "*.toml"))):
+    with open(path, "rb") as handle:
+        doc = tomllib.load(handle)
+    for step in doc.get("steps", []):
+        fenced = False
+        for line in step.get("description", "").splitlines():
+            if line.lstrip().startswith("```"):
+                fenced = not fenced
+                continue
+            if fenced and "GC_PACK_DIR" in line:
+                offenders.append(
+                    "%s [%s]: %s"
+                    % (os.path.basename(path), step.get("id", "?"), line.strip())
+                )
+if offenders:
+    print("\n".join(offenders))
+    raise SystemExit(1)
+PY
+    ) || {
+        fail "formula step bodies must not reach for \$GC_PACK_DIR; it is unset in an agent shell. Add a pack command under commands/ and call it through \`gc\`:
+$offenders"
+    }
 }
 
 # step_description <formula> <step-id> — one step's description text on stdout.
@@ -533,6 +599,7 @@ test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_witness_salvage_reads_work_dir_metadata
 test_polecat_health_check_is_measured_not_improvised
+test_no_formula_step_executes_through_ambient_gc_pack_dir
 test_polecat_stall_requires_proof_of_life_not_just_a_timestamp
 test_parked_session_detector_is_wired_into_the_patrol
 test_parked_remedy_is_documented_for_the_witness
