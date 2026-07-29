@@ -20,6 +20,29 @@ class PromptWorkspace:
     env: dict[str, str]
 
 
+def hermetic_env() -> dict[str, str]:
+    """Base subprocess environment with ambient Gas Town session state stripped.
+
+    A running `gc` session exports a large GC_*/BEADS_* family describing *that*
+    session, and the pack commands exercised below read those same names --
+    `claim/run.sh` derives its expected route from `${GC_TEMPLATE:-${GC_AGENT:-}}`.
+    Inheriting the caller's environment therefore overrides whatever the test set
+    up: a polecat worktree exports GC_TEMPLATE=<rig>/gastown.polecat, which beats
+    the GC_AGENT the claim test declares and fails it with a route mismatch.
+
+    This suite hid the defect longer than its siblings because it is doubly
+    masked: CI supplies GC_TEST_BIN but a clean environment, while a live session
+    has the dirty environment but no GC_TEST_BIN, so `gc_test_bin` skips. Neither
+    side ever runs the one combination that breaks.
+
+    Stripping the family wholesale is safe because CI's `GC_TEST_BIN=... pytest`
+    step exports no other GC_*/BEADS_* variable, so no passing test can depend on
+    an ambient value. Spread this in place of `os.environ` and declare every
+    GC_*/BEADS_* variable the binary under test should see.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith(("GC_", "BEADS_"))}
+
+
 @pytest.fixture(scope="session")
 def gc_test_bin() -> Path:
     configured = os.environ.get("GC_TEST_BIN")
@@ -94,7 +117,7 @@ def write_prompt_workspace(
     )
 
     env = {
-        **os.environ,
+        **hermetic_env(),
         "HOME": str(home),
         "GC_HOME": str(gc_home),
         "GC_CITY": str(city_dir),
@@ -251,3 +274,37 @@ def test_registered_claim_command_dispatches_store_aware_show_and_normalizes_jso
         "hook --claim --drain-ack --json",
         " ".join(("b" + "d", "show", "bd-123", "--json")),
     ]
+
+
+def test_prompt_workspace_env_scrubs_ambient_session_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard `hermetic_env` against a re-introduced `**os.environ` spread.
+
+    CI's pytest step exports no GC_*/BEADS_* beyond GC_TEST_BIN, so it cannot
+    observe a missing scrub the way a live session can. Simulating the session
+    here keeps the helper covered. This test deliberately takes no `gc_test_bin`
+    fixture, so it runs in CI's main pytest sweep instead of sitting behind the
+    GC_TEST_BIN skip that kept the original defect hidden.
+    """
+    monkeypatch.setenv("GC_TEMPLATE", "ambient/gastown.polecat")
+    monkeypatch.setenv("GC_BIN", "/ambient/bin/gc")
+    monkeypatch.setenv("GC_SESSION_NAME", "ambient-session")
+    monkeypatch.setenv("BEADS_ACTOR", "ambient-actor")
+    monkeypatch.setenv("BEADS_DIR", "/ambient/.beads")
+
+    workspace = write_prompt_workspace(
+        tmp_path, city_binding="gc", city_pack=REPO_ROOT / "gascity"
+    )
+
+    # Asserting the exact surviving set (not just the absence of today's known
+    # offenders) is what makes a future ambient leak fail here.
+    assert sorted(key for key in workspace.env if key.startswith(("GC_", "BEADS_"))) == [
+        "GC_CITY",
+        "GC_CITY_PATH",
+        "GC_CITY_ROOT",
+        "GC_HOME",
+        "GC_RIG",
+    ]
+    assert workspace.env["HOME"] == str(tmp_path / "home")
+    assert workspace.env["PATH"] == os.environ["PATH"]
