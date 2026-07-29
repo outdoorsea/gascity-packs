@@ -34,10 +34,17 @@ be inherited from a parent convoy with `metadata.target` set.
 `metadata.rejection_reason`, a previous attempt was rejected by the
 refinery. Resume the existing branch — don't redo all the work.
 
+**Staleness-aware.** `workspace-setup` runs an already-delivered gate before
+any build: if the bead's deliverable is already on the target branch, the
+polecat halts with the evidence instead of producing an empty branch for the
+refinery to refuse. The gate reports; the polecat confirms by reading the cited
+commit before halting, because a false positive drops real work.
+
 ## Failure Modes
 
 | Situation | Action |
 |-----------|--------|
+| Deliverable already on target | Confirm it, then halt with evidence. Never hand an empty branch to the refinery. |
 | Tests fail | Fix them. Do not proceed with failures. |
 | Blocked on external | Mail Witness, mark yourself stuck |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
@@ -214,15 +221,103 @@ the target.
 git status                  # Should be clean
 ```
 
-**5. Run project setup (if configured):**
+**5. Already-delivered gate — is the deliverable ALREADY on {{base_branch}}?**
+
+Run this BEFORE `setup_command` and before writing a line of code. The bead
+pool can go stale relative to the target branch: another machine, an earlier
+polecat, or a human lands the work directly on origin/{{base_branch}} while the
+bead describing it is still open in the pool. A polecat dispatched at that bead
+takes a slot, builds a deliverable that is already present, produces a branch
+with an empty diff, gets refused by the refinery's `branch_has_real_change()`
+guard, and lands as a blocked bead on a human's desk. That guard works — but it
+catches the waste at the END of the cycle, after the slot is spent.
+
+```bash
+gc gastown delivery-check "$WORK_BEAD_ID" --target "origin/{{base_branch}}"
+echo "delivery check exit: $?"
+```
+
+Invoke it through `gc`, not by path. The check lives in the gastown pack, which
+is materialized in a content-addressed cache, and `GC_PACK_DIR` is set only when
+`gc` itself invokes a pack command — it is NOT part of your session environment.
+A bare `"${GC_PACK_DIR:-}/assets/scripts/polecat-delivery-check.sh"` resolves to
+`/assets/scripts/polecat-delivery-check.sh` in an agent session, fails its own
+`-x` guard, prints "not resolvable", and moves on — permanently. That failure
+reads exactly like a gate that ran and found nothing, which is the worst
+available outcome for a check whose entire job is to fire rarely (see gp-fid).
+
+The check gathers three independent signals against the target ref: a commit
+whose message names this bead id (near-conclusive in a rig whose convention is
+`<type>: <subject> (<bead-id>)`, and it needs no verify clause so it works on
+every bead), a file path named by the bead's verify clause already existing,
+and a code-shaped identifier from that clause already present in the content.
+
+| verdict | exit | meaning | action |
+|---------|------|---------|--------|
+| `not-delivered` | 0 | evidence gathered, does not add up | BUILD. This is the common case. |
+| `no-signal` | 0 | nothing checkable — the check ABSTAINED | BUILD. Abstention is not a clearance, and it is not a finding either. |
+| `possibly-delivered` | 0 | every extracted token is already present | ADVISORY. Glance at the cited files, then BUILD. |
+| `already-delivered` | 1 | a commit on the target names this bead | confirm, then halt — see below |
+| — | 2 | bad ref, unreadable bead, no git | delivery was NOT evaluated. BUILD as normal; the refinery guard is still the backstop. Never read a 2 as a verdict in either direction. |
+
+**Only `already-delivered` stops you, and only after you confirm it.** That
+asymmetry is measured, not stylistic (gp-nrm): across 28 real beads the commit
+signal caught 8/8 already-delivered with zero false positives on 14 open beads,
+while the token heuristic behind `possibly-delivered` fired zero times. A signal
+that has never fired does not get to halt a polecat — a miss costs one pool slot
+and the refinery still catches it, but a false positive silently drops real work.
+
+**A verdict is NEVER sufficient on its own.** Open the cited commit or file and
+read it:
+
+```bash
+git show <cited-sha> --stat        # does this commit actually deliver the bead?
+git show origin/{{base_branch}}:<cited-path> | head -40
+```
+
+Ask whether the deliverable the bead asks for is *genuinely there* — not
+merely that its neighbourhood exists. A test file named by a verify clause
+routinely predates the fix the bead wants; a doc that mentions the subject is
+not the same as a doc that documents it. **If confirmation is anything short of
+convincing, BUILD.** A false already-delivered silently drops real work, which
+is strictly worse than the wasted slot this gate exists to save.
+
+**If you confirm it is already delivered:** stop here. Do not build, do not
+push an empty branch, and do NOT hand off to the refinery — there is nothing to
+merge, and an empty branch is exactly the false-completion the refinery would
+refuse. Report the evidence instead, and clear the pool routing so no other
+polecat repeats the cycle:
+
+```bash
+gc bd update "$WORK_BEAD_ID" \
+  --status=blocked \
+  --assignee="" \
+  --set-metadata gc.routed_to=human \
+  --set-metadata already_delivered_suspected="<verdict> vs origin/{{base_branch}}: <sha or path cited by the check>" \
+  --notes "Already delivered before build: <what you confirmed, and where>.
+Evidence: <sha> <subject> / <path>. No branch pushed — nothing to merge.
+Verified by reading the commit, not by the check's verdict alone."
+gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "ALREADY-DELIVERED: $WORK_BEAD_ID — deliverable confirmed present on origin/{{base_branch}} (<sha>); halted before build, no branch pushed."
+gc runtime drain-ack
+exit 0
+```
+
+`blocked` + `gc.routed_to=human` is deliberate: the bead needs one cheap human
+call ("close it as done, or re-scope it") and must not fall back into the
+polecat pool, which would re-run this whole cycle. Unlike the refinery's
+post-hoc `refused_false_completion` — a negative inference with nothing to act
+on — this carries the positive evidence, so the call takes seconds instead of
+an investigation.
+
+**6. Run project setup (if configured):**
 ```bash
 {{setup_command}}
 ```
 Empty setup_command → skip.
 
 **Exit criteria:** In your worktree, on a clean feature branch, rebased
-on latest {{base_branch}}, deps installed, worktree and branch recorded
-on the bead."""
+on latest {{base_branch}}, the already-delivered gate cleared (or halted
+with evidence), deps installed, worktree and branch recorded on the bead."""
 
 [[steps]]
 id = "self-review"

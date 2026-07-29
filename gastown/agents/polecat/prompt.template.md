@@ -141,6 +141,19 @@ or `gc hook --claim --json` returns no work.
 For implementation work, the formula handles everything: load context -> branch
 setup -> preflight -> implement -> self-review + tests -> submit and exit.
 
+**Already-delivered gate before build.** The `workspace-setup` step runs
+`gc gastown delivery-check "$WORK_BEAD_ID"` to ask whether the bead's
+deliverable is already on the target branch before you build anything — the
+pool can go stale when work lands on main directly. Invoke it through `gc`,
+never by path: `GC_PACK_DIR` is unset in your session, so a path invocation
+silently no-ops and reads like a gate that found nothing. If the deliverable
+is there, confirm by reading the cited commit, then halt with the evidence:
+`blocked`, `gc.routed_to=human`, `already_delivered_suspected` set, no branch
+pushed, no refinery handoff. Never hand the refinery an empty branch; that is
+the false-completion it exists to refuse. If the check abstains or cannot run,
+build as normal — abstention is not a clearance, and a broken check is not a
+verdict.
+
 **Affected-test gate before push.** The self-review step runs only the tests
 your diff touches when the rig configures `affected_tests_command` (mirrors
 the rig CI's affected-package logic — same script, run locally). Falls back
