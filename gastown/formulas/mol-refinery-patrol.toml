@@ -333,20 +333,148 @@ for AW in $(printf '%s' "$AWAITING" | jq -r '.[].id'); do
 done
 ```
 
-**2. Select the next work bead:**
+**2. Triage every bead marked `no_code_change` (before any merge selection):**
+
+A bead carrying `no_code_change=true` has a deliverable that is not a patch:
+verdicts recorded in an external tracker, a state correction elsewhere, an
+investigation's findings. It must never reach the merge selector in step 3. A
+merge queue asserts exactly one thing — "this branch landed on the target" — and
+for a zero-diff branch that is unprovable, so `branch_has_real_change()` refuses
+and `halt_false_completion` fires, every single time.
+
+**That halt stays.** Refusing to close a zero-diff bead as merged is exactly
+what catches a polecat that died having produced nothing. The defect was routing
+non-patch work into a patch-merger at all (gp-d5u, observed on ta-af7).
+
+This pass is the refinery's second terminal transition, alongside merge. It
+deliberately does **not** auto-close. Bead metadata carries no provenance —
+`gc bd history` versions the issue row but not its metadata — so nothing here
+can distinguish a flag set by the filer at dispatch from one a polecat set on
+itself. Closing on the flag alone would hand every polecat a one-key escape from
+the false-completion guard, which is strictly worse than the halt it would
+replace. So this pass verifies what IS mechanically checkable (the branch really
+is empty, and it really exists), then hands a human a decision that takes
+seconds because the evidence travels with it.
+
+```bash
+# --- NO_PATCH_TRIAGE ---
+branch_is_empty() {
+  # Exact complement of merge-push's branch_has_real_change(), redefined here
+  # because each formula step is its own shell. Kept literally inverse on every
+  # arm, including the loose `|| echo 0` on the commit count: if these two
+  # predicates ever disagree, a bead falls between them and NEITHER path accepts
+  # it, which is a worse failure than either arm's individual conservatism.
+  #   0 = verified empty (no net diff vs the merge base)
+  #   1 = verified to carry a real change
+  #   2 = could not evaluate -> caller must not act
+  bie_base=$(git merge-base "$1" "$2" 2>/dev/null) || return 2
+  git diff --quiet "$bie_base" "$2"
+  case "$?" in
+    0) return 0 ;;  # no net diff -> empty, whatever the commit count says
+    1) : ;;         # diff present -> confirm it carries commits too
+    *) return 2 ;;  # git diff errored -> cannot evaluate
+  esac
+  [ "$(git rev-list --count "$bie_base..$2" 2>/dev/null || echo 0)" -ge 1 ] || return 0
+  return 1
+}
+
+# `--metadata-field` matches the stored JSON boolean that
+# `--set-metadata no_code_change=true` writes; an unreadable query is not an
+# empty queue, but it must not feed jq empty stdin either.
+NO_PATCH=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \\
+  --exclude-type=epic --metadata-field=no_code_change=true --limit=0 --json)
+[ -n "$NO_PATCH" ] || NO_PATCH='[]'
+
+for NP in $(printf '%s' "$NO_PATCH" | jq -r '.[].id'); do
+  NP_JSON=$(gc bd show "$NP" --json)
+  NP_BRANCH=$(printf '%s' "$NP_JSON" | jq -r '.[0].metadata.branch // empty')
+  NP_TARGET=$(printf '%s' "$NP_JSON" | jq -r '.[0].metadata.target // "{{target_branch}}"')
+  NP_EVIDENCE=$(printf '%s' "$NP_JSON" | jq -r '.[0].metadata.no_code_change_evidence // empty')
+
+  if [ -z "$NP_BRANCH" ]; then
+    echo "NO_PATCH: $NP carries no metadata.branch, so there is nothing to verify against. Left open; the witness owns beads with no branch."
+    continue
+  fi
+
+  git fetch origin "+refs/heads/${NP_BRANCH}:refs/remotes/origin/${NP_BRANCH}" \\
+                   "+refs/heads/${NP_TARGET}:refs/remotes/origin/${NP_TARGET}" >/dev/null 2>&1 || true
+  if ! git show-ref --verify --quiet "refs/remotes/origin/${NP_BRANCH}"; then
+    echo "NO_PATCH: origin/$NP_BRANCH does not exist for $NP. Absence is NOT evidence of a deliberate no-patch outcome — it is also exactly what a polecat that died before pushing looks like. Left open; the witness owns dead sessions."
+    continue
+  fi
+
+  branch_is_empty "origin/$NP_TARGET" "origin/$NP_BRANCH"
+  case "$?" in
+    1)
+      # It carries a real change, so the flag is WRONG. Strip it and let step 3
+      # pick the bead up on this same patrol. Always fail toward merging real
+      # work: a dropped patch is unrecoverable, a spurious merge attempt costs
+      # one iteration.
+      gc bd update "$NP" \\
+        --unset-metadata no_code_change \\
+        --set-metadata no_code_change_cleared="origin/$NP_BRANCH carries a verified real change vs origin/$NP_TARGET; the flag was wrong" \\
+        --notes "no_code_change=true was set, but origin/$NP_BRANCH introduces a real change vs origin/$NP_TARGET. Cleared the flag and released it to the merge queue: a patch that exists must be merged, whatever the flag claimed."
+      echo "NO_PATCH: $NP flag cleared — origin/$NP_BRANCH has a real change and belongs in the merge queue."
+      continue
+      ;;
+    0) : ;;  # verified empty -> the flag matches reality; fall through to the handoff
+    *)
+      echo "NO_PATCH: could not evaluate origin/$NP_BRANCH vs origin/$NP_TARGET for $NP (git tool error). Fail closed — left open for the next patrol."
+      continue
+      ;;
+  esac
+
+  NP_SHA=$(git rev-parse --short "origin/$NP_BRANCH" 2>/dev/null || printf 'unknown')
+  gc bd update "$NP" \\
+    --status=blocked \\
+    --assignee="" \\
+    --set-metadata merge_result=no_patch_needs_human \\
+    --set-metadata gc.routed_to=human \\
+    --set-metadata no_patch_verified="origin/$NP_BRANCH ($NP_SHA) confirmed zero-diff vs origin/$NP_TARGET by the refinery; deliberate no-patch outcome, NOT a dead polecat" \\
+    --notes "NO PATCH TO MERGE — the refinery confirmed origin/$NP_BRANCH ($NP_SHA) introduces no change vs origin/$NP_TARGET, which is the intended outcome for a no_code_change bead.
+This is NOT a false completion: the branch exists on origin and is deliberately empty, so the polecat ran to completion rather than dying.
+Polecat evidence: ${NP_EVIDENCE:-(none recorded — ask why before closing)}
+HUMAN CALL, and it should take seconds: confirm the deliverable at the source named above, then close as done-without-merge. Nothing to merge, nothing to rebase, no branch to resume.
+Not auto-closed on purpose: bead metadata carries no provenance, so no_code_change alone cannot be told apart from a polecat self-certifying out of a build it could not finish."
+  gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "NO PATCH: $NP — zero-diff confirmed benign (no_code_change=true); routed to human for a done-without-merge close. Not a false completion."
+  echo "NO_PATCH: $NP confirmed benign zero-diff; blocked and routed to human with the evidence attached."
+done
+```
+
+Routing to `human` rather than back to the polecat pool is deliberate, and it
+mirrors the polecat's already-delivered halt: the bead needs one cheap decision
+("close it as done, or re-scope it") and must never fall back into the pool,
+which would spend another session reaching the same dead end. Unlike
+`refused_false_completion` — a negative inference with nothing to act on —
+`no_patch_needs_human` carries positive evidence, so the two are distinguishable
+at a glance and only one of them warrants an investigation.
+
+**3. Select the next work bead:**
 
 Search for work beads assigned to you with branch metadata, skipping the
-`awaiting_merge` beads step 1 just polled:
+`awaiting_merge` beads step 1 just polled and the `no_code_change` beads step 2
+just triaged:
 ```bash
 WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
   --exclude-type=epic --has-metadata-key=branch --limit=0 --json \
-  | jq -r '[.[] | select((.metadata.awaiting_merge // "") != "true")][0].id // empty')
+  | jq -r '[.[] | select(((.metadata.awaiting_merge // "") | tostring) != "true")
+                | select(((.metadata.no_code_change // "") | tostring) != "true")][0].id // empty')
 ```
 
-The `awaiting_merge` filter is load-bearing, not cosmetic. These beads stay
-open and assigned to the refinery on purpose, so a plain `--limit=1` query
-would keep handing back the same parked PR and starve every other branch in
-the queue — the merge queue would livelock behind one PR waiting on a human.
+Both exclusions are load-bearing, not cosmetic. `awaiting_merge` beads stay open
+and assigned to the refinery on purpose, so a plain `--limit=1` query would keep
+handing back the same parked PR and starve every other branch in the queue — the
+merge queue would livelock behind one PR waiting on a human. `no_code_change`
+beads have no patch to merge, so selecting one guarantees the false-completion
+halt that step 2 exists to prevent.
+
+**Both comparisons must go through `tostring`.** `--set-metadata k=true` stores
+a JSON **boolean**, and in jq `true != "true"` is TRUE, so comparing the raw
+field against the string `"true"` excludes nothing at all. The filter still
+reads as present and load-bearing while doing exactly nothing — which is how the
+`awaiting_merge` exclusion shipped inert (found while fixing gp-d5u). The
+`--metadata-field=k=true` flag used in steps 1 and 2 does match the boolean;
+only in-jq comparisons need the cast.
 
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
 database. Without it, `gc bd list` routes to the HQ database and never

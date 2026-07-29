@@ -40,11 +40,18 @@ polecat halts with the evidence instead of producing an empty branch for the
 refinery to refuse. The gate reports; the polecat confirms by reading the cited
 commit before halting, because a false positive drops real work.
 
+**Patch-shape-aware.** `submit-and-exit` reconciles `metadata.no_code_change`
+against the branch it is about to hand off: a flagged bead that produced commits
+has the flag cleared (a patch that exists must merge), and a flagged bead with a
+genuinely empty branch is annotated with the deliverable's evidence so the
+refinery can route it out of the merge queue instead of halting on it.
+
 ## Failure Modes
 
 | Situation | Action |
 |-----------|--------|
 | Deliverable already on target | Confirm it, then halt with evidence. Never hand an empty branch to the refinery. |
+| Deliverable is not a patch | Reconcile `no_code_change` with the real diff, attach the evidence, hand off. Never set the flag to escape a failing build. |
 | Tests fail | Fix them. Do not proceed with failures. |
 | Blocked on external | Mail Witness, mark yourself stuck |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
@@ -469,6 +476,80 @@ BODY
 This is a belt-and-suspenders check — self-review should have caught this,
 but we never push with untracked work left behind.
 
+**2b. No-patch gate — does this bead even have a patch to hand off?**
+
+`metadata.no_code_change=true` marks a bead whose deliverable is not a patch: a
+validation task that records verdicts in an external tracker, a state correction
+in another system, an investigation whose product is the note it writes. The
+work is real; it just does not land as a diff.
+
+Such a bead must not be routed into the refinery's MERGE queue. A merge queue
+asserts exactly one thing — "this branch landed on the target" — and for a
+zero-diff branch that is unprovable, so the refinery's `branch_has_real_change()`
+guard refuses to close it and halts. **That halt is correct and is not being
+weakened**: refusing to close a zero-diff bead as merged is precisely what
+catches a polecat that died having produced nothing. The defect is that
+non-patch work was handed to a patch-merger at all (gp-d5u, first observed on
+ta-af7).
+
+Your job here is narrow. Make the flag TRUE OR FALSE about what you actually
+did, and attach the evidence. The refinery owns the routing and the close.
+
+```bash
+NO_CODE_CHANGE=$(gc bd show "$WORK_BEAD_ID" --json \
+  | jq -r '.[0].metadata | if has("no_code_change") then (.no_code_change | tostring) else "" end')
+COMMITS_AHEAD=$(git rev-list --count "origin/{{base_branch}}..HEAD" 2>/dev/null) || COMMITS_AHEAD=""
+```
+
+Read `no_code_change` through `tostring`. `gc bd update --set-metadata k=true`
+stores a JSON **boolean**, so a comparison against the string `"true"` inside
+jq silently never matches — the filter reads as present and does nothing.
+
+An empty `COMMITS_AHEAD` means the count did not evaluate. Do NOT guess in
+either direction: `git fetch origin {{base_branch}}` and retry. If it still will
+not answer, leave the flag untouched and hand off normally — the refinery
+re-checks this independently and fails closed.
+
+**Flag set, but you produced commits** → the flag is wrong for this branch.
+Clear it. Real code must never be dropped on the strength of a marker claiming
+it would not exist:
+```bash
+if [ "$NO_CODE_CHANGE" = "true" ] && [ -n "$COMMITS_AHEAD" ] && [ "$COMMITS_AHEAD" -gt 0 ]; then
+  gc bd update "$WORK_BEAD_ID" \
+    --unset-metadata no_code_change \
+    --notes "no_code_change=true was set on this bead, but the branch carries $COMMITS_AHEAD commit(s). Cleared the flag: there IS a patch and it must go through the merge queue."
+  NO_CODE_CHANGE=""
+fi
+```
+
+**Flag set and the branch is genuinely empty** → record what you delivered and
+where you verified it. This note is the entire reason the refinery's no-patch
+path can be a seconds-long human call instead of an investigation, so write it
+for a reader who has none of your context:
+```bash
+if [ "$NO_CODE_CHANGE" = "true" ] && [ "$COMMITS_AHEAD" = "0" ]; then
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata no_code_change_evidence="<system>: <what you recorded or changed there>; verified by <the check you ran at the source>" \
+    --notes "NO PATCH BY DESIGN — nothing to merge. Branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}}; the empty diff is the intended outcome, not a failure.
+DELIVERABLE: <what the bead asked for, and where it now lives — the system, the ids, the values>.
+VERIFIED: <the independent check you ran at the source, and what it returned>.
+Refinery: there is no merge to assert. Confirm the deliverable at the source, then close as done-without-merge."
+fi
+```
+
+Then continue to the push below. **Push the empty branch anyway — do not skip
+it.** The pushed ref is the positive evidence that you ran to completion and
+deliberately produced no patch. Its absence is indistinguishable from a polecat
+that died before pushing, and removing that ambiguity is the whole point of this
+path.
+
+**Never set `no_code_change` yourself to escape a build you could not finish.**
+You cannot prove to anyone when the flag was set — `gc bd history` versions the
+issue row but NOT its metadata — so downstream it is treated as a claim
+requiring evidence, never as a clearance, and it never auto-closes a bead. A
+polecat that flags its way out of unfinished work is producing a false
+completion by a quieter route than the one the halt catches.
+
 **3. Push your branch:**
 ```bash
 AUTO_PUSH=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata | if has("auto_push") then (.auto_push | tostring) else "" end')
@@ -585,6 +666,13 @@ The refinery will pick this up, rebase onto {{base_branch}}, run tests,
 merge, and close the bead. If there's a conflict, the refinery puts the
 bead back in the pool with `rejection_reason` metadata — a new polecat
 picks it up and resumes from the existing branch.
+
+If `no_code_change` survived step 2b, the refinery routes the bead to its
+no-patch triage instead of the merge queue: it re-confirms the empty diff itself,
+then blocks the bead and routes it to a human for a done-without-merge close,
+carrying your `no_code_change_evidence`. Reassigning to the refinery is still
+correct — it remains the only agent that closes beads — you are simply handing
+it a bead it will terminate a different way. Do NOT close it yourself.
 
 **7. Signal refinery to check for work immediately (belt-and-suspenders):**
 ```bash

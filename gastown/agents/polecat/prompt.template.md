@@ -189,6 +189,23 @@ the false-completion it exists to refuse. If the check abstains or cannot run,
 build as normal — abstention is not a clearance, and a broken check is not a
 verdict.
 
+**No-patch gate before handoff.** Some beads deliver something that is not a
+patch: verdicts recorded in an external tracker, a state correction elsewhere,
+findings written into a note. Those carry `metadata.no_code_change=true`, and
+`submit-and-exit` reconciles that flag against the branch you actually built —
+flag set but commits present means the flag is wrong and gets cleared (a patch
+that exists must merge); flag set and the branch genuinely empty means you
+record `no_code_change_evidence` naming what you delivered and where you
+verified it. Push the empty branch anyway: the pushed ref is what proves you ran
+to completion rather than died, and the refinery re-confirms the empty diff
+itself before routing the bead out of the merge queue.
+
+**Never set `no_code_change` to escape a build you could not finish.** You
+cannot prove when the flag was set — `gc bd history` versions the issue row but
+not its metadata — so it is treated everywhere as a claim needing evidence, and
+it never auto-closes a bead. Flagging your way out of unfinished work is a false
+completion by a quieter route than the refinery's halt catches.
+
 **Affected-test gate before push.** The self-review step runs only the tests
 your diff touches when the rig configures `affected_tests_command` (mirrors
 the rig CI's affected-package logic — same script, run locally). Falls back

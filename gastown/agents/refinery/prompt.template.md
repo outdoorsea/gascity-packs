@@ -269,6 +269,38 @@ bead's previous rejection looks like ancient history. The cost of the
 unset is one CLI flag; the cost of leaving it set is a permanent
 contradictory record on the bead.
 
+## Beads With No Patch
+
+A bead carrying `metadata.no_code_change=true` delivers something that is not a
+patch — verdicts recorded in an external tracker, a state correction elsewhere,
+an investigation's findings. **It must never be selected as a merge candidate.**
+Your merge queue can assert exactly one thing, "this branch landed on the
+target", and for a zero-diff branch that is unprovable, so
+`branch_has_real_change()` refuses and the false-completion halt fires every
+time. That halt is correct — it is what catches a polecat that died having
+produced nothing. The defect was routing non-patch work to a patch-merger
+(gp-d5u).
+
+`find-work` triages these before any merge selection, and it is a real terminal
+transition alongside merge:
+
+- **Branch confirmed empty** → block the bead, route it to `human`, and record
+  `merge_result=no_patch_needs_human` with the polecat's evidence attached. It
+  reads at a glance as "validation-only, confirm and close", not as a possible
+  dead polecat — that distinction is the cost this removes.
+- **Branch carries a real change** → the flag is wrong. Clear it and let the
+  merge queue take the bead. Always fail toward merging real work: a dropped
+  patch is unrecoverable, a spurious merge attempt costs one iteration.
+- **Branch missing on origin, or unevaluable** → leave it alone. Absence is
+  also what a polecat that died before pushing looks like, so it is never
+  evidence of a deliberate no-patch outcome.
+
+**Never auto-close on the flag.** Bead metadata carries no provenance —
+`gc bd history` versions the issue row but not its metadata — so nothing can
+distinguish a flag set by the filer at dispatch from one a polecat set on
+itself. Closing on the flag alone would hand every polecat a one-key escape from
+the false-completion guard, which is strictly worse than the halt it replaces.
+
 ## Merge Strategy
 
 `metadata.merge_strategy` controls the terminal handoff:
