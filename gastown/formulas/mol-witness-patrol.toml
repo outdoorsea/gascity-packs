@@ -444,10 +444,100 @@ Observation: <what you found>
 Recommendation: <what should happen>"
 ```
 
+If the escalation you are about to file claims the merge queue is being
+BYPASSED, stop and run Step 5 first. That claim has a specific required
+test, and the obvious test is wrong.
+
+**Step 5: Before filing a queue-bypass finding.**
+
+"The merge queue is being bypassed" is a high-cost claim — it names a root
+cause a human will act on, against a machine or an operator. Two tests are
+required and BOTH must hold. One tempting test is invalid on its own.
+
+**INVALID: commit shape.** Linear single-parent commits on the target, with
+no merge commits, are NOT evidence of bypass. The refinery's `direct`
+strategy rebases the polecat branch onto the target and fast-forwards
+(`git rebase origin/$TARGET`, then `git merge --ff-only`), so a correctly
+working queue produces linear single-parent history BY CONSTRUCTION. The
+"bypass" shape and the "queue is healthy" shape are the same shape.
+
+Shape does not separate PR merges either: GitHub squash merges are also
+linear single-parent, carrying only a `(#NN)` subject suffix. So a `(#NN)`
+commit is not proof of a PR merge, and the absence of
+`Merge pull request #NN` proves nothing at all.
+
+(gp-zs8: a witness filed a MED escalation off exactly this test and named
+"stop bypassing the queue" as the root cause. The two commits it cited as
+evidence were its own refinery's merges, made inside its own patrol window.)
+
+**REQUIRED test 1 — the author email is foreign to the town:**
+```bash
+git log origin/<target> --format='%H %ae %s' -20
+# Every user.email configured anywhere in the town:
+git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
+  git -C "$wt" config user.email
+done | sort -u
+git config --global user.email
+```
+An author email appearing in NO town git config is the discriminating
+signal. Note that `user.name` is frequently uniform across every agent
+worktree, the refinery worktree, and the canonical checkout, because all
+of them inherit one global value. Uniform `user.name` means the NAME axis
+carries no agency information; it does NOT mean the identity axis is
+useless. Always check `user.email` before discarding identity.
+
+**REQUIRED test 2 — no refinery involvement in the reflog:**
+```bash
+REFINERY_WT=$(git worktree list --porcelain | awk '/^worktree /{print $2}' | grep '/refinery$' | head -1)
+git -C "$REFINERY_WT" reflog show HEAD -n 100
+git reflog show refs/remotes/origin/<target> -n 50
+```
+If that grep finds nothing, resolve the refinery worktree from rig config
+rather than guessing a path. HEAD is per-worktree, so `git -C <wt> reflog
+show HEAD` reads that worktree's own history.
+
+Refinery involvement in its worktree's HEAD reflog looks like
+`rebase (pick): <subject>`, `checkout: moving from <sha> to temp`, or
+`merge refinery-work: Fast-forward`.
+
+CAVEAT: `rebase (pick)` entries appear ONLY when commits actually needed
+replaying. A polecat branch already sitting on top of the target rebases
+as a no-op fast-forward and logs no pick entry at all — just the `temp`
+checkout pair. Absence of `rebase (pick)` is therefore not evidence of
+bypass, and treating it as such is the same mistake in the other
+direction.
+
+The `refs/remotes/origin/<target>` reflog is the sharper signal, because
+it records HOW the ref moved:
+- `update by push` — a process on THIS machine moved it (the refinery did)
+- `fetch: fast-forward` — it arrived already-made from somewhere else
+
+A run of `fetch: fast-forward` entries carrying a foreign author email is
+the actual shape of a second machine pushing directly. `update by push` is
+this town's own refinery doing its job.
+
+Before calling a target commit a lookalike rather than a replay, confirm
+patch identity:
+```bash
+git show <polecat-sha> | git patch-id --stable
+git show <target-sha> | git patch-id --stable
+```
+Equal patch-ids mean the queue replayed that commit. That is the queue
+working, not a bypass.
+
+**If both tests hold**, file the finding with the evidence inline: the
+foreign author email, the reflog lines, and the patch-id comparison.
+**If either test fails, there is no bypass finding to file.**
+
+Even when both hold, prefer the benign reading first: another host in the
+same town legitimately doing hardware-bound work it alone can run. That is
+a topology fact worth reporting, not a violation to name someone for.
+
 **Exit criteria:** Queue health assessed; nudge sent or escalation
-filed if needed. Continue to `check-polecat-health` — do NOT exit the
-wisp here. The `next-iteration` step is the only place that pours the
-next wisp and burns this one."""
+filed if needed. Any queue-bypass claim carries identity + reflog
+evidence, or was not filed. Continue to `check-polecat-health` — do NOT
+exit the wisp here. The `next-iteration` step is the only place that
+pours the next wisp and burns this one."""
 
 [[steps]]
 id = "check-polecat-health"
