@@ -163,13 +163,16 @@ one signal that separates "idle and fine" from "the loop is gone", so it gets
 measured rather than judged.
 
 ```bash
-CHECK="${GC_PACK_DIR:-}/assets/scripts/witness-heartbeat-check.sh"
-if [ -x "$CHECK" ]; then
-  GASTOWN_WITNESS_STALE_MIN={{witness_stale_min}} bash "$CHECK"; echo "heartbeat check exit: $?"
-else
-  echo "witness-heartbeat-check.sh not resolvable under GC_PACK_DIR — use the judgment pass below only."
-fi
+GASTOWN_WITNESS_STALE_MIN={{witness_stale_min}} gc gastown witness-heartbeat-check
+echo "heartbeat check exit: $?"
 ```
+
+Route it through `gc`, never as a path under `$GC_PACK_DIR`: gc sets that
+variable for pack COMMANDS and it is unset in your shell, so a direct path
+resolves to `/assets/scripts/...` and measures nothing. This step shipped that
+way and the check never ran once (gp-3qb) — the `[ -x ]` guard it sat behind
+turned the unset variable into a skip that printed a considered-sounding
+fallback, so every patrol logged a clean health scan it had not performed.
 
 Exit 0 means every checked witness heartbeat is inside the window. Exit 1 means
 findings, one TSV row per witness
