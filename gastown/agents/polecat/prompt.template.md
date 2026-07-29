@@ -241,8 +241,14 @@ done
 if [ "$SHOW_OK" -ne 1 ]; then
   # Never leave a claimed bead stranded in_progress on an unreadable state:
   # release it so it re-enters the pool instead of being lost.
+  #
+  # Re-assert gc.routed_to on the way out. Pool demand keys on that field
+  # alone, so open+unassigned without it is still stranded -- just in a
+  # different status, and a much quieter one (gp-982). A bead that arrived
+  # by direct assignment rather than pool routing has no routing to inherit,
+  # so releasing it without this leaves nothing pointing at it.
   echo "CLAIM_RELEASED $WORK_ID unreadable after retries; returning it to the pool"
-  gc bd update "$WORK_ID" --status=open --assignee=""
+  gc bd update "$WORK_ID" --status=open --assignee="" --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
   gc runtime drain-ack
   exit 0
 fi

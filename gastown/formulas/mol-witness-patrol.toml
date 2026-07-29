@@ -367,10 +367,24 @@ rm -rf <worktree-path> 2>/dev/null  # Fallback
 git worktree prune
 ```
 
-Close any orphaned workflow subtree, then return the bead to pool:
+Close any orphaned workflow subtree, then return the bead to pool.
+`reopen-source` reopens the bead and clears the assignee, but it does NOT
+set routing — you must set `gc.routed_to` yourself or the bead is
+unroutable:
 ```bash
 gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>
+gc bd update <bead> \
+  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
 ```
+
+**Do not skip that second command.** Pool demand keys on `gc.routed_to`,
+not on open status and not on `gc bd ready` membership. A recovered bead
+left without it generates zero demand — no polecat is spawned for it and
+none auto-claims it — yet it looks entirely healthy in every listing:
+open, ready, unassigned, branch intact on origin. Nothing surfaces it as
+stuck, so it sits indefinitely. Salvaging the branch and then leaving the
+bead unroutable means the work you just rescued is still never picked up
+(gp-982: `ml-b2y.1` reached exactly this state by this path).
 
 **Step 4: Assess and notify.**
 
@@ -400,14 +414,74 @@ gc bd update <bead> --set-metadata recovered=true
 ```
 
 **Exit criteria:** All orphaned beads recovered, worktrees cleaned.
-Or no orphans found. Continue to `check-refinery` — do NOT exit the
-wisp here. The `next-iteration` step is the only place that pours the
-next wisp and burns this one."""
+Or no orphans found. Continue to `check-unroutable-beads` — do NOT exit
+the wisp here. The `next-iteration` step is the only place that pours
+the next wisp and burns this one."""
+
+[[steps]]
+id = "check-unroutable-beads"
+title = "Sweep for open work no pool can claim"
+needs = ["recover-orphaned-beads"]
+description = """
+Assert the routing invariant:
+
+> **open + unassigned + `metadata.branch` present => `gc.routed_to` non-empty**
+
+Pool demand keys on `gc.routed_to` alone — not on open status, not on
+`gc bd ready` membership. A bead violating this invariant generates zero
+demand: no polecat is spawned for it, none auto-claims it, and it sits
+indefinitely. It is invisible to every other check because it looks
+healthy from the outside — open, ready, unassigned, branch intact on
+origin, often with a good actionable `rejection_reason`. This step exists
+because nothing else in the patrol can see it (gp-982).
+
+Rejection and orphan-recovery are the two transitions that predictably
+produce this state, so the sweep runs every patrol rather than on demand.
+
+**Step 1: Find violations.**
+```bash
+gc bd list --status=open --json --limit=0 | jq -r '[ .[] | select((.assignee // "") == "") | select((.metadata["branch"] // "") != "") | select((.metadata["gc.routed_to"] // "") == "") | select((.metadata["halt_reason"] // "") != "auto_push_false") | select(((.metadata["branch_ready"] // "") | tostring) != "true") | select(((.issue_type // .type // "") != "epic")) | {id, title, branch: .metadata["branch"], rejected: (.metadata["rejection_reason"] // ""), recovered: (.metadata["recovered"] // "")} ]'
+```
+
+**The two exclusions are load-bearing — do not drop them.**
+`halt_reason=auto_push_false` and `branch_ready=true` mark a
+*deliberate* halt: `mol-polecat-work` sets `gc.routed_to=""` on purpose
+when a bead carries `auto_push=false`, parking the work at branch-ready
+for a human. Those beads match the raw shape of the invariant but are
+correct. Re-routing them silently resumes work an operator explicitly
+opted out of — a worse failure than the one this step fixes, because it
+overrides an intent that was stated rather than merely forgotten.
+
+**Step 2: Re-route each violation.**
+```bash
+gc bd update <bead> --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+```
+Do not touch the branch, the `rejection_reason`, or anything else. The
+branch is intact and the reason is still accurate — routing is the only
+thing missing. A new polecat resumes from that branch normally.
+
+**Step 3: Report, because every hit is an upstream bug.**
+
+A violation means some agent's terminal transition dropped the field.
+Fixing the bead here clears the symptom; the writer still needs fixing.
+Nudge on a single stray, mail on a repeat or a cluster:
+```bash
+gc session nudge mayor "UNROUTABLE SWEPT: <n> bead(s) open+unassigned with a branch but no gc.routed_to; re-routed to the polecat pool. Suspect a reject/recovery path that does not set routing."
+```
+
+If the same bead ID turns up in consecutive patrols, the writer is
+actively re-clearing it — that is a code defect, not a stale bead. Mail
+the mayor with the bead ID and its `rejection_reason` / `recovered`
+fields so the offending path can be traced.
+
+**Exit criteria:** No open+unassigned bead carries a branch without
+routing, excluding deliberate `auto_push=false` halts. Continue to
+`check-refinery` — do NOT exit the wisp here."""
 
 [[steps]]
 id = "check-refinery"
 title = "Check refinery queue health"
-needs = ["recover-orphaned-beads"]
+needs = ["check-unroutable-beads"]
 description = """
 Ensure the refinery is processing work and the queue is healthy.
 

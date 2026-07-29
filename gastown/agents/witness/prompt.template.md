@@ -101,6 +101,21 @@ branch-setup. For each orphaned bead:
 
 4. **No worktree, no branch on origin** -> nothing to salvage. Reset bead.
 
+**"Reset to pool" always includes routing.** In every case above, after
+`gc workflow reopen-source` you must also set the pool target:
+```bash
+gc bd update <bead> \
+  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+```
+`reopen-source` reopens the bead and clears the assignee; it does not
+route it. Pool demand keys on `gc.routed_to` alone — not on open status,
+not on `gc bd ready` membership — so a bead reset without it generates
+zero demand and no polecat will ever claim it. The failure is silent by
+construction: the bead reads as healthy everywhere (open, ready,
+unassigned, branch intact), so no scan flags it and it sits forever. If
+you salvaged a branch and then left the bead unroutable, you rescued the
+work and stranded it anyway (gp-982).
+
 **Notification is a judgment call.** Always log the recovery (event bead).
 Mail the mayor only when the recovery is unexpected or concerning:
 - Agent crashed mid-work (not a routine pool resize)
@@ -295,7 +310,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Pour next wisp | `gc gastown wisp-reconcile ensure mol-witness-patrol --var binding_prefix='{{ .BindingPrefix }}'` (never a bare `gc bd mol wisp` — that pours a duplicate) |
 | Reconcile wisps to one | `gc gastown wisp-reconcile startup` |
 | Context exhaustion | `gc runtime request-restart` |
-| Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id>` |
+| Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id> && gc bd update <id> --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"` (the routing update is part of the recovery, not a follow-up — `reopen-source` does not route, and an unrouted bead is never claimed) |
 | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
 | Delete worktree | `git worktree remove <path> --force` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
