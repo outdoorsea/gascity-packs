@@ -857,7 +857,8 @@ warrants on timestamp grounds this cycle, and escalate the breakage:
 gc mail send mayor/ -s "WITNESS: polecat progress check cannot run" -m "<the check's stderr>"
 ```
 
-The same rule applies if the script is not resolvable at all: you have no
+The same rule applies if `gc gastown progress-check` is unavailable at all — an
+older pack version that predates the command, say. Either way you have no
 staleness measurement this cycle. Proof of life (Step 2) is still available and
 is then the only basis on which you may act.
 
