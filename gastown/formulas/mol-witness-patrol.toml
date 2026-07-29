@@ -29,8 +29,10 @@ monitors the WORK layer:
 1. **Orphaned bead recovery** — beads assigned to agents that won't spawn
    (pool max changed, agent removed from config). This is the core job.
 2. **Refinery queue health** — work beads assigned to refinery, staleness.
-3. **Polecat health** — detect stuck polecats, file warrants for dog pool.
-4. **Help mail** — triage HELP/escalation requests from polecats.
+3. **Parked sessions** — sessions stopped at a provider usage-limit prompt.
+   They report `active` to everything else, so nothing else will catch them.
+4. **Polecat health** — detect stuck polecats, file warrants for dog pool.
+5. **Help mail** — triage HELP/escalation requests from polecats.
 
 Gate checks and convoy/swarm completion are town-wide concerns handled by
 the deacon, not the per-rig witness.
@@ -70,6 +72,10 @@ default = ""
 [vars.event_timeout]
 description = "Seconds to sleep before re-checking. Replaces former event-watch loop which hot-spun on cache-reconcile firehose."
 default = "60"
+
+[vars.parked_settle_secs]
+description = "Seconds between the two pane peeks that decide whether a session showing a usage-limit banner is parked or still advancing. Paid once for the whole rig, and only when some session is actually showing a banner — the peek pass itself costs ~17s for a 5-session rig (measured, concurrent peeks in batches of 8). Long enough that an auto-retry or a re-render lands inside the window and reports `settling` instead of `parked`; short enough that a genuinely parked session is recovered within one cycle rather than sitting on a P1 bead for hours."
+default = "45"
 
 [vars.polecat_stale_min]
 description = "Minutes of polecat silence — no file write under the worktree, no bead update — before check-polecat-health's deterministic pass marks the bead stale. Stale is a candidate for a proof-of-life peek, never a warrant on its own. The default leaves an order of magnitude over the longest common legitimate silence (one build/vet/test cycle inside a single tool call, ~4 minutes on this fleet) while still surfacing a genuine multi-hour wedge within one patrol cycle. Raise it for rigs whose test suites run long."
@@ -609,14 +615,183 @@ a topology fact worth reporting, not a violation to name someone for.
 
 **Exit criteria:** Queue health assessed; nudge sent or escalation
 filed if needed. Any queue-bypass claim carries identity + reflog
-evidence, or was not filed. Continue to `check-polecat-health` — do NOT
-exit the wisp here. The `next-iteration` step is the only place that
-pours the next wisp and burns this one."""
+evidence, or was not filed. Continue to `check-parked-sessions` — do
+NOT exit the wisp here. The `next-iteration` step is the only place
+that pours the next wisp and burns this one."""
+
+[[steps]]
+id = "check-parked-sessions"
+title = "Detect sessions parked at a usage-limit prompt"
+needs = ["check-refinery"]
+description = """
+**Config: parked_settle_secs = {{parked_settle_secs}}**
+
+A session parked at a provider usage-limit prompt is a THIRD state, and every
+other detector in Gas Town reads it as healthy (gp-px5, measured 2026-07-29):
+
+- `gc session list` reports it `active`, so the controller will not restart it.
+- Liveness resolves its assignee to `active`, so `recover-orphaned-beads`
+  correctly refuses it. It is NOT an orphan.
+- It is not stuck in the `check-polecat-health` sense: no infinite loop, no
+  long tool call. It is not executing at all.
+- `gc runtime drain` is COOPERATIVE — it sets GC_DRAIN and waits for the agent
+  to poll `gc runtime drain-check`. A parked session never polls, so drain is a
+  no-op against exactly the case you most want to drain.
+
+Measured cost: a polecat held a P1 bead for 17h and did nothing, its pane
+showing a weekly-limit banner and no "esc to interrupt". It was NOT out of
+quota — a sibling session was mid-turn on the same shared provider in the same
+minute. The banner was stale session state, and `gc session reset` restored it
+in under 60 seconds.
+
+It is also a BEAD SINK. Releasing the bead does not help while the session
+lives: a bead set to open and unassigned at 19:26:41Z was back in_progress
+under the same parked session by 19:29:30Z, with no operator action in
+between. Nor can you route around it — a polecat instance is not addressable
+(`gc sling <rig>/{{binding_prefix}}<suffix>` fails; the pool target is the
+only address), so one parked member can swallow a whole rig's dispatch. Reset
+the SESSION. Do not try to move the work.
+
+**Step 1: Measure. Run the detector — do not eyeball panes.**
+
+```bash
+gc gastown parked-check
+echo "parked check exit: $?"
+```
+
+Route it through `gc`, never as a path under `$GC_PACK_DIR`: gc sets that
+variable for pack COMMANDS and it is unset in your shell, so a direct path
+resolves to `/assets/scripts/...` and measures nothing.
+
+The command scans the active sessions in your own rig (GC_RIG, inherited from
+your shell). It peeks each pane, then re-peeks only the sessions showing a
+limit banner after one shared {{parked_settle_secs}}s settle gap — the gap is
+paid once for the rig, and only when something is actually showing a banner.
+Budget roughly 17s for the peek pass on a 5-session rig (measured), plus the
+gap when there is a candidate.
+
+Exit 0 means nothing parked and nothing unmeasured. Exit 1 means findings, one
+TSV row per session — verdict, session, session_name, alias, rig, detail:
+
+| verdict | meaning | action |
+|---------|---------|--------|
+| `parked` | banner in the pane tail, no mid-turn marker, pane unchanged across the gap | Step 2 — reset it |
+| `settling` | banner present but the pane is still advancing | nothing. It may be auto-retrying; a reset would interrupt a recovery already under way |
+| `busy` | a mid-turn marker is present | nothing. It is executing |
+| `clear` | no limit banner in the pane tail | nothing |
+| `unpeekable` | the peek failed | this session's state was NOT measured. Note it; if the same session is unpeekable across cycles, escalate |
+
+Exit 2 means the check could not run. That is "no session was measured", NOT
+health. Escalate the breakage and take no reset action on parked grounds this
+cycle:
+
+```bash
+gc mail send mayor/ -s "WITNESS: parked-session check cannot run" -m "<the check's stderr>"
+```
+
+**Step 2: Reset every `parked` session. This is the documented remedy.**
+
+`gc session reset` is the correct, cheap, bead-preserving fix: the controller
+stops the runtime and starts the same session again with fresh provider
+conversation state, while session identity, alias, mail, and queued work stay
+attached to the existing session bead. The work bead is NOT released and does
+NOT need to be — the restarted session resumes it from formula context.
+
+Two things that are NOT the remedy:
+
+- **A warrant.** That sends the dog to kill an agent over a provider budget
+  banner, and the shutdown dance's proof-of-life questions can never be
+  answered by a session parked at a prompt. Wrong tool, destructive outcome.
+- **Releasing the bead.** Measured above: the parked session re-claims it
+  within minutes. Reset first; the bead follows the session.
+
+Never reset your own session — you are running this patrol, and a reset
+mid-cycle discards your context and the wisp bookkeeping. Skip any row whose
+session matches `$GC_SESSION_ID` or `$GC_SESSION_NAME`.
+
+**Precondition — a clean worktree.** Reset restarts the runtime, not the
+worktree: files on disk survive. What does not survive is the session's
+in-flight reasoning about uncommitted work. Verify the three signals that were
+verified in the incident before resetting:
+
+```bash
+BEAD=$(gc bd list --status=in_progress --assignee="$SESSION_NAME" --json --limit=1 | jq -r '.[0].id // empty')
+WORKTREE=''
+if [ -n "$BEAD" ]; then
+  WORKTREE=$(gc bd show "$BEAD" --json | jq -r '.[0].metadata.work_dir // empty')
+fi
+if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
+  git -C "$WORKTREE" status --porcelain
+  git -C "$WORKTREE" log --oneline origin/main..HEAD
+  git -C "$WORKTREE" stash list
+fi
+```
+
+All three empty (or no worktree at all) is a clean worktree: nothing is at
+risk on disk, and the standing authorization to reset applies. Reset it:
+
+```bash
+gc session reset "$ALIAS"
+```
+
+If ANY of the three is non-empty, do NOT reset. There is unpublished work whose
+context would be lost. Mail the mayor with the evidence and let this cycle pass:
+
+```bash
+gc mail send mayor/ -s "WITNESS: parked session with unpublished work" -m "Session: <alias> (<session_name>)
+Bead: <bead>
+Banner: <detail column from the check>
+Dirty paths / unpushed commits / stashes: <what you found>
+Standing authorization covers clean worktrees only — not resetting. Requesting a decision."
+```
+
+**Step 3: Record the reset, and never reset-loop.**
+
+Stamp the bead so a repeat is visible to the next cycle and the next witness
+session. Metadata is the durable record; your context is not:
+
+```bash
+COUNT=$(gc bd show "$BEAD" --json | jq -r '.[0].metadata.parked_reset_count // 0')
+gc bd update "$BEAD" --set-metadata parked_reset_count=$((COUNT + 1)) --set-metadata parked_reset_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+```
+
+A session that comes back `parked` after a reset — `parked_reset_count` of 2 or
+more — is NOT a stale-banner case. That is a real wall, or something the reset
+cannot fix. Do not reset again; escalate:
+
+```bash
+gc mail send mayor/ -s "WITNESS: parked session survived reset [HIGH]" -m "Session: <alias>
+Bead: <bead>
+Resets so far: <count>
+Banner: <detail column>
+A reset cleared the banner once and it returned. This may be a genuine provider
+limit rather than stale session state. Not resetting again."
+```
+
+**Step 4: Confirm the recovery.**
+
+Re-measure the session you reset rather than assuming it took. Naming it
+explicitly re-checks just that one and bypasses the rig filter:
+
+```bash
+gc gastown parked-check "$SESSION"
+```
+
+`clear` or `busy` means it came back. Still `parked` on the same cycle usually
+means the restart has not finished — leave it for the next cycle, where Step 3's
+counter makes a genuine failure visible.
+
+**Exit criteria:** Every active session in the rig measured; every `parked`
+verdict either reset under a clean worktree, escalated (dirty worktree), or
+escalated as a repeat offender; nothing killed and no bead released on parked
+grounds. Or nothing parked. Continue to `check-polecat-health` — do NOT exit
+the wisp here. The `next-iteration` step is the only place that pours the next
+wisp and burns this one."""
 
 [[steps]]
 id = "check-polecat-health"
 title = "Check polecat work progress"
-needs = ["check-refinery"]
+needs = ["check-parked-sessions"]
 description = """
 Detect polecats that are alive but not making progress on their work.
 
@@ -725,6 +900,15 @@ None of the following is evidence of a stall:
   loop if the narrative does not advance — same command, same failure, no new
   reasoning — across peeks taken well apart.
 - **Silence during one long tool call.** Step 2 is what settles this.
+- **A session `check-parked-sessions` reported as `parked`.** A parked session
+  produces the exact evidence this step treats as a confirmed stall — no file
+  writes, no bead updates, an unchanged pane across two peeks — because it is
+  not executing at all. It is the third state, not a stall, and the previous
+  step already reset it or escalated it. Filing a warrant here sends the dog to
+  kill an agent over a provider budget banner, and the shutdown dance's
+  proof-of-life questions can never be answered by a session parked at a
+  prompt. Check the parked verdicts from that step before reading a failed
+  proof-of-life peek as a stall.
 
 **Step 4: For confirmed-stuck polecats, file a warrant (deduped).**
 
@@ -733,7 +917,8 @@ handle the shutdown dance (multi-stage interrogation with due process).
 
 A `stale` row alone never justifies a warrant. Reaching this step requires
 both a `stale` verdict from Step 1 and a failed proof-of-life confirmation
-from Step 2, and the `reason` must record both so the dog — and anyone
+from Step 2, and a target that `check-parked-sessions` did not report as
+`parked` this cycle. The `reason` must record all three so the dog — and anyone
 auditing a pardon later — can see which evidence was actually gathered.
 
 First check for an existing open warrant against the same target — a second

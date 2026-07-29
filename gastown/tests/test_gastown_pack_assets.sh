@@ -294,6 +294,122 @@ test_polecat_health_check_is_measured_not_improvised() {
         fail "the formula must state the local-mtime-with-Z prohibition outright"
 }
 
+# step_description <formula> <step-id> — one step's description text on stdout.
+# Guards below have to distinguish "this step says X" from "some other step in
+# the same file says X": mol-witness-patrol legitimately files warrants in
+# check-polecat-health, and a whole-file grep for warrant filing would pass on a
+# parked step that filed one too.
+step_description() {
+    python3 - "$1" "$2" <<'PY'
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    doc = tomllib.load(handle)
+for step in doc.get("steps", []):
+    if step.get("id") == sys.argv[2]:
+        sys.stdout.write(step.get("description", ""))
+        break
+else:
+    raise SystemExit(f"no step {sys.argv[2]!r} in {sys.argv[1]}")
+PY
+}
+
+test_parked_session_detector_is_wired_into_the_patrol() {
+    # gp-px5: a session parked at a provider usage-limit prompt reports `active`
+    # to `gc session list`, resolves to `active` for liveness, and is not
+    # looping — so the controller, orphan recovery, and the stuck-polecat check
+    # each correctly declined it, and one held a P1 bead for 17h. The detector
+    # is the only thing that models this state; these guards keep it reachable.
+    local formula check cmd block
+    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+    check="$GASTOWN/assets/scripts/parked-session-check.sh"
+    cmd="$GASTOWN/commands/parked-check/run.sh"
+
+    [[ -x "$check" ]] || fail "missing or non-executable assets/scripts/parked-session-check.sh"
+    [[ -x "$cmd" ]] || fail "missing or non-executable commands/parked-check/run.sh"
+    [[ -f "$GASTOWN/commands/parked-check/help.md" ]] ||
+        fail "missing commands/parked-check/help.md"
+    parse_toml "$formula"
+
+    # The wrapper is the whole point of the command: gc sets GC_PACK_DIR for
+    # pack COMMANDS and never in an agent's shell, so a formula that reads
+    # "$GC_PACK_DIR/assets/scripts/..." resolves to "/assets/scripts/..." and
+    # silently measures nothing. usage-stamp was routed through gc for exactly
+    # this reason (gp-fid); the check must not regress to the path form.
+    grep -F 'gc gastown parked-check' "$formula" >/dev/null ||
+        fail "the witness patrol must invoke the detector as 'gc gastown parked-check'"
+    ! grep -F 'GC_PACK_DIR' "$formula" | grep -F 'parked' >/dev/null ||
+        fail "the parked check must not be resolved via \$GC_PACK_DIR; it is unset in an agent shell"
+    grep -F 'GC_PACK_DIR' "$cmd" >/dev/null ||
+        fail "commands/parked-check/run.sh must resolve the detector through GC_PACK_DIR"
+
+    # A step nothing `needs` never runs. The chain is the wiring.
+    python3 - "$formula" <<'PY'
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    steps = tomllib.load(handle)["steps"]
+ids = [s["id"] for s in steps]
+if "check-parked-sessions" not in ids:
+    raise SystemExit("mol-witness-patrol has no check-parked-sessions step")
+needed = {n for s in steps for n in s.get("needs", [])}
+if "check-parked-sessions" not in needed:
+    raise SystemExit("check-parked-sessions is not in any step's needs — it would never run")
+PY
+
+    grep -F '[vars.parked_settle_secs]' "$formula" >/dev/null ||
+        fail "parked_settle_secs must be declared so the settle gap is configurable per rig"
+    grep -F '{{parked_settle_secs}}' "$formula" >/dev/null ||
+        fail "the settle gap must come from the formula var, not a number invented per cycle"
+
+    block=$(step_description "$formula" check-parked-sessions)
+
+    grep -F 'gc session reset' <<<"$block" >/dev/null ||
+        fail "check-parked-sessions must name 'gc session reset' as the remedy"
+    grep -F 'git -C "$WORKTREE" status --porcelain' <<<"$block" >/dev/null ||
+        fail "the reset must be gated on a runnable clean-worktree precondition, not a vibe"
+    grep -F 'parked_reset_count' <<<"$block" >/dev/null ||
+        fail "a reset must be recorded durably so a repeat offender is visible to the next cycle"
+
+    # The two wrong tools, asserted as INVOCATIONS rather than words. The step
+    # names both in prose to explain why each is wrong, so a word-level grep
+    # matches its own documentation — the first version of this guard failed on
+    # the sentence "`gc runtime drain` is COOPERATIVE". A command the witness
+    # would actually run starts its line; a backticked mention does not.
+    ! grep -F -- '--label=warrant' <<<"$block" >/dev/null ||
+        fail "a parked session must not be warranted; the dog would kill an agent over a budget banner"
+    ! grep -E '^[[:space:]]*gc runtime drain' <<<"$block" >/dev/null ||
+        fail "drain is cooperative and a parked session never polls drain-check; it must not be the remedy"
+    ! grep -E 'gc bd update[^|]*--assignee' <<<"$block" >/dev/null ||
+        fail "releasing the bead is not the remedy — the parked session re-claims it within minutes (measured)"
+
+    # The misrouting hole: a parked session produces exactly the evidence
+    # check-polecat-health treats as a confirmed stall (no writes, no bead
+    # updates, an unchanged pane), so without this cross-reference the very
+    # next step files a warrant on it.
+    block=$(step_description "$formula" check-polecat-health)
+    grep -F 'parked' <<<"$block" >/dev/null ||
+        fail "check-polecat-health must rule out the parked verdict before reading a failed peek as a stall"
+}
+
+test_parked_remedy_is_documented_for_the_witness() {
+    # Ask 2 of gp-px5: make the reset the DOCUMENTED remedy. The formula step is
+    # where it is executed; the prompt is where a witness reading its own role
+    # finds it — including on a cycle where the check could not run.
+    local prompt="$GASTOWN/agents/witness/prompt.template.md"
+
+    grep -F 'gc gastown parked-check' "$prompt" >/dev/null ||
+        fail "the witness prompt must name the parked-session detector"
+    grep -F 'gc session reset' "$prompt" >/dev/null ||
+        fail "the witness prompt must name 'gc session reset' as the parked-session remedy"
+    ! grep -F 'GC_PACK_DIR/assets/scripts/parked' "$prompt" >/dev/null ||
+        fail "the prompt must not resolve the detector via \$GC_PACK_DIR; it is unset in an agent shell"
+    grep -F 'last_active' "$prompt" >/dev/null ||
+        fail "the prompt must say why last_active cannot be the freshness signal; that blind spot IS the bug"
+    grep -F 'cooperative' "$prompt" >/dev/null ||
+        fail "the prompt must record that drain is cooperative and a no-op against a parked session"
+}
+
 test_polecat_stall_requires_proof_of_life_not_just_a_timestamp() {
     # The other half of gp-9ly: a timestamp is an inference, a live peek is an
     # observation. A rising token counter must be able to overrule staleness,
@@ -418,6 +534,8 @@ test_retired_dog_formulas_are_not_reintroduced
 test_witness_salvage_reads_work_dir_metadata
 test_polecat_health_check_is_measured_not_improvised
 test_polecat_stall_requires_proof_of_life_not_just_a_timestamp
+test_parked_session_detector_is_wired_into_the_patrol
+test_parked_remedy_is_documented_for_the_witness
 test_wisp_reconcile_is_the_only_implementation
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
