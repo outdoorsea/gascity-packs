@@ -812,13 +812,16 @@ read as ~7h stale, and a polecat running an ordinary 4-minute build/vet/test
 cycle was written up as looping.
 
 ```bash
-CHECK="${GC_PACK_DIR:-}/assets/scripts/polecat-progress-check.sh"
-if [ -x "$CHECK" ]; then
-  GASTOWN_POLECAT_STALE_MIN={{polecat_stale_min}} bash "$CHECK"; echo "progress check exit: $?"
-else
-  echo "polecat-progress-check.sh not resolvable under GC_PACK_DIR — nothing was measured; see the fallback rule below."
-fi
+GASTOWN_POLECAT_STALE_MIN={{polecat_stale_min}} gc gastown progress-check
+echo "progress check exit: $?"
 ```
+
+Route it through `gc`, never as a path under `$GC_PACK_DIR` — the same rule the
+`check-parked-sessions` step states above, for the same reason: gc sets that
+variable for pack COMMANDS and it is unset in your shell, so a direct path
+resolves to `/assets/scripts/...` and measures nothing. This step shipped that
+way (gp-3qb), and the `[ -x ]` guard it sat behind turned the unset variable into
+a skip, so the step fell back to the very eyeballing gp-9ly exists to prevent.
 
 The check selects the beads for you: `in_progress`, assignee matching the
 polecat role as a delimited token, from your own rig's ledger — so it never
