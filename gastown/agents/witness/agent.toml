@@ -2,6 +2,9 @@ scope = "rig"
 wake_mode = "fresh"
 work_dir = ".gc/agents/{{.Rig}}/witness"
 nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
+# Plain work_dir, not a worktree, so nothing else scaffolds it: without
+# .remember/logs the remember plugin's hooks are dropped, not merely unlogged.
+pre_start = ["{{.ConfigDir}}/assets/scripts/remember-scaffold.sh --create {{.WorkDir}}"]
 idle_timeout = "1h"
 # Preemptively cycle the witness before the typical provider cred-cache
 # lifetime. Claude Code (Bedrock) caches AWS creds at session start and can
