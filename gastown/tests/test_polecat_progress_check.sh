@@ -48,6 +48,40 @@ run_check() {
     ERR=$(cat "$ERRFILE")
 }
 
+# run_wrapper <beads-json-literal> [env assignments...] — invoke the command
+# wrapper the way `gc` does, and capture stdout/stderr/exit like run_check.
+#
+# GC_CITY is explicitly UNSET here, because that is the state `gc` hands a pack
+# command: it exports GC_CITY_PATH, not GC_CITY. Without `-u` this would pass on
+# a developer machine inside a city (where GC_CITY is exported into every shell)
+# while failing in CI — and it would stop testing the wrapper's city resolution
+# at all.
+#
+# WRAP_PACK/WRAP_CITY override the two variables gc supplies, so the
+# missing-context paths can be exercised without unsetting them for real.
+#
+# It runs from $NOCITY — a directory with no city.toml anywhere above it —
+# because the check's fallback is to walk up from cwd. A polecat worktree lives
+# at <city>/.gc/worktrees/..., so running these from the repo would let that
+# walk-up find the developer's REAL city and pass whether or not the wrapper
+# resolves anything. $NOCITY makes the wrapper's resolution the single reason
+# these can succeed, locally and on CI alike.
+run_wrapper() {
+    local payload="$1"
+    shift
+    printf '%s' "$payload" >"$BEADS"
+    set +e
+    # ${1+"$@"} rather than "$@": bash 3.2 under `set -u` treats an empty "$@"
+    # as an unbound variable.
+    OUT=$(cd "$NOCITY" && env -u GC_CITY \
+        GC_CITY_PATH="${WRAP_CITY-$CITY}" GC_PACK_DIR="${WRAP_PACK-$ROOT/gastown}" \
+        GC_BEADS_JSON="$BEADS" PATH="$BIN:$PATH" ${1+"$@"} \
+        sh "$WRAPPER" 2>"$ERRFILE")
+    RC=$?
+    set -e
+    ERR=$(cat "$ERRFILE")
+}
+
 # set_mtime <file> <epoch> — portable absolute-time stamp.
 # GNU touch takes `-d @EPOCH`. BSD touch only takes `-t`, which it reads in
 # LOCAL time, so the epoch is formatted with a local `date -r`. That local
@@ -127,7 +161,9 @@ CITY="$tmp/city"
 BIN="$tmp/bin"
 BEADS="$tmp/beads.json"
 ERRFILE="$tmp/stderr.txt"
-mkdir -p "$CITY"
+NOCITY="$tmp/nocity"
+WRAPPER="$ROOT/gastown/commands/progress-check/run.sh"
+mkdir -p "$CITY" "$NOCITY"
 : >"$CITY/city.toml"
 write_gc_stub "$BIN"
 
@@ -552,6 +588,105 @@ test_uses_no_bash4_only_constructs() {
         fail "the check must stay bash 3.2 compatible (the fleet includes macOS)"
 }
 
+# --- the `gc gastown progress-check` wrapper --------------------------------
+#
+# gp-b68: everything above was correct and completely unreachable. The witness's
+# check-polecat-health step resolved the check as
+# "${GC_PACK_DIR:-}/assets/scripts/polecat-progress-check.sh", but GC_PACK_DIR is
+# set by `gc` when `gc` invokes a pack command and is absent from a plain agent
+# session. The path expanded to "/assets/scripts/...", the `[ -x ]` guard in
+# front of it failed, and the step printed a message that reads like a considered
+# fallback — so the deterministic staleness pass never ran once, and every patrol
+# fell back to eyeballing while looking like it had measured.
+#
+# gp-3qb routed the command and pinned this contract for the DEACON's heartbeat
+# check. The witness's progress check was routed in the same sweep but its
+# wrapper was left unpinned, so nothing here failed if the wrapper broke. These
+# tests close that asymmetry: they cover the resolution contract, not the
+# measurement, which the run_check tests above already own.
+
+test_wrapper_is_executable() {
+    [ -x "$WRAPPER" ] || fail "$WRAPPER must be executable"
+    [ -f "$ROOT/gastown/commands/progress-check/help.md" ] ||
+        fail "missing commands/progress-check/help.md"
+}
+
+test_wrapper_rejects_missing_pack_context() {
+    # Invoked by path instead of through `gc`, so GC_PACK_DIR is empty. This is
+    # the gp-b68 defect's exact input: it must fail loudly rather than resolving
+    # to /assets/scripts/... and reporting nothing measured as nothing wrong.
+    WRAP_PACK="" run_wrapper '[]'
+    [ "$RC" -eq 2 ] || fail "missing GC_PACK_DIR must exit 2, got $RC"
+    printf '%s' "$ERR" | grep -q 'missing Gas City pack context' ||
+        fail "the wrapper must name the missing pack context, got: $ERR"
+}
+
+test_wrapper_rejects_missing_city_context() {
+    WRAP_CITY="" run_wrapper '[]'
+    [ "$RC" -eq 2 ] || fail "missing GC_CITY_PATH must exit 2, got $RC"
+}
+
+test_wrapper_reports_a_pack_without_the_check() {
+    # An older pack version that predates the check. Exit 2 — "freshness was not
+    # measured" — never 0, which would read as "every polecat is fresh".
+    WRAP_PACK="$tmp" run_wrapper '[]'
+    [ "$RC" -eq 2 ] || fail "a pack missing the check must exit 2, got $RC"
+    printf '%s' "$ERR" | grep -q 'not found in this pack version' ||
+        fail "the wrapper must say the check is missing, got: $ERR"
+}
+
+test_wrapper_resolves_the_city_from_pack_context() {
+    # GC_CITY unset and cwd outside any city — the witness's actual situation
+    # when `gc` invokes the command. The wrapper must use the city root gc
+    # resolved rather than walking up from cwd, which would find no city.toml.
+    local wt
+    wt=$(make_worktree wt_wrapper_city)
+    echo 'package main' >"$wt/live.go"
+    run_wrapper "$(bead_json bd-wcity "$POLECAT" "$ANCIENT" "$wt")"
+    [ "$RC" -eq 0 ] ||
+        fail "the wrapper must resolve the city from GC_CITY_PATH, got $RC: $ERR"
+    printf '%s' "$OUT" | grep -q "^fresh	bd-wcity	$POLECAT	" ||
+        fail "the wrapper should relay the check's TSV rows, got: $OUT"
+}
+
+test_wrapper_passes_findings_exit_through() {
+    # Exit 1 is a verdict, not an error to swallow: the witness branches on it to
+    # decide whether to peek for proof of life. A wrapper that collapsed it to 0
+    # would restore the original silence through a different route.
+    run_wrapper "$(bead_json bd-wfind "$POLECAT" "$(ts_ago 6000)" "$tmp/absent")"
+    [ "$RC" -eq 1 ] || fail "the wrapper must pass through exit 1 (findings), got $RC"
+    printf '%s' "$OUT" | grep -q "^stale	bd-wfind	" || fail "expected a stale row, got: $OUT"
+}
+
+test_wrapper_passes_the_stale_window_through() {
+    # The formula supplies the window as an environment prefix on the `gc` call.
+    # If the wrapper dropped it, every rig would silently fall back to 45m — a
+    # quieter version of the same bug, since the check would still print rows.
+    run_wrapper "$(bead_json bd-wwin "$POLECAT" "$(ts_ago 3600)" "$tmp/absent")" \
+        GASTOWN_POLECAT_STALE_MIN=30
+    [ "$RC" -eq 1 ] ||
+        fail "a 60m-old heartbeat must be stale under a 30m window, got $RC ($OUT)"
+    printf '%s' "$ERR" | grep -q 'window 30m' ||
+        fail "the 30m window must reach the check, got: $ERR"
+}
+
+# --- the caller actually invokes it the resolvable way ----------------------
+
+test_formula_invokes_the_command_not_the_path() {
+    local formula="$ROOT/gastown/formulas/mol-witness-patrol.toml"
+    grep -Fq 'gc gastown progress-check' "$formula" ||
+        fail "mol-witness-patrol must run the check as 'gc gastown progress-check'"
+    grep -Fq 'GASTOWN_POLECAT_STALE_MIN={{polecat_stale_min}}' "$formula" ||
+        fail "the window must come from the formula var, not a number invented per cycle"
+    # The regression itself. Match the code CONSTRUCT, not the string
+    # GC_PACK_DIR: the prose under the snippet quotes the broken path on purpose,
+    # to record why it was broken, and a string match would forbid explaining it.
+    ! grep -qE '^[[:space:]]*CHECK=' "$formula" ||
+        fail "formula must not resolve the check into a path variable"
+    ! grep -qE '^[[:space:]]*(bash|sh|exec)[[:space:]].*GC_PACK_DIR' "$formula" ||
+        fail "formula must not execute a script through ambient GC_PACK_DIR"
+}
+
 test_recent_mtime_is_fresh_under_non_utc_tz
 test_four_minute_old_worktree_is_fresh_under_non_utc_tz
 test_verdict_is_identical_across_timezones
@@ -584,5 +719,13 @@ test_every_z_suffixed_format_is_explicitly_utc
 test_file_mtimes_come_from_stat_not_date
 test_both_work_dir_namespaces_are_read
 test_uses_no_bash4_only_constructs
+test_wrapper_is_executable
+test_wrapper_rejects_missing_pack_context
+test_wrapper_rejects_missing_city_context
+test_wrapper_reports_a_pack_without_the_check
+test_wrapper_resolves_the_city_from_pack_context
+test_wrapper_passes_findings_exit_through
+test_wrapper_passes_the_stale_window_through
+test_formula_invokes_the_command_not_the_path
 
 echo "polecat progress check tests passed"
