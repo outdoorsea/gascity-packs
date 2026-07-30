@@ -255,10 +255,18 @@ test_witness_salvage_reads_work_dir_metadata() {
         fail "witness salvage must resolve the worktree from metadata.work_dir"
     ! grep -F "jq -r '.worktree // empty'" "$formula" >/dev/null ||
         fail "witness salvage must not regress to metadata.worktree; no bead carries that key"
-    # `gc.work_dir` is the rig root, not the bead's worktree — a plausible-looking
-    # but wrong "fix" that resolves to a non-existent path.
+    # `gc.work_dir` is the agent's persistent HOME workspace — the parent of the
+    # per-bead worktree, sitting on the agent's own `gc-<agent>-<sha>` branch. It
+    # is a real directory, which is what makes it a plausible-looking but wrong
+    # salvage source: committing bead work there and pushing publishes the agent
+    # home branch, not `polecat/<bead>`, leaving the bead with no merge target.
+    #
+    # gp-6k8: this forbids the agent home as the SALVAGE TARGET, not as evidence.
+    # Read-only probing of both scopes is required elsewhere in this formula to
+    # decide whether anything is at risk on disk; that is a different question
+    # from where a branch gets committed and pushed. Keep the two separate.
     ! grep -F "jq -r '.gc.work_dir // empty'" "$formula" >/dev/null ||
-        fail "witness salvage must not read gc.work_dir; that is the rig root, not the worktree"
+        fail "witness salvage must not resolve its worktree from gc.work_dir; that is the agent home, not the bead's worktree"
 }
 
 test_polecat_health_check_is_measured_not_improvised() {
@@ -366,8 +374,16 @@ PY
 
     grep -F 'gc session reset' <<<"$block" >/dev/null ||
         fail "check-parked-sessions must name 'gc session reset' as the remedy"
-    grep -F 'git -C "$WORKTREE" status --porcelain' <<<"$block" >/dev/null ||
+    grep -E 'git -C "\$[A-Z_]+" status --porcelain' <<<"$block" >/dev/null ||
         fail "the reset must be gated on a runnable clean-worktree precondition, not a vibe"
+    # gp-6k8: the precondition must probe BOTH directory scopes. A session parked
+    # before branch-setup has no `metadata.work_dir` at all, so gating on that key
+    # alone reports "nothing is at risk on disk" for precisely the sessions whose
+    # uncommitted work is sitting in the `gc.work_dir` agent home.
+    grep -F 'gc.work_dir' <<<"$block" >/dev/null ||
+        fail "the clean-worktree precondition must also probe the gc.work_dir agent home (gp-6k8)"
+    grep -F 'PROBED' <<<"$block" >/dev/null ||
+        fail "the precondition must distinguish verified-clean from nothing-measured (gp-6k8)"
     grep -F 'parked_reset_count' <<<"$block" >/dev/null ||
         fail "a reset must be recorded durably so a repeat offender is visible to the next cycle"
 

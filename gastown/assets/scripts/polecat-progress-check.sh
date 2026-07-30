@@ -19,10 +19,28 @@
 # mtime — that is the bug this script exists to make unrepeatable.
 #
 # For each in_progress work bead assigned to a polecat, the heartbeat is the
-# NEWER of the bead's `updated_at` and the newest file mtime under
-# `metadata.work_dir`. Either alone is misleading: a polecat editing files for
+# NEWER of the bead's `updated_at` and the newest file mtime under the polecat's
+# working directory. Either alone is misleading: a polecat editing files for
 # an hour without touching bd looks stale by bead time, and a polecat mid
 # `go test` touches no files but is plainly alive.
+#
+# Which directory that is takes TWO keys, in different namespaces, because the
+# bead carries two directories with different scopes (gp-6k8):
+#
+#   metadata.work_dir      the PER-BEAD worktree, e.g. <home>/worktrees/ta-sec.
+#                          Written by the polecat's branch-setup step.
+#   metadata.gc.work_dir   the agent's PERSISTENT HOME workspace, e.g.
+#                          <city>/.gc/worktrees/<rig>/polecats/gastown.slit.
+#                          Written by gc core when the session is stamped.
+#
+# These are NOT two spellings of one field — the second is the parent of the
+# first — so this check reads the per-bead worktree by preference and falls back
+# to the agent home. The fallback is the point: a polecat parked BEFORE
+# branch-setup has no `metadata.work_dir` at all, and its edits are sitting in
+# the agent home. Reading only the unprefixed key made that case measure nothing
+# and report `-`, which a caller reads as "nothing is at risk on disk" — the
+# false negative that authorized resetting a session over live unpushed work.
+# An absent per-bead worktree means "look at the home", never "nothing at risk".
 #
 # Output: one TSV row per checked bead on stdout, column header on stderr.
 #
@@ -33,9 +51,17 @@
 #   stale         heartbeat older than the window — NOT proof of a stall, see below
 #   no-heartbeat  no usable timestamp at all — nothing was measured
 #
-#   source        which signal won: `worktree`, `bead`, or `-`
+#   source        which signal won: `worktree`, `home`, `bead`, or `-`
 #   commits       commits ahead of upstream/origin-main, or `-` if unresolvable
 #   dirty         count of uncommitted+untracked paths, or `-`
+#
+# `source` distinguishes the two directory scopes, so the caller never has to
+# guess which one the `commits`/`dirty` counts describe:
+#
+#   worktree  the per-bead worktree — counts belong to this bead's branch
+#   home      the agent home workspace — counts are the AGENT's, not this
+#             bead's. Still real work at risk on disk, but attributing it to
+#             this bead's branch would be wrong; there is no branch yet.
 #
 # Exit codes:  0 = every checked polecat is fresh (or none to check)
 #              1 = findings on stdout (stale and/or no-heartbeat)
@@ -156,11 +182,20 @@ ts_epoch() {
 # calls touch index files, which would make every worktree look eternally busy.
 # `node_modules` is pruned for walk cost. No timezone is involved at any point:
 # `stat` emits integers and they are compared as integers.
+#
+# `.remember` and `.gc` are pruned for the same reason as `.git`: they are
+# written by tooling, not by the polecat doing work. Measured on a PARKED agent
+# home (gp-6k8), the four newest files were all plumbing — `.remember/tmp/
+# save-session.pid`, `.remember/logs/memory-<date>.log`, `.gc/tmp/skill-catalog-
+# *.b64` — all stamped while the session sat idle at a prompt. Counting those as
+# activity makes an idle agent home read fresh forever, which matters most for
+# the home-scope fallback above: those beads have no other directory signal, so
+# the staleness check would go permanently blind on exactly them.
 newest_mtime() {
   local dir="$1" newest
   # shellcheck disable=SC2086 # $STAT_MTIME must word-split into two args.
   newest=$(find "$dir" \
-      \( -name .git -o -name node_modules \) -prune -o -type f -print0 2>/dev/null \
+      \( -name .git -o -name node_modules -o -name .remember -o -name .gc \) -prune -o -type f -print0 2>/dev/null \
     | xargs -0 stat $STAT_MTIME 2>/dev/null \
     | sort -rn 2>/dev/null \
     | sed -n '1p') || newest=''
@@ -181,6 +216,15 @@ fi
 # the way the sibling witness heartbeat check does — this schema has drifted before.
 JQ_ISSUES='def issues_of: (.issues? // .) | if type == "array" then . else [] end;'
 
+# Emit `-` for an absent path rather than an empty field. This is load-bearing,
+# not cosmetic: tab is an IFS *whitespace* character, so `IFS=$'\t' read`
+# COLLAPSES a run of tabs. A bead carrying only `gc.work_dir` would emit
+# `...<TAB><TAB>/agent/home` and `read` would land the home path in $work_dir —
+# measuring the agent home as if it were the per-bead worktree, and inverting
+# this fix in exactly the case it exists for. A literal directory named `-`
+# would be misread as absent; that is not a path any of this writes.
+JQ_DASH='def dash: if . == null then "-" else tostring | if . == "" then "-" else . end end;'
+
 if ! TOTAL=$(printf '%s' "$BEADS" | jq -r "$JQ_ISSUES issues_of | length" 2>/dev/null); then
   echo "polecat-progress-check: could not parse the bead list — progress NOT measured" >&2
   exit 2
@@ -191,13 +235,15 @@ fi
 # unrelated agent named `policy-cat` does not.
 ROWS=$(printf '%s' "$BEADS" | jq -r --arg role "$ROLE" "
   $JQ_ISSUES
+  $JQ_DASH
   issues_of
   | .[]
   | select((.assignee // \"\") | test(\"(^|[^a-zA-Z0-9])\" + \$role + \"([^a-zA-Z0-9]|\$)\"))
   | [ (.id // \"?\"),
       (.assignee // \"-\"),
       (.updated_at // \"\"),
-      ((.metadata.work_dir // \"\") | tostring)
+      (.metadata.work_dir | dash),
+      (.metadata[\"gc.work_dir\"] | dash)
     ]
   | @tsv
 " 2>/dev/null) || ROWS=''
@@ -208,30 +254,48 @@ CHECKED=0
 FINDINGS=0
 STALE=0
 
-while IFS=$'\t' read -r bead assignee updated work_dir; do
+while IFS=$'\t' read -r bead assignee updated work_dir gc_work_dir; do
   [ -n "${bead:-}" ] || continue
   CHECKED=$((CHECKED + 1))
 
   bead_epoch=$(ts_epoch "$updated")
 
+  # Resolve the directory to measure across both namespaces. Prefer the
+  # per-bead worktree; fall back to the agent home when it is absent OR its
+  # directory is gone. Both halves of that fallback matter: `metadata.work_dir`
+  # is missing entirely before branch-setup runs, and it outlives the directory
+  # after a worktree is cleaned up. In both states the agent home is still on
+  # disk and can still be holding uncommitted work.
+  dir=''
+  scope='-'
+  if [ "$work_dir" != '-' ] && [ -d "$work_dir" ]; then
+    dir=$work_dir
+    scope='worktree'
+  elif [ "$gc_work_dir" != '-' ] && [ -d "$gc_work_dir" ]; then
+    dir=$gc_work_dir
+    scope='home'
+  fi
+
   tree_epoch=0
   commits='-'
   dirty='-'
-  if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ]; then
-    tree_epoch=$(newest_mtime "$work_dir")
+  if [ -n "$dir" ]; then
+    tree_epoch=$(newest_mtime "$dir")
     # Commits ahead of wherever this branch forked from. Reported, never
     # judged: 0 commits alongside a large `dirty` count is ordinary mid-flight
     # state for a polecat that has not reached its commit step.
-    commits=$(git -C "$work_dir" rev-list --count '@{upstream}..HEAD' 2>/dev/null) \
-      || commits=$(git -C "$work_dir" rev-list --count 'origin/main..HEAD' 2>/dev/null) \
+    commits=$(git -C "$dir" rev-list --count '@{upstream}..HEAD' 2>/dev/null) \
+      || commits=$(git -C "$dir" rev-list --count 'origin/main..HEAD' 2>/dev/null) \
       || commits='-'
-    dirty=$(git -C "$work_dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ') || dirty='-'
+    dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l | tr -d ' ') || dirty='-'
   fi
 
-  # Newest signal wins. Both operands are epoch integers.
+  # Newest signal wins. Both operands are epoch integers. When the directory
+  # signal wins, `source` names WHICH scope it came from, so a caller reading
+  # `home` knows the counts are the agent's and not this bead's branch.
   if [ "$tree_epoch" -gt "$bead_epoch" ]; then
     best=$tree_epoch
-    source='worktree'
+    source=$scope
   elif [ "$bead_epoch" -gt 0 ]; then
     best=$bead_epoch
     source='bead'

@@ -334,10 +334,48 @@ gc bd update <bead> --set-metadata branch=$BRANCH
 ```
 Skip to Step 3 (cleanup).
 
-**Case E: No worktree exists (`metadata.work_dir` missing or directory gone),
-no branch on origin.**
+**Case E: No working directory exists in EITHER scope, no branch on origin.**
 Nothing to salvage. The bead goes back to pool and a new polecat
 starts fresh.
+
+"No working directory" means both keys were checked and neither names a
+directory that is present on disk:
+
+```bash
+gc bd show "$BEAD" --json | jq -r '
+  .[0].metadata
+  | [ (.work_dir // empty), (."gc.work_dir" // empty) ]
+  | map(select(. != "")) | unique | .[]'
+```
+
+A missing `metadata.work_dir` alone does NOT put a bead in Case E. That key is
+absent for every polecat that halted before its branch-setup step, and those are
+exactly the sessions whose uncommitted work sits in the `gc.work_dir` agent home.
+Classifying them as "nothing to salvage" on the unprefixed key alone is how live
+unpushed work gets discarded (gp-6k8).
+
+**The two scopes are probed the same way but salvaged differently.** Cases A-D
+resolve their worktree from `metadata.work_dir` only, and that does not change:
+the agent home sits on the agent's own `gc-<agent>-<sha>` branch, so committing
+bead work there and pushing would publish the agent home branch instead of
+`polecat/<bead>` and strand the bead with no merge target. Never salvage by
+pushing from the agent home.
+
+So when the per-bead worktree is absent and only the agent home exists:
+
+1. Probe it READ-ONLY (`status --porcelain`, `log origin/main..HEAD`,
+   `stash list`) — evidence only, no commits, no pushes.
+2. All three empty -> Case E genuinely applies. Reset the bead to pool.
+3. Anything non-empty -> there is unpublished work and no branch to put it on.
+   Do NOT reset and do NOT push. Leave the bead and escalate with the evidence:
+
+```bash
+gc mail send mayor/ -s "WITNESS: orphaned bead with work in the agent home" -m "Bead: <bead>
+Agent home: <gc.work_dir> (branch $(git -C "<gc.work_dir>" branch --show-current))
+Dirty paths / unpushed commits / stashes: <what you found>
+No per-bead worktree or branch exists, so there is nothing to push this to
+without inventing one. Requesting a decision."
+```
 
 **Step 3: Verify work on main before resetting.**
 
@@ -714,21 +752,55 @@ worktree: files on disk survive. What does not survive is the session's
 in-flight reasoning about uncommitted work. Verify the three signals that were
 verified in the incident before resetting:
 
+**Check BOTH directory scopes.** A bead records two working directories under
+two different keys, and reading only one is how a parked session with a dirty
+workspace gets reported as "nothing at risk" (gp-6k8):
+
+| key | scope | written by |
+|---|---|---|
+| `metadata.work_dir` | the per-bead worktree | polecat, at branch-setup |
+| `metadata.gc.work_dir` | the agent's persistent home workspace | gc core, at session stamp |
+
+The second is the PARENT of the first, not another spelling of it. A session
+parked BEFORE branch-setup has no `metadata.work_dir` at all — its edits are in
+the agent home. So an absent per-bead worktree means "check the home", never
+"nothing is at risk".
+
 ```bash
 BEAD=$(gc bd list --status=in_progress --assignee="$SESSION_NAME" --json --limit=1 | jq -r '.[0].id // empty')
-WORKTREE=''
+DIRS=''
 if [ -n "$BEAD" ]; then
-  WORKTREE=$(gc bd show "$BEAD" --json | jq -r '.[0].metadata.work_dir // empty')
+  # Both scopes, in preference order. Deduped so a bead carrying only one, or
+  # the same path twice, still probes each real directory exactly once.
+  DIRS=$(gc bd show "$BEAD" --json | jq -r '
+    .[0].metadata
+    | [ (.work_dir // empty), (."gc.work_dir" // empty) ]
+    | map(select(. != "")) | unique | .[]')
 fi
-if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
-  git -C "$WORKTREE" status --porcelain
-  git -C "$WORKTREE" log --oneline origin/main..HEAD
-  git -C "$WORKTREE" stash list
-fi
+PROBED=0
+for D in $DIRS; do
+  [ -d "$D" ] || continue
+  PROBED=$((PROBED + 1))
+  echo "--- $D (on branch $(git -C "$D" branch --show-current 2>/dev/null || echo '?')) ---"
+  git -C "$D" status --porcelain
+  git -C "$D" log --oneline origin/main..HEAD
+  git -C "$D" stash list
+done
+echo "probed $PROBED director(ies)"
 ```
 
-All three empty (or no worktree at all) is a clean worktree: nothing is at
-risk on disk, and the standing authorization to reset applies. Reset it:
+Read the branch from git, as above — never from `metadata.gc.work_branch`. That
+field records the base branch (`main`), not the branch checked out in the
+directory, so trusting it as the latter misreports every agent home.
+
+`PROBED=0` means no directory existed to measure, which is NOT the same as
+verified-clean. Treat it as unverified: if the bead names a path that is gone,
+the standing authorization does not apply — mail the mayor as below rather than
+resetting on an unmeasured workspace.
+
+All three signals empty across every probed directory (with `PROBED` at least 1)
+is a clean workspace: nothing is at risk on disk, and the standing authorization
+to reset applies. Reset it:
 
 ```bash
 gc session reset "$ALIAS"

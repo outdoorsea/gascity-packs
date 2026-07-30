@@ -104,6 +104,23 @@ bead_json() {
         "$1" "$2" "$3" "$4"
 }
 
+# bead_json_scoped <bead> <assignee> <updated_at> <work_dir> <gc_work_dir> —
+# gp-6k8: a bead carrying either or both directory scopes. Pass `-` for a scope
+# to OMIT that key entirely, which is how a real bead looks before branch-setup
+# has run (no `work_dir`, only the `gc.work_dir` agent home). Omitting rather
+# than emptying matters: an absent key and a present-but-empty one take
+# different paths through the check's jq.
+bead_json_scoped() {
+    local wd="$4" gwd="$5" fields=''
+    [ "$wd" = '-' ] || fields="\"work_dir\":\"$wd\""
+    if [ "$gwd" != '-' ]; then
+        [ -z "$fields" ] || fields="$fields,"
+        fields="$fields\"gc.work_dir\":\"$gwd\""
+    fi
+    printf '[{"id":"%s","assignee":"%s","status":"in_progress","updated_at":"%s","metadata":{%s}}]' \
+        "$1" "$2" "$3" "$fields"
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 CITY="$tmp/city"
@@ -247,6 +264,90 @@ test_uncommitted_diff_with_zero_commits_is_not_stale() {
         fail "a big uncommitted diff with no commits must read fresh, got: $OUT"
     printf '%s' "$OUT" | grep -q '	0	7$' ||
         fail "commits=0 and dirty=7 should both be reported, got: $OUT"
+}
+
+# --- the gp-6k8 regression: two directory scopes, one of them ignored --------
+
+test_agent_home_is_measured_when_per_bead_worktree_is_absent() {
+    # THE gp-6k8 regression. A polecat parked BEFORE its branch-setup step has
+    # no `metadata.work_dir` at all — only `gc.work_dir`, the agent home. The
+    # check read the unprefixed key alone, measured nothing, and printed
+    # `commits=-  dirty=-`. The witness patrol reads that as "nothing is at risk
+    # on disk" and treats it as authorization to reset the session. The home was
+    # holding three uncommitted files the entire time.
+    local home
+    home=$(make_worktree home_only)
+    echo 'unpushed work' >"$home/a.go"
+    echo 'more'          >"$home/b.go"
+    echo 'and more'      >"$home/c.go"
+
+    run_check "$(bead_json_scoped gp-home "$POLECAT" "$ANCIENT" - "$home")" TZ="$OFFSET_TZ"
+    printf '%s' "$OUT" | grep -q '	home	0	3$' ||
+        fail "a bead carrying only gc.work_dir must still measure the agent home (source=home, dirty=3), got: $OUT"
+}
+
+test_absent_worktree_does_not_shift_the_home_into_the_worktree_column() {
+    # The TSV between jq and the read loop is tab-separated, and tab is an IFS
+    # *whitespace* character — so `IFS=$'\t' read` COLLAPSES a run of tabs. If
+    # the absent `work_dir` were emitted as an empty field, `read` would land
+    # the agent home path in $work_dir and label it `worktree`, attributing the
+    # agent's uncommitted work to a bead that has no branch yet. That inverts
+    # the fix in exactly the case it exists for, so the scope label is asserted
+    # explicitly, not just the presence of counts.
+    local home
+    home=$(make_worktree collapse_home)
+    echo work >"$home/x.go"
+
+    run_check "$(bead_json_scoped gp-collapse "$POLECAT" "$ANCIENT" - "$home")" TZ="$OFFSET_TZ"
+    printf '%s' "$OUT" | grep -q '	worktree	' &&
+        fail "the agent home must never be reported as a per-bead worktree, got: $OUT"
+    printf '%s' "$OUT" | grep -q '	home	' ||
+        fail "expected source=home for a bead with no per-bead worktree, got: $OUT"
+    return 0
+}
+
+test_per_bead_worktree_wins_over_agent_home() {
+    # Both scopes present is the normal post-branch-setup state — ta-sec carries
+    # all four keys, with `work_dir` a CHILD of `gc.work_dir`. The bead's own
+    # worktree is the bead's own work and must win; the home is only a fallback.
+    # The home is given more dirty files than the worktree so a precedence
+    # inversion cannot pass by coincidence.
+    local wt home
+    wt=$(make_worktree pref_wt)
+    home=$(make_worktree pref_home)
+    echo one >"$wt/only_here.go"
+    echo a >"$home/h1.go"
+    echo b >"$home/h2.go"
+    echo c >"$home/h3.go"
+    echo d >"$home/h4.go"
+
+    run_check "$(bead_json_scoped gp-pref "$POLECAT" "$ANCIENT" "$wt" "$home")" TZ="$OFFSET_TZ"
+    printf '%s' "$OUT" | grep -q '	worktree	0	1$' ||
+        fail "the per-bead worktree must win over the agent home (dirty=1, not 4), got: $OUT"
+}
+
+test_home_is_measured_when_the_per_bead_worktree_is_gone() {
+    # ta-af7's shape: `work_dir` names a worktree that has since been cleaned
+    # up, while `gc.work_dir` still points at a live agent home. A stale path
+    # must not suppress the fallback — the home is still on disk and can still
+    # be holding work worth salvaging.
+    local home
+    home=$(make_worktree gone_home)
+    echo salvageable >"$home/keep.go"
+
+    run_check "$(bead_json_scoped gp-gone "$POLECAT" "$ANCIENT" "$tmp/cleaned-up-worktree" "$home")" TZ="$OFFSET_TZ"
+    printf '%s' "$OUT" | grep -q '	home	0	1$' ||
+        fail "a vanished per-bead worktree must fall back to the agent home, got: $OUT"
+}
+
+test_neither_scope_on_disk_still_reports_no_measurement() {
+    # The honest negative. When neither directory exists there genuinely is
+    # nothing to measure, and the row must say so with `-` rather than inventing
+    # a zero — `dirty=0` would read as "verified clean", which is the false
+    # assurance this whole change exists to remove.
+    run_check "$(bead_json_scoped gp-none "$POLECAT" "$(ts_ago 60)" "$tmp/no-wt" "$tmp/no-home")" TZ="$OFFSET_TZ"
+    printf '%s' "$OUT" | grep -q '^fresh	gp-none	.*	bead	-	-$' ||
+        fail "with neither scope on disk the git columns must be '-', not 0, got: $OUT"
 }
 
 test_git_dir_churn_does_not_mask_staleness() {
@@ -431,6 +532,21 @@ test_file_mtimes_come_from_stat_not_date() {
     return 0
 }
 
+test_both_work_dir_namespaces_are_read() {
+    # gp-6k8: the fallback IS the fix. Collapsing this back to a single
+    # unprefixed lookup is a one-line "simplification" that silently restores
+    # the false negative for every polecat parked before branch-setup, so the
+    # three moving parts are pinned at the source level.
+    grep -q 'gc\.work_dir' "$SCRIPT" ||
+        fail "the check must read the gc.work_dir agent home as a fallback (gp-6k8)"
+    grep -q 'metadata\.work_dir' "$SCRIPT" ||
+        fail "the check must still prefer the per-bead metadata.work_dir"
+    grep -q 'read -r bead assignee updated work_dir gc_work_dir' "$SCRIPT" ||
+        fail "the read loop must consume both directory columns"
+    grep -q 'def dash:' "$SCRIPT" ||
+        fail "absent paths must be emitted as '-', never as an empty field: tab collapses under IFS (gp-6k8)"
+}
+
 test_uses_no_bash4_only_constructs() {
     ! grep -nE 'declare -A|local -A|mapfile|readarray|\$\{[A-Za-z_]+\^|\$\{[A-Za-z_]+,,|&>>|\[\[ -v ' "$SCRIPT" >/dev/null ||
         fail "the check must stay bash 3.2 compatible (the fleet includes macOS)"
@@ -444,6 +560,11 @@ test_genuinely_stale_worktree_is_flagged
 test_worktree_activity_overrides_stale_bead_stamp
 test_bead_stamp_carries_when_worktree_is_gone
 test_uncommitted_diff_with_zero_commits_is_not_stale
+test_agent_home_is_measured_when_per_bead_worktree_is_absent
+test_absent_worktree_does_not_shift_the_home_into_the_worktree_column
+test_per_bead_worktree_wins_over_agent_home
+test_home_is_measured_when_the_per_bead_worktree_is_gone
+test_neither_scope_on_disk_still_reports_no_measurement
 test_git_dir_churn_does_not_mask_staleness
 test_future_mtime_is_skew_not_stale
 test_zero_time_sentinel_is_no_heartbeat_not_ancient
@@ -461,6 +582,7 @@ test_unreadable_bead_list_fails_loud
 test_missing_city_fails_loud
 test_every_z_suffixed_format_is_explicitly_utc
 test_file_mtimes_come_from_stat_not_date
+test_both_work_dir_namespaces_are_read
 test_uses_no_bash4_only_constructs
 
 echo "polecat progress check tests passed"
