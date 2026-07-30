@@ -15,6 +15,11 @@
 #      return it to the pool without pushing, merging, or closing.
 #   4. Green checks still proceed, so the gate is precise rather than a
 #      blanket refusal.
+#   5. A squash-merged MULTI-commit PR closes -- the case the git-side patch-id
+#      predicate is blind to, where GitHub's `mergedAt` is the only evidence --
+#      and a gh query that gh REJECTS is loud rather than silently downgraded
+#      to "no API". The field names themselves are pinned against the real gh
+#      binary in test_gh_json_fields.sh; a fixture cannot catch a rename.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -117,6 +122,10 @@ SH
 #   GH_PR_VIEW_JSON     stdout of `gh pr view --json state,mergedAt,...`;
 #                       unset => the command answers nothing, which is how a
 #                       test reaches the git-side merge_landed fallback
+#   GH_PR_VIEW_ERR      stderr of `gh pr view`, with a nonzero exit. This is the
+#                       "gh is installed and REJECTED the query" case, which is
+#                       NOT the same as "gh is absent" and must not be silent.
+#   GH_PR_VIEW_EXIT     exit status paired with GH_PR_VIEW_ERR (default 1)
 write_gh_stub() {
     cat >"$1/gh" <<'SH'
 #!/usr/bin/env sh
@@ -143,6 +152,10 @@ case "$1" in
     pr)
         case "$2" in
             view)
+                if [ -n "${GH_PR_VIEW_ERR:-}" ]; then
+                    printf '%s\n' "$GH_PR_VIEW_ERR" >&2
+                    exit "${GH_PR_VIEW_EXIT:-1}"
+                fi
                 [ -n "${GH_PR_VIEW_JSON:-}" ] || exit 1
                 printf '%s\n' "$GH_PR_VIEW_JSON"
                 exit 0
@@ -183,7 +196,7 @@ new_sandbox() {
     # Unset per-scenario knobs so a previous test cannot leak into the next.
     unset GH_PROTECTION_JSON GH_PROTECTED_FLAG GH_WATCH_EXIT \
         GH_CHECKS_JSON GH_CHECKS_ERR GH_CHECKS_EXIT GH_PR_VIEW_JSON \
-        GC_LIST_AWAITING GC_LIST_WORK
+        GH_PR_VIEW_ERR GH_PR_VIEW_EXIT GC_LIST_AWAITING GC_LIST_WORK
 }
 
 # Bead with the given merge_strategy ("" = unset, i.e. let the formula decide).
@@ -558,7 +571,8 @@ test_recheck_closes_bead_once_github_reports_merged() {
     # or "never close early" would just become "never close".
     new_sandbox
     write_awaiting_bead "$(date -u +%s)"
-    export GH_PR_VIEW_JSON='{"state":"MERGED","mergedAt":"2026-07-28T21:42:50Z","mergeCommitOid":"abc123def456"}'
+    # Shape copied from real gh: `mergeCommit` is an object, not a flat sha.
+    export GH_PR_VIEW_JSON='{"state":"MERGED","mergedAt":"2026-07-28T21:42:50Z","mergeCommit":{"oid":"abc123def456"}}'
 
     run_recheck_block
     grep -q "gc bd close" "$GC_LOG" ||
@@ -575,7 +589,7 @@ test_recheck_leaves_unmerged_pr_open() {
     # mergedAt null is a real verdict, not a missing answer: leave it alone.
     new_sandbox
     write_awaiting_bead "$(date -u +%s)"
-    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommitOid":""}'
+    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommit":null}'
 
     run_recheck_block
     assert_not_closed "unmerged"
@@ -658,13 +672,127 @@ test_recheck_leaves_unlanded_branch_open_without_github() {
     assert_not_closed "unlanded branch"
 }
 
+# A repo where a MULTI-commit branch was SQUASH-merged: the target carries ONE
+# commit whose diff is the sum of the branch's two, so no per-commit patch-id
+# matches and `git cherry` reports both as absent. This is the formula's
+# documented blind spot, and the only thing that sees through it is GitHub's
+# `mergedAt` -- which is why a broken --json query here strands the bead.
+setup_squash_landing_repo() {
+    ORIGIN="$SANDBOX/origin.git"
+    REPO="$SANDBOX/squashed"
+    git init -q --bare "$ORIGIN"
+    git init -q "$REPO"
+    git -C "$REPO" config user.email t@example.com
+    git -C "$REPO" config user.name Tester
+    git -C "$REPO" remote add origin "$ORIGIN"
+    echo base >"$REPO/file.txt"
+    git -C "$REPO" add file.txt
+    git -C "$REPO" commit -qm base
+    git -C "$REPO" branch -M main
+    git -C "$REPO" push -q origin main
+    FORK_SHA=$(git -C "$REPO" rev-parse main)
+
+    # Two commits on the branch -- the multi-commit precondition.
+    git -C "$REPO" checkout -q -b polecat/bd-1
+    echo one >"$REPO/a.txt"
+    git -C "$REPO" add a.txt
+    git -C "$REPO" commit -qm "part one"
+    echo two >"$REPO/b.txt"
+    git -C "$REPO" add b.txt
+    git -C "$REPO" commit -qm "part two"
+    git -C "$REPO" push -q origin polecat/bd-1
+
+    # The squash merge: both changes land on main as a single new commit.
+    git -C "$REPO" checkout -q main
+    git -C "$REPO" merge -q --squash polecat/bd-1 >/dev/null
+    git -C "$REPO" commit -qm "Fix the thing (#42)"
+    git -C "$REPO" push -q origin main
+    git -C "$REPO" fetch -q origin
+    SQUASH_SHA=$(git -C "$REPO" rev-parse main)
+}
+
+test_recheck_closes_squash_merged_multi_commit_pr() {
+    # The headline regression: the case that strands a bead when the GitHub
+    # query is broken. gh's answer is the ONLY evidence available here, so this
+    # test fails outright if the --json field list is rejected.
+    new_sandbox
+    setup_squash_landing_repo
+    write_awaiting_bead "$(date -u +%s)" "" "$FORK_SHA"
+
+    # Non-vacuity: prove the git-side predicate genuinely cannot see this
+    # landing. Without this the test could pass on the git fallback and prove
+    # nothing about the API path.
+    git -C "$REPO" cherry origin/main origin/polecat/bd-1 | grep -q '^+' ||
+        fail "fixture is wrong: a squash of a multi-commit branch must leave git cherry reporting '+'"
+
+    export GH_PR_VIEW_JSON="{\"state\":\"MERGED\",\"mergedAt\":\"2026-07-30T04:00:00Z\",\"mergeCommit\":{\"oid\":\"$SQUASH_SHA\"}}"
+    run_recheck_block "$REPO"
+
+    grep -q "gc bd close" "$GC_LOG" ||
+        fail "a squash-merged multi-commit PR must close its bead, log: $(cat "$GC_LOG")\nout: $(cat "$SANDBOX/recheck.out")"
+    grep -q "merge_result=merged" "$GC_LOG" ||
+        fail "the squash-merged bead must record merge_result=merged"
+    # Pins the nested read: `.mergeCommit.oid`, not a flat `mergeCommitOid`.
+    grep -q "merged_sha=$SQUASH_SHA" "$GC_LOG" ||
+        fail "the merge sha must be read out of the mergeCommit object, log: $(cat "$GC_LOG")"
+}
+
+test_recheck_strands_squash_merge_when_gh_query_is_rejected() {
+    # The failure this bug caused, pinned as a test: with gh's answer lost, the
+    # same landed work does NOT close. That is the correct conservative
+    # behaviour, but it must be LOUD -- silence here is what let the defect
+    # survive, because a stranded bead looks exactly like a waiting one.
+    new_sandbox
+    setup_squash_landing_repo
+    write_awaiting_bead "$(date -u +%s)" "" "$FORK_SHA"
+    export GH_PR_VIEW_ERR='Unknown JSON field: "mergeCommitOid"'
+    export GH_PR_VIEW_EXIT=1
+
+    run_recheck_block "$REPO"
+    assert_not_closed "rejected gh query on a squash merge"
+    grep -q "Unknown JSON field" "$SANDBOX/recheck.out" ||
+        fail "the stranding must report gh's own stderr, got: $(cat "$SANDBOX/recheck.out")"
+}
+
+test_recheck_makes_a_rejected_gh_query_loud() {
+    # `2>/dev/null || printf ''` made "gh REJECTED my query" indistinguishable
+    # from "gh is not installed", and only the latter is a legitimate reason to
+    # fall back quietly. A rejected field list is a code defect that retrying
+    # cannot fix, so it must be named as one.
+    new_sandbox
+    write_awaiting_bead "$(date -u +%s)"
+    export GH_PR_VIEW_ERR='Unknown JSON field: "mergeCommitOid"'
+    export GH_PR_VIEW_EXIT=1
+
+    run_recheck_block
+    grep -qi "FORMULA BUG" "$SANDBOX/recheck.out" ||
+        fail "a rejected --json field list must be reported as a formula bug, got: $(cat "$SANDBOX/recheck.out")"
+    grep -q "mergeCommitOid" "$SANDBOX/recheck.out" ||
+        fail "the diagnostic must name the field gh rejected, got: $(cat "$SANDBOX/recheck.out")"
+    assert_not_closed "rejected gh query"
+
+    # A transient failure must be loud too, but must NOT be mislabelled a code
+    # defect: an operator who cannot tell the two apart can act on neither.
+    new_sandbox
+    write_awaiting_bead "$(date -u +%s)"
+    export GH_PR_VIEW_ERR='error connecting to api.github.com'
+    export GH_PR_VIEW_EXIT=1
+
+    run_recheck_block
+    grep -q "could not answer" "$SANDBOX/recheck.out" ||
+        fail "a transient gh failure must still be reported, got: $(cat "$SANDBOX/recheck.out")"
+    ! grep -qi "FORMULA BUG" "$SANDBOX/recheck.out" ||
+        fail "a network blip must not be reported as a formula bug"
+    assert_not_closed "transient gh failure"
+}
+
 test_recheck_escalates_a_stale_pr_exactly_once() {
     # Leaving the bead open is only half of "make it loud". A PR nobody merges
     # has to surface -- but nagging every patrol iteration is how alerts get
     # ignored, so the escalation fires once, on the transition.
     new_sandbox
     write_awaiting_bead "$(( $(date -u +%s) - 7200 ))"
-    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommitOid":""}'
+    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommit":null}'
 
     run_recheck_block
     assert_not_closed "stale"
@@ -676,7 +804,7 @@ test_recheck_escalates_a_stale_pr_exactly_once() {
     # Second pass, bead already flagged: silence.
     new_sandbox
     write_awaiting_bead "$(( $(date -u +%s) - 7200 ))" true
-    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommitOid":""}'
+    export GH_PR_VIEW_JSON='{"state":"OPEN","mergedAt":null,"mergeCommit":null}'
     run_recheck_block
     ! grep -q "session nudge" "$GC_LOG" ||
         fail "an already-flagged stale PR must not re-escalate every patrol"
@@ -724,6 +852,9 @@ test_recheck_closes_bead_once_github_reports_merged
 test_recheck_leaves_unmerged_pr_open
 test_recheck_detects_rebased_landing_without_github
 test_recheck_leaves_unlanded_branch_open_without_github
+test_recheck_closes_squash_merged_multi_commit_pr
+test_recheck_strands_squash_merge_when_gh_query_is_rejected
+test_recheck_makes_a_rejected_gh_query_loud
 test_recheck_escalates_a_stale_pr_exactly_once
 test_awaiting_bead_never_starves_the_merge_queue
 

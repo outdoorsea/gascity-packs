@@ -262,15 +262,40 @@ for AW in $(printf '%s' "$AWAITING" | jq -r '.[].id'); do
   # (a) Ask GitHub first. `mergedAt` is authoritative and rewrite-proof: it is
   # true regardless of how the merge was performed, including the multi-commit
   # squash that the git-side predicate cannot see.
+  #
+  # The sha lives at `.mergeCommit.oid` -- `mergeCommit` is an OBJECT, and there
+  # is no flat `mergeCommitOid` field. gh validates --json names CLIENT-SIDE and
+  # rejects the ENTIRE query on one bad name, so a typo here does not degrade
+  # this check, it deletes it: for every parked bead, on every rig, forever.
   AW_MERGED_AT=""
   AW_MERGE_SHA=""
   AW_API_ANSWERED=false
   if [ -n "$AW_PR" ] && command -v gh >/dev/null 2>&1; then
-    AW_PR_JSON=$(gh pr view "$AW_PR" --json state,mergedAt,mergeCommitOid 2>/dev/null || printf '')
+    # Keep stderr. Discarding it is precisely what let a bad field name live in
+    # this path undetected: `2>/dev/null || printf ''` makes "gh rejected my
+    # query" indistinguishable from "gh is not installed", and only the latter
+    # is a legitimate reason to fall back quietly.
+    AW_ERR_FILE=$(mktemp)
+    AW_PR_JSON=$(gh pr view "$AW_PR" --json state,mergedAt,mergeCommit 2>"$AW_ERR_FILE") || AW_PR_JSON=""
+    AW_ERR_TEXT=$(sed -n '1p' "$AW_ERR_FILE")
+    rm -f "$AW_ERR_FILE"
     if [ -n "$AW_PR_JSON" ]; then
       AW_API_ANSWERED=true
       AW_MERGED_AT=$(printf '%s' "$AW_PR_JSON" | jq -r '.mergedAt // empty' 2>/dev/null)
-      AW_MERGE_SHA=$(printf '%s' "$AW_PR_JSON" | jq -r '.mergeCommitOid // empty' 2>/dev/null)
+      AW_MERGE_SHA=$(printf '%s' "$AW_PR_JSON" | jq -r '.mergeCommit.oid // empty' 2>/dev/null)
+    else
+      # gh is installed and still did not answer. Never let this be silent: this
+      # is the ONLY check that sees a squash-merged multi-commit branch, so
+      # losing it strands the bead open while its work already sits on target.
+      case "$AW_ERR_TEXT" in
+        *"Unknown JSON field"*)
+          echo "AWAITING_MERGE: FORMULA BUG for $AW -- gh rejected this step's --json field list: ${AW_ERR_TEXT}"
+          echo "AWAITING_MERGE: the authoritative mergedAt signal is DEAD until those field names are fixed; a squash-merged multi-commit PR cannot be detected and its bead will never close. This does not clear on retry."
+          ;;
+        *)
+          echo "AWAITING_MERGE: gh could not answer for $AW (PR ${AW_URL:-#$AW_PR}): ${AW_ERR_TEXT:-no stderr}; using the git-side predicate for this patrol."
+          ;;
+      esac
     fi
   fi
 
