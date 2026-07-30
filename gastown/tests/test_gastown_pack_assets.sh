@@ -392,6 +392,94 @@ PY
         fail "check-polecat-health must rule out the parked verdict before reading a failed peek as a stall"
 }
 
+test_worktree_reaper_is_wired_into_the_patrol() {
+    # gp-a7z: no component owned a polecat worktree's death. The refinery
+    # deletes the BRANCH after merge, orphan recovery keys on a
+    # live-but-unreachable ASSIGNEE (a landed bead is closed and unassigned),
+    # and the controller manages processes. Worktrees accumulated one per
+    # completed bead — 5 at filing, 8 two days later. These guards keep the
+    # reaper reachable and keep its predicate out of the formula prose.
+    local formula check cmd block
+    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+    check="$GASTOWN/assets/scripts/polecat-worktree-reap.sh"
+    cmd="$GASTOWN/commands/worktree-reap/run.sh"
+
+    [[ -x "$check" ]] || fail "missing or non-executable assets/scripts/polecat-worktree-reap.sh"
+    [[ -x "$cmd" ]] || fail "missing or non-executable commands/worktree-reap/run.sh"
+    [[ -f "$GASTOWN/commands/worktree-reap/help.md" ]] ||
+        fail "missing commands/worktree-reap/help.md"
+    parse_toml "$formula"
+
+    # Same GC_PACK_DIR trap parked-check and usage-stamp were both routed
+    # through `gc` to escape (gp-fid): the var is set for pack COMMANDS and
+    # never in an agent's shell, so a formula reading
+    # "$GC_PACK_DIR/assets/scripts/..." resolves to "/assets/scripts/..." and
+    # silently reaps nothing while reading like it ran.
+    grep -F 'gc gastown worktree-reap' "$formula" >/dev/null ||
+        fail "the witness patrol must invoke the reaper as 'gc gastown worktree-reap'"
+    ! grep -F 'GC_PACK_DIR' "$formula" | grep -F 'worktree-reap' >/dev/null ||
+        fail "the reaper must not be resolved via \$GC_PACK_DIR; it is unset in an agent shell"
+    grep -F 'GC_PACK_DIR' "$cmd" >/dev/null ||
+        fail "commands/worktree-reap/run.sh must resolve the reaper through GC_PACK_DIR"
+
+    # A step nothing `needs` never runs. The chain is the wiring.
+    python3 - "$formula" <<'PY'
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    steps = tomllib.load(handle)["steps"]
+ids = [s["id"] for s in steps]
+if "reap-landed-worktrees" not in ids:
+    raise SystemExit("mol-witness-patrol has no reap-landed-worktrees step")
+needed = {n for s in steps for n in s.get("needs", [])}
+if "reap-landed-worktrees" not in needed:
+    raise SystemExit("reap-landed-worktrees is not in any step's needs — it would never run")
+# Salvage must get first refusal on every tree: recovery pushes stranded work to
+# a branch, and only then is the tree disposable. Reaping first would race it.
+order = {sid: i for i, sid in enumerate(ids)}
+if order["reap-landed-worktrees"] < order["recover-orphaned-beads"]:
+    raise SystemExit("reap-landed-worktrees must come AFTER recover-orphaned-beads")
+PY
+
+    block=$(step_description "$formula" reap-landed-worktrees)
+
+    # The predicate belongs in the script, and the two checks that carry the
+    # safety argument must be named in the step so nobody re-derives them
+    # loosely: the formula is a prompt, and a vague one invites improvisation
+    # (the gp-9ly failure mode).
+    grep -F 'git cherry' <<<"$block" >/dev/null ||
+        fail "the step must name the patch-id test; ancestry is the wrong one"
+    grep -F 'git status --porcelain' <<<"$block" >/dev/null ||
+        fail "the step must name the clean-tree precondition"
+
+    # Ancestry must be named ONLY to reject it. `git cherry` exists because the
+    # refinery rebases before merging, so a landed branch is often not an
+    # ancestor of the target: measured 2026-07-29, gp-px5 and gp-nrm were both
+    # closed and clean with zero unmerged patches and is_ancestor=NO. A step
+    # that reached for ancestry would leak exactly those trees forever.
+    grep -F 'is-ancestor' <<<"$block" >/dev/null ||
+        fail "the step must explicitly rule out merge-base --is-ancestor as the landed test"
+    ! grep -E '^[[:space:]]*git (-C [^ ]+ )?merge-base --is-ancestor' <<<"$block" >/dev/null ||
+        fail "ancestry must be named as the WRONG test, never invoked as the landed check"
+
+    # Agent liveness is the predicate that would have destroyed gp-px5's
+    # in-flight work; the step has to say so, in both directions.
+    grep -F 'gp-px5' <<<"$block" >/dev/null ||
+        fail "the step must cite the gp-px5 near-miss that rules out keying on agent liveness"
+    ! grep -E '^[[:space:]]*gc session list' <<<"$block" >/dev/null ||
+        fail "the reaper must not consult session liveness; it keys on the bead's terminal state"
+
+    # Reaping is destructive and the whole point is that it is bounded. A step
+    # that widened to agent workspaces would take out running agents' homes.
+    grep -F 'agent workspace' <<<"$block" >/dev/null ||
+        fail "the step must state that agent workspaces are out of scope"
+
+    # Exit 2 means nothing was measured. Recording it as a clean sweep is how
+    # an unbounded leak looks healthy — the same asymmetry parked-check pins.
+    grep -F 'exit codes' <<<"$(tr '[:upper:]' '[:lower:]' <<<"$block")" >/dev/null ||
+        fail "the step must document the reaper's exit codes, including 2 = not measured"
+}
+
 test_parked_remedy_is_documented_for_the_witness() {
     # Ask 2 of gp-px5: make the reset the DOCUMENTED remedy. The formula step is
     # where it is executed; the prompt is where a witness reading its own role
