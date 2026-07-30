@@ -315,12 +315,48 @@ test_pin_on_a_side_branch_is_an_error() {
     out=$(run_check "$cache" "$city") && rc=0 || rc=$?
 
     [ "$rc" -eq 2 ] || fail "side-branch pin should exit 2, got $rc: $out"
-    grep -qi "not an ancestor of" <<<"$out" ||
-        fail "should report the pin is not an ancestor, got: $out"
+    grep -qi "diverged from" <<<"$out" ||
+        fail "should report the pin has diverged, got: $out"
     grep -qi "merge-base" <<<"$out" ||
         fail "should report the merge-base so the divergence is datable, got: $out"
     grep -qi "re-point it\|side branch" <<<"$out" ||
         fail "should say advancing the pin will not help, got: $out"
+}
+
+# A pin that is mainline PLUS unmerged commits is not the incident. It is a city
+# deliberately pinned to a branch under test, and it is fast-forwardable. Both
+# states fail `git merge-base --is-ancestor`, so a check that does not separate
+# them reports a blocking error on an ordinary development workflow — and a
+# doctor check that cries wolf on normal use gets muted before the day it has
+# something real to say.
+test_pin_ahead_of_mainline_warns_rather_than_erroring() {
+    local up head ahead city cache
+    up=$(make_upstream ahead 6)
+    head=$(sha_at "$up" HEAD)
+    # Two commits on top of main, never merged. merge-base(pin, main) == main tip.
+    git_q -C "$up" checkout -b feature/under-test
+    echo "unmerged 1" >"$up/f1.txt"
+    git_q -C "$up" add -A
+    git_q -C "$up" commit -m "unmerged 1"
+    echo "unmerged 2" >"$up/f2.txt"
+    git_q -C "$up" add -A
+    git_q -C "$up" commit -m "unmerged 2"
+    ahead=$(sha_at "$up" HEAD)
+    git_q -C "$up" checkout main
+
+    city=$(make_city ahead-city "https://example.com/pk/tree/$ahead/gastown" "sha:$ahead")
+    cache=$(make_cache "$up" a4a4 "$ahead" "https://example.com/pk.git")
+    add_rig "$city" alpha "https://example.com/pk/tree/$ahead/gastown" "sha:$ahead" "$cache" >/dev/null
+
+    local out rc
+    out=$(run_check "$cache" "$city") && rc=0 || rc=$?
+
+    [ "$rc" -eq 1 ] || fail "ahead-but-unmerged should warn, not error, got $rc: $out"
+    grep -qi "2 commit(s) ahead of" <<<"$out" ||
+        fail "should report how far ahead the pin is, got: $out"
+    grep -qi "diverged" <<<"$out" &&
+        fail "unmerged work must not be reported as diverged, got: $out"
+    return 0
 }
 
 # Behind-but-on-mainline is ordinary staleness. import-drift reports that; this
@@ -337,7 +373,7 @@ test_pin_behind_but_on_mainline_is_not_an_ancestry_failure() {
     out=$(run_check "$cache" "$city") && rc=0 || rc=$?
 
     [ "$rc" -eq 0 ] || fail "behind-but-ancestor should exit 0, got $rc: $out"
-    grep -qi "not an ancestor" <<<"$out" &&
+    grep -qiE "not an ancestor|diverged from" <<<"$out" &&
         fail "staleness must not be reported as an ancestry failure, got: $out"
     return 0
 }
@@ -439,7 +475,7 @@ test_absent_commit_warns_rather_than_erroring() {
     # than asserted to be off-mainline.
     grep -qi "not present in the cache clone" <<<"$out" ||
         fail "absent commit should be reported as absent, got: $out"
-    grep -qi "not an ancestor" <<<"$out" &&
+    grep -qiE "not an ancestor|diverged from" <<<"$out" &&
         fail "absent commit must not be asserted off-mainline, got: $out"
     return 0
 }

@@ -506,7 +506,34 @@ for rec in "${records[@]}"; do
         base=$(git -C "$materialized_dir" merge-base "$c" "$mainline" 2>/dev/null)
         when=""
         [ -n "$base" ] && when=$(git -C "$materialized_dir" log -1 --format=%cs "$base" 2>/dev/null)
-        hard "$scope declares ${c:0:12}, which is not an ancestor of $mainline"
+        mainline_sha=$(git -C "$materialized_dir" rev-parse "$mainline" 2>/dev/null)
+
+        # Two very different situations both fail --is-ancestor, and conflating
+        # them is how a doctor check gets muted.
+        #
+        # AHEAD: the merge-base IS the mainline tip, so the pin is mainline plus
+        # unmerged commits — a city deliberately pinned to a branch under test,
+        # or to work that has not landed yet. Ordinary, intentional, and
+        # fast-forwardable. Reporting it as an error fires on a normal
+        # development workflow, and a check that cries wolf on normal workflows
+        # gets ignored precisely when it finally has something real to say.
+        #
+        # DIVERGED: the merge-base is strictly BEHIND the mainline tip, so the
+        # mainline has moved on independently and the pin sits on a branch that
+        # was abandoned. This is the incident (051c35e, merge-base with main six
+        # weeks earlier) and it is unrecoverable by advancing the pin.
+        if [ -n "$base" ] && [ -n "$mainline_sha" ] && [ "$base" = "$mainline_sha" ]; then
+            ahead=$(git -C "$materialized_dir" rev-list --count "$mainline..$c" 2>/dev/null)
+            soft "$scope declares ${c:0:12}, which is ${ahead:-?} commit(s) ahead of $mainline and not merged"
+            detail "  $scope declared: ${c:0:12}"
+            detail "  mainline:        $mainline at ${mainline_sha:0:12}"
+            detail "         the pin contains $mainline plus ${ahead:-?} unmerged commit(s)."
+            detail "         Intentional when a city is pinned to a branch under test; it"
+            detail "         becomes ordinary staleness once that work lands."
+            continue
+        fi
+
+        hard "$scope declares ${c:0:12}, which has diverged from $mainline"
         detail "  $scope declared: ${c:0:12}"
         detail "  mainline:        $mainline at $(git -C "$materialized_dir" rev-parse --short=12 "$mainline" 2>/dev/null)"
         if [ -n "$base" ]; then
