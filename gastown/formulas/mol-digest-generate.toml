@@ -42,6 +42,22 @@ A formatted markdown digest covering:
 
 The digest is mailed to the mayor and archived as a digest bead.
 
+## The anchoring invariant
+
+**The period a run covers is fixed by when its wisp was poured, not by when a
+dog got around to executing it.** Pickup lag is normal and unbounded; the
+cooldown that poured the wisp is what decided which period is owed. Every
+`date`-at-execution-time shortcut in this formula has been removed for that
+reason — see the `determine-period` step and gp-gqz.
+
+Two consequences worth knowing before you start:
+- `Digest: YYYY-MM-DD` titles in the city ledger are the run's memory. They are
+  how the next run detects a duplicate or a skipped period, so the title shape
+  is a contract, not a label.
+- Queries against that ledger must be city-scoped and include closed beads. A
+  mis-scoped query returns an empty array and exit 0, which looks exactly like
+  "no digests exist" — that is how a skipped day stays invisible.
+
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-digest-generate"
 phase = "vapor"
@@ -55,33 +71,213 @@ default = "daily"
 description = "Seconds to wait for slow queries before giving up"
 default = "30"
 
+[vars.period_date]
+description = """
+Explicit period to digest (YYYY-MM-DD), for deliberate backfill of a day the
+ledger is missing. Empty (the default) means derive the period from the wisp's
+own pour time, which is the only correct behaviour for scheduled runs. Set this
+ONLY when hand-pouring a wisp to fill a known gap."""
+default = ""
+
 [[steps]]
 id = "determine-period"
-title = "Determine digest time range"
+title = "Determine digest time range from the wisp's pour time"
 description = """
 Establish the time range for this digest.
 
-**1. Determine period type:**
-Use {{period}} (from formula vars, defaults to "daily").
+**The window is anchored to the wisp's `created_at`, never to the clock at
+execution time.** The deacon's cooldown decides *which* period is owed and
+records that decision by pouring the wisp. Execution can lag the pour by
+minutes or by days. Re-deriving the period from `date` at execution time
+answers "which day is it now", not "which day was I asked for" — so a late
+pickup silently skips the owed day and duplicates the next one.
 
-**2. Calculate time range:**
+That is not hypothetical: a wisp poured 2026-07-28T06:34Z was picked up ~38h
+late and produced the 07-28 window instead of 07-27. 2026-07-27 was never
+digested, and the next wisp (poured 07-29) computed 07-28 again — one day lost,
+the next duplicated, no error raised in either run. See gp-gqz.
 
-| Period | Since | Until |
-|--------|-------|-------|
-| daily | Yesterday 00:00 UTC | Today 00:00 UTC |
-| weekly | Last Monday 00:00 UTC | This Monday 00:00 UTC |
+**1. Resolve the city root.**
+
+Digest beads live in the *city* ledger. A rig ledger answers a digest query
+with an empty array and exit status 0 — indistinguishable from "no digests
+exist" — so the scope must be resolved and asserted before any query runs.
 
 ```bash
-# For daily:
-SINCE=$(date -u -d 'yesterday 00:00' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
-        date -u -v-1d -j -f '%H:%M' '00:00' +%Y-%m-%dT%H:%M:%SZ)
-UNTIL=$(date -u -d 'today 00:00' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || \
-        date -u -j -f '%H:%M' '00:00' +%Y-%m-%dT%H:%M:%SZ)
+if [ -z "${GC_CITY:-}" ]; then
+  dir=$(pwd)
+  while [ "$dir" != "/" ]; do
+    if [ -f "$dir/city.toml" ]; then
+      GC_CITY="$dir"
+      break
+    fi
+    dir=$(dirname "$dir")
+  done
+fi
+if [ -z "${GC_CITY:-}" ] || [ ! -f "$GC_CITY/city.toml" ]; then
+  echo "HALT: city root unresolved; refusing to run against a rig ledger" >&2
+  exit 2
+fi
 ```
 
-Note the timestamps for the digest header.
+**2. Read the pour instant from this wisp.**
 
-Continue to data collection when the time range is established."""
+`$GC_BEAD_ID` is the wisp the deacon poured for this run.
+
+```bash
+POUR_AT=$(gc bd show "$GC_BEAD_ID" -C "$GC_CITY" --json 2>/dev/null |
+          jq -r '.[0].created_at // empty')
+case "$POUR_AT" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) POUR_DATE="${POUR_AT%%T*}" ;;
+  *) echo "HALT: no usable created_at on wisp $GC_BEAD_ID (got: '$POUR_AT')" >&2
+     exit 2 ;;
+esac
+```
+
+**3. Derive the window from `$POUR_DATE`.**
+
+`PERIOD_DATE` is the day (or week) the digest covers, and is also the date in
+its title and mail subject.
+
+| Period | PERIOD_DATE (= SINCE) | UNTIL |
+|--------|-----------------------|-------|
+| daily | pour date - 1 day | pour date |
+| weekly | Monday before the pour week's Monday | pour week's Monday |
+
+```bash
+if [ -n "{{period_date}}" ]; then
+  # Deliberate backfill: an operator named the period explicitly.
+  PERIOD_DATE="{{period_date}}"
+  UNTIL_DATE=$(date -u -d "$PERIOD_DATE +1 day" +%Y-%m-%d 2>/dev/null ||
+               date -u -j -v+1d -f '%Y-%m-%d' "$PERIOD_DATE" +%Y-%m-%d)
+elif [ "{{period}}" = "weekly" ]; then
+  DOW=$(date -u -d "$POUR_DATE" +%u 2>/dev/null ||
+        date -u -j -f '%Y-%m-%d' "$POUR_DATE" +%u)
+  UNTIL_DATE=$(date -u -d "$POUR_DATE -$((DOW - 1)) day" +%Y-%m-%d 2>/dev/null ||
+               date -u -j -v-$((DOW - 1))d -f '%Y-%m-%d' "$POUR_DATE" +%Y-%m-%d)
+  PERIOD_DATE=$(date -u -d "$UNTIL_DATE -7 day" +%Y-%m-%d 2>/dev/null ||
+                date -u -j -v-7d -f '%Y-%m-%d' "$UNTIL_DATE" +%Y-%m-%d)
+else
+  PERIOD_DATE=$(date -u -d "$POUR_DATE -1 day" +%Y-%m-%d 2>/dev/null ||
+                date -u -j -v-1d -f '%Y-%m-%d' "$POUR_DATE" +%Y-%m-%d)
+  UNTIL_DATE="$POUR_DATE"
+fi
+
+if [ -z "$PERIOD_DATE" ] || [ -z "$UNTIL_DATE" ]; then
+  echo "HALT: date arithmetic produced an empty window" >&2
+  exit 2
+fi
+
+SINCE="${PERIOD_DATE}T00:00:00Z"
+UNTIL="${UNTIL_DATE}T00:00:00Z"
+DATE="$PERIOD_DATE"
+echo "digest window: $SINCE .. $UNTIL (wisp poured $POUR_AT)"
+```
+
+**If any check above halts, escalate — do not work around it.** Falling back
+to wall-clock time, or to "today minus one", is the exact defect this step
+exists to prevent: it produces a plausible digest for the wrong period and
+leaves no trace. A halted run that escalates is recoverable; a confidently
+wrong window is not.
+
+Continue to the ledger check with `$SINCE`, `$UNTIL` and `$DATE` established."""
+
+[[steps]]
+id = "check-digest-ledger"
+title = "Check the digest ledger for a duplicate or a gap"
+description = """
+Read the existing digest ledger once, and use it for two decisions: whether
+this period is already covered, and whether any period was skipped.
+
+**1. Read the ledger (city-scoped, closed included, strictly matched).**
+
+Three details are load-bearing, and getting any of them wrong yields a
+silently empty ledger — which reads as "this is the city's first digest run"
+and is how a missing day stays missing:
+
+- `-C "$GC_CITY"` — digest beads are city-level. A rig-scoped query returns
+  `[]` with exit 0.
+- `--all` — digest beads get closed. The default list filter hides them.
+  (`--status=all` is *not* a valid status value and is silently ignored; the
+  flag is `--all`.)
+- the title regex — `--label=digest` alone also matches bug reports *about*
+  the digest formula, which are not digests. Match `Digest: YYYY-MM-DD`.
+
+```bash
+LEDGER_ERR=$(mktemp)
+LEDGER_RAW=$(gc bd list -C "$GC_CITY" --all --title="Digest:" --json --limit=0 2>"$LEDGER_ERR")
+LEDGER_CODE=$?
+LEDGER_MSG=$(sed -n '1p' "$LEDGER_ERR"); rm -f "$LEDGER_ERR"
+
+if [ "$LEDGER_CODE" -ne 0 ]; then
+  echo "HALT: digest ledger query failed (exit $LEDGER_CODE): ${LEDGER_MSG:-no stderr}" >&2
+  exit 2
+fi
+if ! printf '%s' "$LEDGER_RAW" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  echo "HALT: digest ledger query returned non-array JSON" >&2
+  exit 2
+fi
+
+# One "YYYY-MM-DD<TAB>bead-id" per line, oldest first.
+LEDGER=$(printf '%s' "$LEDGER_RAW" | jq -r '
+  [ .[] | select(.title | test("^Digest: [0-9]{4}-[0-9]{2}-[0-9]{2}$")) ]
+  | sort_by(.title)
+  | .[] | [ (.title | ltrimstr("Digest: ")), .id ] | @tsv')
+# Count from the JSON, not by piping the text through grep -c: grep exits 1 on
+# an empty ledger, which aborts the step under `set -e` on exactly the run that
+# most needs to report what it saw.
+LEDGER_COUNT=$(printf '%s' "$LEDGER_RAW" | jq '
+  [ .[] | select(.title | test("^Digest: [0-9]{4}-[0-9]{2}-[0-9]{2}$")) ] | length')
+echo "digest ledger: $LEDGER_COUNT entries"
+```
+
+An empty ledger is only true for a city's genuine first run. **Do not assert
+"first digest run" as a conclusion** — report it as an observed count and let
+it look strange. Every silent-empty variant of this query produces exactly the
+same output as a real first run, so the claim is never yours to make.
+
+**2. Idempotency: stop if this period is already digested.**
+
+Regenerating a period the ledger already covers mails the mayor a duplicate
+and costs a mail bead plus Dolt commits for nothing.
+
+```bash
+EXISTING=$(printf '%s\n' "$LEDGER" | awk -F'\t' -v d="$DATE" '$1 == d { print $2; exit }')
+if [ -n "$EXISTING" ]; then
+  echo "ALREADY_DIGESTED $DATE by $EXISTING — closing without generating."
+  gc bd close "$GC_BEAD_ID" -C "$GC_CITY" --reason "Digest for $DATE already exists ($EXISTING); no duplicate generated"
+  gc runtime drain-ack
+  exit 0
+fi
+```
+
+Send no mail and create no bead on this path — the existing digest is the
+deliverable, and the cooldown is already satisfied.
+
+**3. Gap detection: is this window contiguous with the newest digest?**
+
+```bash
+GAP_NOTE=""
+NEWEST=$(printf '%s\n' "$LEDGER" | tail -1 | cut -f1)
+if [ -n "$NEWEST" ]; then
+  if [ "{{period}}" = "weekly" ]; then GAP_STEP=7; else GAP_STEP=1; fi
+  EXPECTED=$(date -u -d "$NEWEST +$GAP_STEP day" +%Y-%m-%d 2>/dev/null ||
+             date -u -j -v+"$GAP_STEP"d -f '%Y-%m-%d' "$NEWEST" +%Y-%m-%d)
+  if [ "$DATE" \\> "$EXPECTED" ]; then
+    GAP_NOTE="never digested: $EXPECTED through the period before $DATE (newest on record was $NEWEST)"
+    echo "GAP $GAP_NOTE" >&2
+  fi
+fi
+```
+
+**Report the gap; do not auto-backfill it.** A wisp that backfills on its own
+turns a long outage into a stampede — a fortnight of downtime becomes fourteen
+digests and fourteen mail beads delivered at once, which is the cost step 2
+exists to avoid. Surfacing the gap in the digest header makes a skipped period
+visible on the next run instead of never, and an operator can then fill it
+deliberately by pouring a wisp with `period_date` set.
+
+Carry `$GAP_NOTE` into the digest header. Continue to data collection."""
 
 [[steps]]
 id = "collect-data"
@@ -139,8 +335,19 @@ Transform data into a formatted digest and deliver it.
 
 **1. Generate digest markdown:**
 
+The heading date is `$DATE` (the period covered, derived from the wisp's pour
+time) — not today's date. Include the resolved window verbatim so the covered
+range is auditable from the digest alone, and emit the gap line whenever
+`$GAP_NOTE` is non-empty.
+
 ```markdown
-# Gas Town {{period}} Digest: {{date}}
+# Gas Town {{period}} Digest: $DATE
+
+Window: $SINCE .. $UNTIL
+Ledger: $LEDGER_COUNT prior digests on record
+
+> **GAP** — $GAP_NOTE
+> (omit this block entirely when $GAP_NOTE is empty)
 
 ## Summary
 - **Issues filed**: N (tasks: X, bugs: Y)
@@ -171,15 +378,26 @@ gc mail send mayor/ -s "Gas Town Digest: $DATE" -m "$DIGEST"
 ```
 
 **3. Archive as bead:**
+
+The title must be exactly `Digest: $DATE` — that string is the ledger key the
+duplicate and gap checks read. Any other shape makes this run invisible to the
+next one, which reopens the skipped-day hole.
+
 ```bash
-gc bd create --type=task \
+gc bd create -C "$GC_CITY" --type=task \
   --title="Digest: $DATE" \
   --label=digest,{{period}}
 ```
 
-**4. Close work bead, signal reconciler, and exit:**
+**4. Close the wisp, signal reconciler, and exit:**
+
+Close `$GC_BEAD_ID` — the wisp poured for this run — city-scoped, exactly as
+the duplicate path does. A bare or guessed id is fuzzy-matched and can close
+an unrelated bead; an unscoped close resolves against whatever ledger the
+dog's cwd lands in, which is not necessarily the one holding the wisp.
+
 ```bash
-gc bd close <work-bead> --reason "Digest generated and sent"
+gc bd close "$GC_BEAD_ID" -C "$GC_CITY" --reason "Digest generated and sent"
 gc runtime drain-ack
 exit
 ```
