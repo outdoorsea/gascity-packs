@@ -165,6 +165,23 @@ for ORPHAN in $ORPHANS; do
   # surfaces beads the inbox missed.
 done
 
+# Step 0b: Address-agnostic census. The scan above matches gc.routed_to against
+# THIS refinery's address, and find-work matches assignee against it — the same
+# string, so both go blind to the same defect at once. A handoff written to a
+# misspelled refinery address matches neither and is invisible while the queue
+# reports empty. Two live address forms were measured on one ledger
+# ('<rig>/refinery' and '<rig>/gastown.refinery'); only one was ever queried.
+#
+# So look at branch-carrying open work WITHOUT consulting any address, and say
+# out loud what is out there. Reporting only: find-work's ADDRESS_AGNOSTIC_SWEEP
+# owns the ownership filters and the adoption, and duplicating that judgement
+# here is how the two would drift apart.
+gc bd list ${GC_RIG:+--rig="$GC_RIG"} --status=open --has-metadata-key=branch --limit=0 --json 2>/dev/null \
+  | jq -r '.[] | "branch-carrying open bead: \(.id) assignee=\(.assignee // "<unassigned>") routed_to=\(.metadata["gc.routed_to"] // "<none>")"'
+# Any line here whose address is not one this refinery queries is the bug.
+# Do not act on it now — the patrol's find-work step adopts it with the
+# evidence checks intact.
+
 # Step 1: Reconcile your patrol wisps to exactly one, and resume it.
 # `startup` keeps an in_progress wisp over a queued one and burns the surplus.
 # Checking without reconciling is how this refinery accumulated three open

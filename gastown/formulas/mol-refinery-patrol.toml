@@ -525,14 +525,159 @@ sees rig-scoped work beads — the `assignee` field alone does not route
 by namespace. For HQ-only refineries `$GC_RIG` is empty and the flag
 expands to nothing.
 
-If found: read the bead metadata to confirm it has a branch:
+**3b. Address-agnostic fallback sweep (runs only when step 3 selected nothing):**
+
+Step 3 and the startup orphan scan are not two independent detectors. Step 3
+matches `assignee == $GC_AGENT`; the orphan scan matches `gc.routed_to ==` this
+refinery's address. Both compare the same address string, so both go blind to
+the same defect at the same instant: a producer that writes a merge handoff to a
+MISSPELLED refinery address matches neither, and the bead sits open, correctly
+branched, fully pushed, and completely invisible while the refinery reports an
+empty queue and idles. The orphan scan is documented as the fallback that
+catches what the inbox missed, and it catches nothing here — a correct handoff
+CLEARS `gc.routed_to`, so empty is the healthy shape and the scan has no address
+left to match on.
+
+Measured on the live tallyup ledger: `assignee='tallyup/refinery'` and
+`assignee='tallyup/gastown.refinery'` each held open merge work. The refinery
+only ever queried one form. Neither instance was found by anything in this
+formula — one surfaced from `git branch -r --no-merged origin/main` during an
+unrelated recheck, the other from a hand-run sweep that ignored assignee
+entirely and found 1 stranded bead among 186 open ones. The same sweep run
+town-wide caught a live P0 stranded six minutes after handoff.
+
+This is the third path, and it is deliberately keyed on a DIFFERENT attribute
+than the other two, because redundancy that keys on the same field is not
+redundancy. It never reads the assignee at all, so it degrades gracefully
+against address forms nobody has invented yet.
+
+It is the consumer-side half of a two-part fix. The producer side (gp-0fz, a
+`binding_prefix` that renders empty) stops NEW bad addresses from being written;
+this sweep is what makes the refinery survive the ones already in the wild, plus
+whatever the next producer bug invents. Fixing only the producer leaves every
+already-stranded bead stranded, and nothing would report it.
+
+Ignoring the assignee is affordable because within this state machine an open
+bead is claimed by its OTHER metadata, and every one of those claims is checked:
+
+| Shape | Marker | Who owns it |
+|---|---|---|
+| Parked PR | `awaiting_merge=true` | step 1 |
+| Non-patch deliverable | `no_code_change=true` | step 2 |
+| Refinery rejected it | `rejection_reason` set | the polecat pool |
+| Halted before push | `branch_ready=true` / `halt_reason` | the caller |
+| Any pool demand | `gc.routed_to` non-empty | whoever it names |
+
+What survives those exclusions — open, carrying a branch, routed to nobody — is
+by construction a completed handoff, because a correct handoff is the only
+transition that clears `gc.routed_to` while leaving the bead open with a branch.
+The one remaining question is whether its address is spelled in a form this
+refinery queries, and that is precisely the bug.
+
+Two further checks demand positive evidence that a polecat actually finished, so
+a dead session's half-built branch is never mistaken for a handoff:
+
+- **`metadata.target` must be set.** `workspace-setup` records `branch` EARLY,
+  before any implementation; only the polecat's submit step writes `target`. It
+  is the one attribute that means "a polecat completed the handoff" without
+  naming an address.
+- **`origin/<branch>` must exist.** A branch recorded but never pushed is a
+  polecat that died, which the witness owns — not a merge.
+
+Neither failure is swallowed. A branch-carrying bead that nobody owns and that
+fails an evidence check is stranded in a way no other mechanism reports either,
+so it gets a line naming the bead, its branch, and the address it was wearing.
+
+```bash
+# --- ADDRESS_AGNOSTIC_SWEEP ---
+# Guarded on the "queue empty" verdict, which is exactly the moment a
+# misaddressed handoff is invisible and the refinery would otherwise idle.
+if [ -z "${WORK:-}" ]; then
+  SWEEP=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --status=open \\
+    --exclude-type=epic --has-metadata-key=branch --limit=0 --json)
+  # An unreadable query is not an empty ledger, and it must not feed jq an empty
+  # stdin either -- that errors out noisily and looks like "nothing stranded".
+  [ -n "$SWEEP" ] || SWEEP='[]'
+
+  # No --assignee anywhere in this pipeline. The assignee string is the thing
+  # that is wrong, so consulting it would reproduce the blindness this exists to
+  # cover. Every comparison goes through `tostring` for the same reason step 3's
+  # do: `--set-metadata k=true` stores a JSON boolean, and in jq `true != "true"`
+  # is TRUE, so a raw compare reads as load-bearing while excluding nothing.
+  SWEEP_UNOWNED=$(printf '%s' "$SWEEP" | jq -r '
+    def field($k): ((.metadata[$k] // "") | tostring);
+    .[]
+    | select(field("awaiting_merge")   != "true")
+    | select(field("no_code_change")   != "true")
+    | select(field("branch_ready")     != "true")
+    | select(field("rejection_reason") == "")
+    | select(field("halt_reason")      == "")
+    | select(field("gc.routed_to")     == "")
+    | .id')
+
+  for SW in $SWEEP_UNOWNED; do
+    SW_JSON=$(gc bd show "$SW" --json)
+    SW_BRANCH=$(printf '%s' "$SW_JSON" | jq -r '.[0].metadata.branch // empty')
+    SW_TARGET=$(printf '%s' "$SW_JSON" | jq -r '.[0].metadata.target // empty')
+    SW_ADDR=$(printf '%s' "$SW_JSON" | jq -r '.[0].assignee // empty')
+    [ -n "$SW_ADDR" ] || SW_ADDR="<unassigned>"
+
+    if [ -z "$SW_TARGET" ]; then
+      echo "SWEEP: $SW carries branch '$SW_BRANCH' but no metadata.target (addressed to '$SW_ADDR'); only the polecat's submit step writes target, so there is no completed handoff to act on. Left for the witness."
+      continue
+    fi
+
+    # ls-remote asks origin directly, so the verdict does not depend on how
+    # stale this worktree's fetch state happens to be.
+    git ls-remote --exit-code --heads origin "$SW_BRANCH" >/dev/null 2>&1
+    case "$?" in
+      0) : ;;
+      2)
+        echo "SWEEP: $SW claims branch '$SW_BRANCH' (addressed to '$SW_ADDR') but origin has no such ref. That is a polecat that died before pushing, not a merge. Left for the witness."
+        continue
+        ;;
+      *)
+        echo "SWEEP: could not reach origin to verify '$SW_BRANCH' for $SW; failing closed and leaving it for the next patrol."
+        continue
+        ;;
+    esac
+
+    # Adopt it, and repair the address while doing so. The repair is the point:
+    # it puts the bead back where BOTH prescribed paths can see it, so this
+    # sweep never has to be the thing that finds the same bead twice.
+    if gc bd update "$SW" --assignee="$GC_AGENT" \\
+         --set-metadata address_repaired_from="$SW_ADDR" \\
+         --notes "Address-agnostic sweep adopted this bead. It was open, unrouted, and carried branch '$SW_BRANCH' with target '$SW_TARGET' -- the shape of a completed polecat handoff -- but was addressed to '$SW_ADDR', which no refinery discovery path queries. Reassigned to $GC_AGENT so the merge queue can see it. The address itself is a producer-side defect: whatever wrote it will keep writing it."; then
+      WORK="$SW"
+      echo "SWEEP: adopted $SW as merge work (was addressed to '$SW_ADDR'; branch $SW_BRANCH -> $SW_TARGET)."
+      gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "SWEEP: $SW was invisible to both refinery discovery paths (addressed to '$SW_ADDR'); adopted it and merging. The producer is writing an address nothing queries."
+      break
+    fi
+    echo "SWEEP: $SW is merge work but the reassignment did not land; left open for the next patrol."
+  done
+fi
+```
+
+The sweep selects at most one bead and stops. It is a selector, not a batch
+job — the merge pipeline below handles one branch per patrol iteration, and the
+next iteration sweeps again, so a queue of misaddressed beads drains one per
+patrol rather than all at once.
+
+Do NOT "simplify" the guard away and run this sweep unconditionally. It reads
+every open branch-carrying bead in the ledger, and step 3 is both cheaper and
+authoritative when it answers. Idle is the only moment this is needed, and idle
+is the exact symptom the bug produces.
+
+If found (by step 3 or the sweep): read the bead metadata to confirm it has a
+branch:
 ```bash
 gc bd show $WORK --json | jq '.[0].metadata'
 ```
 The bead MUST have `metadata.branch`. If `metadata.target` is missing,
 use {{target_branch}} as default. Note the work bead ID and close this step.
 
-If NO work found:
+If NO work found — meaning step 3 selected nothing AND the sweep adopted
+nothing:
 Write exactly:
 ```
 IDLE: no work, exiting turn.
