@@ -140,7 +140,24 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "--set-metadata awaiting_merge=true",
         'merge_landed "origin/$AW_TARGET" "origin/$AW_BRANCH" "$AW_FORK"',
         'git cherry "$ml_target" "$ml_branch"',
-        'select((.metadata.awaiting_merge // "") != "true")',
+        # The `tostring` cast is pinned deliberately and must not be
+        # "simplified" away. `--set-metadata k=true` stores a JSON *boolean*,
+        # and in jq `true != "true"` is TRUE, so comparing the raw field to the
+        # string "true" excludes nothing — the filter reads as load-bearing
+        # while doing nothing. This exclusion shipped inert for exactly that
+        # reason (found while fixing gp-d5u); pinning the cast is what stops it
+        # regressing back to a no-op. Only in-jq comparisons need the cast;
+        # `--metadata-field=k=true` matches the boolean natively.
+        'select(((.metadata.awaiting_merge // "") | tostring) != "true")',
+        # no_code_change beads have no patch, so routing one into the merge
+        # selector guarantees the false-completion halt (gp-d5u). Pin the
+        # triage query, its emptiness predicate, the terminal marker, and the
+        # work-selection skip: this is the refinery's second terminal
+        # transition and it fails as silently as the first.
+        "--metadata-field=no_code_change=true",
+        "branch_is_empty",
+        "--set-metadata merge_result=no_patch_needs_human",
+        'select(((.metadata.no_code_change // "") | tostring) != "true")',
     ),
     "mol-witness-patrol": (
         "LIVENESS_MAP=$(jq -n",
