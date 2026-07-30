@@ -33,6 +33,10 @@ monitors the WORK layer:
    They report `active` to everything else, so nothing else will catch them.
 4. **Polecat health** — detect stuck polecats, file warrants for dog pool.
 5. **Help mail** — triage HELP/escalation requests from polecats.
+6. **Landed-worktree reaping** — per-bead polecat worktrees whose work already
+   reached the target branch. Nothing else owns their death: the refinery
+   deletes the BRANCH after merge, not the tree, and orphan recovery keys on a
+   live-but-unreachable assignee, which a closed bead never is.
 
 Gate checks and convoy/swarm completion are town-wide concerns handled by
 the deacon, not the per-rig witness.
@@ -51,6 +55,12 @@ the previous location is disposable:
 The witness's core recovery job: when a bead is orphaned (agent won't
 come back), ensure the work reaches the branch (push), then clean up
 the worktree. This makes the work schedulable again.
+
+The same chain licenses the reaper in `reap-landed-worktrees`: once a bead is
+closed and its commits' patches are on the target, BOTH earlier locations are
+disposable, and the tree is pure garbage. That step is the only place the chain
+is read forwards (work landed, so drop the tree) rather than backwards (work is
+stranded, so push it).
 
 ## What the witness does NOT do
 
@@ -458,14 +468,100 @@ gc bd update <bead> --set-metadata recovered=true
 ```
 
 **Exit criteria:** All orphaned beads recovered, worktrees cleaned.
-Or no orphans found. Continue to `check-unroutable-beads` — do NOT exit
+Or no orphans found. Continue to `reap-landed-worktrees` — do NOT exit
 the wisp here. The `next-iteration` step is the only place that pours
 the next wisp and burns this one."""
 
 [[steps]]
+id = "reap-landed-worktrees"
+title = "Reap per-bead worktrees whose work already landed"
+needs = ["recover-orphaned-beads"]
+description = """
+Remove per-bead polecat worktrees whose work has reached the target branch.
+
+Runs AFTER `recover-orphaned-beads` on purpose: salvage gets first refusal on
+every tree. A tree this step reaps has already been offered to salvage and
+declined by it, because salvage only looks at beads with a live-but-unreachable
+assignee and these beads are closed and unassigned.
+
+**Why this step exists (gp-a7z).** No component owned a polecat worktree's
+death. The refinery deletes the BRANCH after merge, not the tree. Orphan
+recovery above removes trees only for orphaned beads. The controller manages
+processes, not directories. So the city accumulated one worktree per completed
+bead: 5 stale trees when the bug was filed, 8 two days later, roughly 3/day at
+that throughput.
+
+**Run the reaper. Do not hand-roll this predicate.**
+```bash
+gc gastown worktree-reap --reap
+```
+
+Reporting is the default and `--reap` is the only mode that deletes; run it
+without the flag first if you want to see verdicts before acting.
+
+Exit codes: `0` nothing to report, `1` findings on stdout, `2` the reaper could
+not run. A `2` means nothing was measured — that is NOT a clean sweep. Do not
+record a reap count for it; treat it as breakage and continue to the next step.
+
+**Read the verdict rows, do not re-derive them.** Column 1 is the verdict:
+`reaped` / `reap` / `reap-failed`, the `keep-*` refusals, and `unverifiable`.
+Anything `unverifiable` was NOT cleared — it abstained. Never "help" it along by
+removing the directory yourself.
+
+**Why the predicate lives in a script and not in this step.** The two checks
+that carry the safety argument are `git status --porcelain` empty and
+`git cherry <target> HEAD` reporting no `+` commits — together they mean
+reaping cannot lose work. Both are exact, and both are easy to approximate
+wrongly:
+
+- Ancestry is NOT the landed test. The refinery rebases before merging, so a
+  landed branch's commits are on the target under DIFFERENT SHAs. Measured on
+  gascity-packs (2026-07-29): of three landed, closed, clean trees, `git
+  merge-base --is-ancestor HEAD origin/main` said YES for gp-982 and NO for
+  gp-px5 and gp-nrm — all three with zero unmerged patches. An ancestry-keyed
+  reaper reaps one and leaks two forever. See gp-zs8 for the same trap in the
+  other direction.
+- Agent liveness is NOT an input, in either direction. "This agent has no
+  session, so its workspace is garbage" would have destroyed gp-px5: a rejected
+  bead resumed by a DIFFERENT polecat keeps `metadata.work_dir` pointing into
+  the original polecat's workspace, and that agent had no session at all. And
+  polecat names are recycled from the namepool — furiosa went from no-session to
+  draining in ~15 minutes. The mirror image is just as wrong: `gc session list`
+  reports a polecat's `work_dir` as its AGENT WORKSPACE, the parent of every
+  per-bead tree, so refusing to reap "under a live agent" would refuse every
+  tree of every running polecat and the leak would survive this step entirely.
+
+The reaper keys on the BEAD's terminal state plus a grace window measured from
+its `closed_at`, and never touches a parent agent workspace, the rig repo, the
+refinery workspace, or a crew checkout.
+
+**Scope discipline.** Do not extend this to agent workspaces. A leaked directory
+is a cheap problem; an agent whose workspace vanished mid-session is not.
+
+**Notify only when it is interesting.** Routine reaping is log-only — it is
+garbage collection, and mailing about it every cycle is noise. Nudge the mayor
+when the pattern is worth a human look:
+
+| Situation | Action |
+|-----------|--------|
+| Trees reaped, no failures | Log only. Routine. |
+| `reap-failed` rows present | Log + nudge mayor. Removal is broken; disk grows. |
+| `unverifiable` rows persisting across cycles | Log + nudge mayor. Something is wrong with the bead or the ref, and those trees never get collected. |
+| Exit code 2 | Log + mail mayor. The reaper cannot run at all, so the leak is unbounded again. |
+
+```bash
+gc session nudge mayor/ "worktree-reap: <n> reaped, <n> failed, <n> unverifiable in $GC_RIG"
+```
+
+**Exit criteria:** The reaper ran and its rows were read, or it reported
+nothing to do. Continue to `check-unroutable-beads` — do NOT exit the wisp
+here. The `next-iteration` step is the only place that pours the next wisp and
+burns this one."""
+
+[[steps]]
 id = "check-unroutable-beads"
 title = "Sweep for open work no pool can claim"
-needs = ["recover-orphaned-beads"]
+needs = ["reap-landed-worktrees"]
 description = """
 Assert the routing invariant:
 
