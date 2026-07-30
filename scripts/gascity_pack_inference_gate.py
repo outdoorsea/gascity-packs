@@ -85,7 +85,19 @@ GASTOWN_FORMULA_CONTRACTS = {
         "git worktree add",
         "--set-metadata branch=\"$BRANCH\"",
         "{{test_command}}",
-        "REFINERY_TARGET=\"${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery\"",
+        # The refinery address is RESOLVED, never composed-and-written (gp-0fz).
+        # The old pin required the assignment
+        # `REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"`, which
+        # degrades to `$GC_RIG/refinery` whenever `{{binding_prefix}}` renders
+        # empty at pour time. Nothing rejects that write — the refinery's
+        # assigned-work scan queries its own `$GC_AGENT` and misses, and the
+        # routed-orphan scan keys on `gc.routed_to`, which the handoff correctly
+        # clears — so the bead reads healthy while generating zero demand. Pin
+        # the resolver call, the composed value's demotion to a mere candidate,
+        # and the refusal-halts-not-falls-back guarantee instead.
+        "REFINERY_TARGET=$(gc gastown agent-address refinery",
+        "--candidate \"${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery\"",
+        "HALT: cannot resolve the refinery address",
         "--assignee=\"$REFINERY_TARGET\"",
     ),
     "mol-refinery-patrol": (

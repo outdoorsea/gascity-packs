@@ -304,10 +304,20 @@ gc bd update "$WORK_BEAD_ID" \
   --notes "Already delivered before build: <what you confirmed, and where>.
 Evidence: <sha> <subject> / <path>. No branch pushed — nothing to merge.
 Verified by reading the commit, not by the check's verdict alone."
-gc session nudge "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness" "ALREADY-DELIVERED: $WORK_BEAD_ID — deliverable confirmed present on origin/{{base_branch}} (<sha>); halted before build, no branch pushed."
+WITNESS_TARGET=$(gc gastown agent-address witness --quiet \
+    --candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness") || WITNESS_TARGET=""
+if [ -n "$WITNESS_TARGET" ]; then
+  gc session nudge "$WITNESS_TARGET" "ALREADY-DELIVERED: $WORK_BEAD_ID — deliverable confirmed present on origin/{{base_branch}} (<sha>); halted before build, no branch pushed." || true
+fi
 gc runtime drain-ack
 exit 0
 ```
+
+Resolve the witness address rather than composing it, for the same reason
+`submit-and-exit` resolves the refinery's (gp-0fz): an empty `{{binding_prefix}}`
+yields `$GC_RIG/witness`, which no agent answers to. This one is best-effort —
+the bead state above is the durable record, so a failed resolve drops the nudge
+rather than the halt.
 
 `blocked` + `gc.routed_to=human` is deliberate: the bead needs one cheap human
 call ("close it as done, or re-scope it") and must not fall back into the
@@ -645,17 +655,63 @@ reason and writes no token fields, because a bead claiming 0 in / 0 out is
 indistinguishable from work that was genuinely free. Neither outcome blocks
 the handoff: metering is an observation, never a gate on work changing hands.
 
-**6. Reassign to refinery:**
+**6. Reassign to refinery.**
+
+Resolve the address BEFORE writing it. Do not compose it and write it in one
+breath — that is the bug this step is built around:
+
 ```bash
-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+REFINERY_TARGET=$(gc gastown agent-address refinery \
+    --candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery") || {
+  echo "HALT: cannot resolve the refinery address — refusing to write an assignee." >&2
+  WITNESS_TARGET=$(gc gastown agent-address witness --quiet) \
+    || WITNESS_TARGET="${GC_RIG:+$GC_RIG/}gastown.witness"
+  gc mail send "$WITNESS_TARGET" \
+    -s "ESCALATION: unresolvable refinery address for $WORK_BEAD_ID [HIGH]" \
+    -m "submit-and-exit refused the handoff: no known agent answers to the composed
+refinery address, and none could be derived. Branch is pushed; the bead is still
+in_progress and assigned to this session, which is the recoverable state.
+Composed candidate: ${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery
+See the resolver's stderr above for the roster it consulted." || true
+  exit 1
+}
+case "$REFINERY_TARGET" in
+  ""|*[[:space:]]*|*'{'*|*'}'*)
+      echo "HALT: refinery address is not address-shaped: '$REFINERY_TARGET'" >&2
+      exit 1 ;;
+esac
 gc bd update "$WORK_BEAD_ID" --status=open --assignee="$REFINERY_TARGET" --set-metadata gc.routed_to=""
 ```
 
-`${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` resolves to
-`$GC_RIG/{{binding_prefix}}refinery` when running inside a rig session,
-or `{{binding_prefix}}refinery` when running in an HQ-only city where
-the workspace is the rig. Writing a rendered empty rig prefix produces
-`/{{binding_prefix}}refinery` and strands beads outside the refinery pool.
+**Why this is not a bare string concatenation (gp-0fz).** The composed form
+`${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery` is substituted at pour time. When
+`{{binding_prefix}}` renders empty it degrades to `$GC_RIG/refinery` — which is
+not the refinery; the real agent is `$GC_RIG/gastown.refinery`, because the
+import is bound as `[rigs.imports.gastown]`. Nothing rejects the bad write:
+`--assignee` accepts any string, the refinery's assigned-work scan queries its
+own `$GC_AGENT` and misses, and the routed-orphan scan keys on `gc.routed_to`,
+which this step correctly clears. The bead then reads healthy in every listing —
+open, branch pushed, target set — while generating zero demand and no wake
+signal. A misspelled address is precisely the case where no fallback fires; this
+stranded work across three sessions in two rigs, one for ~6h.
+
+`gc gastown agent-address` resolves against two independent signals: this
+session's OWN address (which already carries the binding prefix — a polecat
+running as `$GC_RIG/gastown.<name>` is bound under `gastown.` by construction)
+and the roster in `gc agent list`. It prints a warning when the composed
+candidate loses, so a still-broken substitution stays visible instead of being
+silently papered over, and it REFUSES rather than returning a guess.
+
+**A refusal is a halt, not a fallback.** Do not "helpfully" write the composed
+value when the resolver declines it — that reintroduces the exact bug. Halting
+leaves the bead in_progress with the branch pushed, which a human or the witness
+can see and recover. A bad assignee is invisible to everything.
+
+The shape check after the call is deliberate belt-and-suspenders: the city pin
+that supplies `gc gastown <sub>` versions independently of the rig pin that
+supplies this formula, so on a lagging city pin the subcommand may not exist at
+all. Verify the output is address-shaped rather than trusting the exit code
+alone; `gc doctor`'s command-coverage check reports the cross-pin gap.
 
 Set `assignee` to the configured refinery named-session identity and clear
 `gc.routed_to` because the direct assignment is the handoff. Generic pool
@@ -676,10 +732,21 @@ it a bead it will terminate a different way. Do NOT close it yourself.
 
 **7. Signal refinery to check for work immediately (belt-and-suspenders):**
 ```bash
-REFINERY_TARGET="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
-gc session wake "$REFINERY_TARGET" || true
-gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
+REFINERY_TARGET=$(gc gastown agent-address refinery --quiet \
+    --candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery") || REFINERY_TARGET=""
+if [ -n "$REFINERY_TARGET" ]; then
+  gc session wake "$REFINERY_TARGET" || true
+  gc session nudge "$REFINERY_TARGET" "Run 'gc prime' to check merge queue and begin processing." || true
+else
+  echo "Could not resolve the refinery address to signal; step 6's bead.updated event is the backstop."
+fi
 ```
+
+Resolve again rather than reusing step 6's variable: each block runs as its own
+shell, so nothing carries over. Unlike step 6 this is best-effort — the signal
+only saves latency, so a failure to resolve skips the nudge instead of halting.
+Never fall back to the composed string here either; nudging an address nobody
+answers to is a silent no-op that reads like a delivered signal.
 
 The `gc bd update` in step 6 generates a `bead.updated` event the refinery's
 event-watch will see, but that can take up to `event_timeout` seconds. Wake

@@ -1155,6 +1155,27 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     assert "gc bd dep add" in contracts["mol-idea-to-plan"]
 
 
+def test_gastown_formula_contract_pins_resolved_refinery_address() -> None:
+    fragments = gascity_pack_inference_gate.all_gastown_formula_contracts()["mol-polecat-work"]
+
+    # The handoff resolves the refinery address against the live roster, keeps
+    # the composed value as a candidate the resolver may reject, and halts
+    # rather than guessing when nothing answers to it.
+    assert "REFINERY_TARGET=$(gc gastown agent-address refinery" in fragments
+    assert '--candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"' in fragments
+    assert "HALT: cannot resolve the refinery address" in fragments
+
+    # Composing the address and writing it in one breath is the gp-0fz
+    # stranding bug: an empty `{{binding_prefix}}` yields `$GC_RIG/refinery`,
+    # which no refinery discovery path sees, so the bead dwells open and
+    # healthy-looking while generating zero demand. It must never be pinned as
+    # contract again — a pin here would *require* the broken write.
+    assert not any(
+        fragment.startswith('REFINERY_TARGET="')
+        for fragment in fragments
+    ), "pinning the composed-and-written refinery address reinstates the gp-0fz stranding bug"
+
+
 def test_build_basic_work_item_targets_code_and_pytest() -> None:
     text = gascity_pack_inference_gate.build_basic_work_item()
 
