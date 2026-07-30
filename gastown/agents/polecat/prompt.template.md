@@ -212,6 +212,24 @@ the rig CI's affected-package logic — same script, run locally). Falls back
 to the full `test_command` for rigs without one. Either way, push is gated
 on local pass — don't ship a PR with locally-failing tests.
 
+**Editing a formula TOML? List its contract pins first.** Gas Town's
+orchestration gate pins literal text fragments inside `gastown/formulas/*.toml`
+— the handoff address, the branch shape, the drain call — and the formula file
+does not mark which lines those are. Rewriting a step around a better mechanism
+silently drops the pin and the refinery rejects the branch, even when every
+other check passed. Each pinned formula now opens with a `CONTRACT PIN` comment,
+and you can read the pins directly:
+
+```bash
+python3 scripts/gascity_pack_inference_gate.py --list-formula-contracts <formula>
+```
+
+If the contract genuinely changed because you replaced the mechanism it names,
+update the registry in `scripts/gascity_pack_inference_gate.py` in the SAME
+commit and say in the commit body what now carries the guarantee. Never delete a
+pin just to make the gate pass — the pin is the only check that the step still
+exists.
+
 {{ template "following-mol" . }}
 
 Default implementation formula: `mol-polecat-work`

@@ -1,3 +1,15 @@
+# CONTRACT PIN — read before editing this file.
+#
+# The gastown-orchestration gate pins literal text fragments from this formula
+# in GASTOWN_FORMULA_CONTRACTS / GASTOWN_BUILD_WORKFLOW_CONTRACTS
+# (scripts/gascity_pack_inference_gate.py). Nothing below marks which lines they
+# are, so list them before you edit:
+#
+#   python3 scripts/gascity_pack_inference_gate.py --list-formula-contracts mol-polecat-work
+#
+# Dropping a pinned fragment fails the gate and gets the branch rejected. If the
+# contract genuinely changed, update the registry in the SAME commit — never
+# delete a pin just to go green.
 description = """
 Polecat work lifecycle — feature-branch variant.
 

@@ -1135,6 +1135,149 @@ def test_validate_gastown_orchestration_contract_rejects_uncast_jq_metadata_bool
     assert "human_review_required" in str(excinfo.value)
 
 
+def test_every_pinned_formula_carries_contract_pin_header() -> None:
+    """The pin must be discoverable from the file an editor actually opens.
+
+    This is the invariant gp-8h3 was filed against: the registry pinned
+    fragments that nothing in the .toml mentioned, so a rewrite learned about
+    the pin only by being rejected. Adding a formula to the registry without
+    the header would silently reopen that gap, so check it mechanically rather
+    than trusting the next editor to remember.
+    """
+    source = gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+    missing: list[str] = []
+    for formula_name in gascity_pack_inference_gate.all_gastown_formula_contracts():
+        text = (source / "formulas" / f"{formula_name}.toml").read_text(encoding="utf-8")
+        header = text.split('description = """', 1)[0]
+        for required in (
+            "CONTRACT PIN",
+            "GASTOWN_FORMULA_CONTRACTS",
+            "GASTOWN_BUILD_WORKFLOW_CONTRACTS",
+            f"--list-formula-contracts {formula_name}",
+        ):
+            if required not in header:
+                missing.append(f"{formula_name}: header missing {required!r}")
+    assert not missing, "\n".join(missing)
+
+
+def listing_sections_by_registry(listing: str) -> dict[str, list[str]]:
+    """Split a `--list-formula-contracts` listing into its per-registry blocks.
+
+    Checking attribution needs the fragments grouped the way the listing groups
+    them; a flat substring test would pass even if every pin were filed under
+    the wrong registry, which is the one thing this listing exists to get right.
+    """
+    sections: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in listing.splitlines():
+        if line.startswith("  ") and not line.startswith("    ") and line.endswith(":"):
+            current = sections.setdefault(line.strip().rstrip(":"), [])
+        elif line.startswith("    ") and current is not None:
+            current.append(line.strip())
+        elif not line.startswith(" "):
+            current = None
+    return sections
+
+
+def sole_removable_pin(registry_name: str, formula_name: str) -> str:
+    """A pin owned by `registry_name` that string-removal can drop on its own.
+
+    Pins overlap: `--assignee="$REFINERY_TARGET"` is a substring of
+    `--status=open --assignee="$REFINERY_TARGET"`, and `{{test_command}}` is
+    pinned by both registries. Deleting either from a synthetic formula breaks
+    more pins than intended and blurs which registry the error should name, so
+    pick a fragment that only claims itself.
+    """
+    owned = dict(gascity_pack_inference_gate.gastown_contract_registries())[registry_name][formula_name]
+    union = gascity_pack_inference_gate.all_gastown_formula_contracts()[formula_name]
+    for fragment in owned:
+        pinned_once = union.count(fragment) == 1
+        contained_by_another = any(other != fragment and fragment in other for other in union)
+        if pinned_once and not contained_by_another:
+            return fragment
+    raise AssertionError(f"no independently-removable pin in {registry_name}[{formula_name!r}]")
+
+
+def test_format_gastown_formula_contracts_lists_pins_with_owning_registry() -> None:
+    # Derive the expectation from the registries instead of restating a
+    # fragment as a literal. A hardcoded pin here is a second copy of the
+    # contract, which is the defect gp-8h3 is about -- and gp-0fz proved the
+    # copy goes stale the moment the real one moves: it replaced the composed
+    # refinery address with a resolved one, and this test kept asserting the
+    # composed form until the refinery rejected the branch.
+    listing = gascity_pack_inference_gate.format_gastown_formula_contracts(["mol-polecat-work"])
+    assert "gastown/formulas/mol-polecat-work.toml" in listing
+
+    sections = listing_sections_by_registry(listing)
+    for registry_name, group in gascity_pack_inference_gate.gastown_contract_registries():
+        fragments = group["mol-polecat-work"]
+        assert fragments, f"{registry_name} pins nothing for mol-polecat-work"
+        assert registry_name in sections, f"listing has no {registry_name} section"
+        # Attribution, not mere presence: each fragment under its owning dict.
+        assert [repr(fragment) for fragment in fragments] == sections[registry_name]
+
+
+def test_format_gastown_formula_contracts_defaults_to_every_pinned_formula() -> None:
+    listing = gascity_pack_inference_gate.format_gastown_formula_contracts()
+    for formula_name in gascity_pack_inference_gate.all_gastown_formula_contracts():
+        assert f"gastown/formulas/{formula_name}.toml" in listing
+
+
+def test_format_gastown_formula_contracts_rejects_unknown_formula() -> None:
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="mol-not-a-formula"):
+        gascity_pack_inference_gate.format_gastown_formula_contracts(["mol-not-a-formula"])
+
+
+def test_list_formula_contracts_flag_needs_no_city(capsys) -> None:
+    # Listing pins has to work from a polecat worktree with no gc binary and no
+    # disposable city -- that is where someone is standing when they need it.
+    assert gascity_pack_inference_gate.main(["--list-formula-contracts", "mol-review-leg"]) == 0
+    assert "gastown/formulas/mol-review-leg.toml" in capsys.readouterr().out
+
+
+def test_gastown_contract_drift_error_is_self_service(tmp_path) -> None:
+    """A rejection must teach the fix, not just report the symptom."""
+    formulas = tmp_path / "gastown" / "formulas"
+    formulas.mkdir(parents=True)
+    dropped = sole_removable_pin("GASTOWN_FORMULA_CONTRACTS", "mol-polecat-work")
+    for formula_name, fragments in gascity_pack_inference_gate.all_gastown_formula_contracts().items():
+        text = "\n".join(fragments)
+        if formula_name == "mol-polecat-work":
+            text = text.replace(dropped, "")
+        (formulas / f"{formula_name}.toml").write_text(text, encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError) as excinfo:
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
+
+    message = str(excinfo.value)
+    # Which pin broke, which dict owns it, which file to open.
+    assert repr(dropped) in message
+    assert "GASTOWN_FORMULA_CONTRACTS['mol-polecat-work']" in message
+    assert "scripts/gascity_pack_inference_gate.py" in message
+    # Both remedies, and the command that shows the rest of the pins.
+    assert "restore the exact fragment" in message
+    assert "in the SAME commit" in message
+    assert "--list-formula-contracts mol-polecat-work" in message
+    # Never present pin-deletion as the cheap way out.
+    assert "Do NOT delete a pin" in message
+
+
+def test_gastown_contract_drift_error_attributes_build_workflow_registry(tmp_path) -> None:
+    formulas = tmp_path / "gastown" / "formulas"
+    formulas.mkdir(parents=True)
+    dropped = sole_removable_pin("GASTOWN_BUILD_WORKFLOW_CONTRACTS", "mol-polecat-work")
+    for formula_name, fragments in gascity_pack_inference_gate.all_gastown_formula_contracts().items():
+        text = "\n".join(fragments)
+        if formula_name == "mol-polecat-work":
+            text = text.replace(dropped, "")
+        (formulas / f"{formula_name}.toml").write_text(text, encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError) as excinfo:
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
+
+    assert "GASTOWN_BUILD_WORKFLOW_CONTRACTS['mol-polecat-work']" in str(excinfo.value)
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(

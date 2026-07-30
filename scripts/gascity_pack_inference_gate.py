@@ -66,6 +66,25 @@ GASTOWN_REVIEW_TITLE = "Gastown orchestration gate: review leg"
 GASTOWN_REVIEW_ASSIGNMENT_TITLE = "Review Gastown orchestration gate fixture"
 SMOKE_TITLE_PREFIX = "RC model smoke"
 GASTOWN_ALWAYS_ON_AGENTS = ("mayor", "deacon", "boot", "witness")
+# The two dicts below pin literal text fragments that must appear in
+# `gastown/formulas/<formula>.toml`. They are the only check that a load-bearing
+# orchestration step still exists after a formula is rewritten.
+#
+# The pin is a TWO-WAY contract, and the second direction is the one that keeps
+# getting missed: editing a formula does not update the registry, and nothing in
+# the .toml says a fragment is pinned. A rewrite that drops a fragment therefore
+# passes every local check the editor thinks to run and fails at the gate
+# instead, costing a full reject + reclaim + re-implement cycle (gp-8h3, which
+# recorded two such instances: gp-0fz and gp-d5u).
+#
+# Three things exist to close that gap; keep all three working when you touch
+# this registry:
+#   1. Each pinned formula .toml opens with a comment naming this registry.
+#      Adding a formula here means adding that header there.
+#   2. `--list-formula-contracts` prints these fragments, so an editor can see
+#      the pins for a file BEFORE editing it.
+#   3. `validate_gastown_orchestration_contract` reports which dict holds each
+#      missing fragment and how to resolve it.
 GASTOWN_FORMULA_CONTRACTS = {
     "mol-review-leg": (
         "write the FULL report into the bead notes",
@@ -2609,12 +2628,77 @@ def require_gastown_review_report(bead: Mapping[str, Any]) -> None:
         )
 
 
+def gastown_contract_registries() -> tuple[tuple[str, Mapping[str, tuple[str, ...]]], ...]:
+    """The pinning registries, paired with the names an editor has to grep for.
+
+    Every consumer walks the registries through here so the union, the
+    `--list-formula-contracts` listing, and the drift error cannot disagree
+    about which dict owns a fragment.
+    """
+    return (
+        ("GASTOWN_FORMULA_CONTRACTS", GASTOWN_FORMULA_CONTRACTS),
+        ("GASTOWN_BUILD_WORKFLOW_CONTRACTS", GASTOWN_BUILD_WORKFLOW_CONTRACTS),
+    )
+
+
 def all_gastown_formula_contracts() -> dict[str, tuple[str, ...]]:
     contracts: dict[str, list[str]] = {}
-    for group in (GASTOWN_FORMULA_CONTRACTS, GASTOWN_BUILD_WORKFLOW_CONTRACTS):
+    for _registry_name, group in gastown_contract_registries():
         for formula_name, fragments in group.items():
             contracts.setdefault(formula_name, []).extend(fragments)
     return {formula_name: tuple(fragments) for formula_name, fragments in contracts.items()}
+
+
+def gastown_contract_registry_for(formula_name: str, fragment: str) -> str:
+    """Name of the dict that pins `fragment` for `formula_name`.
+
+    The drift error is only self-service if it names the exact dict to open;
+    the same fragment string can legitimately be pinned by either registry, so
+    report the first that claims it rather than guessing.
+    """
+    for registry_name, group in gastown_contract_registries():
+        if fragment in group.get(formula_name, ()):
+            return registry_name
+    return "GASTOWN_FORMULA_CONTRACTS"
+
+
+def gate_script_ref() -> str:
+    """Repo-relative path to this script, for messages that ask you to edit it."""
+    try:
+        return str(Path(__file__).resolve().relative_to(REPO_ROOT))
+    except ValueError:  # pragma: no cover - script relocated outside the repo
+        return Path(__file__).name
+
+
+def format_gastown_formula_contracts(formula_names: Sequence[str] | None = None) -> str:
+    """Render the pinned fragments so an editor can read them before editing.
+
+    This is the payoff for the pointer comment at the top of each pinned
+    formula: "which fragments does this file owe?" has to be answerable without
+    reading Python, or the pointer just relocates the search.
+    """
+    contracts = all_gastown_formula_contracts()
+    selected = list(formula_names) if formula_names else sorted(contracts)
+    unknown = [name for name in selected if name not in contracts]
+    if unknown:
+        known = ", ".join(sorted(contracts))
+        raise GateError(f"no pinned contract for formula(s) {', '.join(unknown)}; pinned formulas are: {known}")
+
+    lines: list[str] = []
+    for formula_name in selected:
+        lines.append(f"{formula_name} (gastown/formulas/{formula_name}.toml)")
+        for registry_name, group in gastown_contract_registries():
+            fragments = group.get(formula_name, ())
+            if not fragments:
+                continue
+            lines.append(f"  {registry_name}:")
+            lines.extend(f"    {fragment!r}" for fragment in fragments)
+        lines.append("")
+    lines.append(
+        f"Pinned in {gate_script_ref()}. These fragments must appear verbatim in the formula; "
+        "an edit that drops one fails the gastown-orchestration gate."
+    )
+    return "\n".join(lines)
 
 
 def validate_methodology_flow_contract(pack_spec: PackSpec) -> None:
@@ -2913,17 +2997,29 @@ def find_uncast_jq_metadata_booleans(pack_source: Path) -> list[str]:
 
 def validate_gastown_orchestration_contract(pack_source: Path) -> None:
     missing: list[str] = []
+    drifted_formulas: list[str] = []
     for formula_name, required_fragments in all_gastown_formula_contracts().items():
         path = pack_source / "formulas" / f"{formula_name}.toml"
         if not path.is_file():
             missing.append(f"{formula_name}: missing formula file {path}")
+            drifted_formulas.append(formula_name)
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for fragment in required_fragments:
             if fragment not in text:
-                missing.append(f"{formula_name}: missing contract fragment {fragment!r}")
+                registry_name = gastown_contract_registry_for(formula_name, fragment)
+                missing.append(
+                    f"{formula_name}: missing contract fragment {fragment!r}\n"
+                    f"    pinned by {registry_name}[{formula_name!r}] in {gate_script_ref()}"
+                )
+                drifted_formulas.append(formula_name)
     if missing:
-        raise GateError("Gastown orchestration contract drifted:\n" + "\n".join(f"- {item}" for item in missing))
+        raise GateError(
+            "Gastown orchestration contract drifted:\n"
+            + "\n".join(f"- {item}" for item in missing)
+            + "\n\n"
+            + gastown_contract_remediation(drifted_formulas)
+        )
 
     # Checked after the fragment pins, and reported separately, because it is a
     # different kind of failure: the pins catch a contract that was *removed*,
@@ -2941,6 +3037,36 @@ def validate_gastown_orchestration_contract(pack_source: Path) -> None:
             "Fix the reader, never the writer: normalizing on read keeps beads already "
             "parked in the wild with the boolean spelling parked."
         )
+
+
+def gastown_contract_remediation(drifted_formulas: Sequence[str]) -> str:
+    """The half of the drift error that tells you what to actually do.
+
+    Naming the missing fragment is not enough: nothing in the formula .toml says
+    a fragment is pinned, so an editor who hits this has no way to know the
+    registry exists, let alone which of the two remedies is correct. Spelling
+    out both -- and refusing to present pin-deletion as the easy one -- is what
+    keeps this from being rediscovered by rejection every time (gp-8h3).
+    """
+    listed = " ".join(dict.fromkeys(drifted_formulas)) or "<formula>"
+    return (
+        "These fragments are load-bearing orchestration contracts, pinned as literal text.\n"
+        "Editing a formula does NOT update the pin, and the .toml does not show it.\n"
+        "\n"
+        "Resolve ONE of two ways -- this is a judgement call, not a formality:\n"
+        "  1. The contract still holds and the edit dropped it by accident (the usual\n"
+        "     case): restore the exact fragment text in the formula.\n"
+        "  2. The contract genuinely changed because you replaced the mechanism it\n"
+        "     names: update the registry entry in the SAME commit, and say in the\n"
+        "     commit body what now carries the guarantee.\n"
+        f"     The registries live in {gate_script_ref()}.\n"
+        "\n"
+        "Do NOT delete a pin just to make this pass. An unexplained deletion removes the\n"
+        "only check that the orchestration step still exists.\n"
+        "\n"
+        "See every fragment pinned for these formulas:\n"
+        f"  python3 {gate_script_ref()} --list-formula-contracts {listed}"
+    )
 
 
 def stop_city(gc_bin: str, workspace: GateWorkspace, *, env: Mapping[str, str]) -> None:
@@ -3258,12 +3384,31 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip Ollama/Claude env validation; intended only with --setup-only",
     )
+    parser.add_argument(
+        "--list-formula-contracts",
+        nargs="*",
+        metavar="FORMULA",
+        help=(
+            "print the text fragments pinned in gastown/formulas/<formula>.toml and exit; "
+            "no argument lists every pinned formula. Run this BEFORE editing a formula."
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Listing the pins is a pure read of the registry: no city, no gc binary, no
+    # inference. Answer it before any gate setup so it stays runnable from a
+    # polecat worktree, which is exactly where someone is about to edit a formula.
+    if args.list_formula_contracts is not None:
+        try:
+            print(format_gastown_formula_contracts(args.list_formula_contracts))
+        except GateError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
     try:
         pack_names = expand_pack_selection(args.pack)
         if len(pack_names) > 1 and args.pack_source:
