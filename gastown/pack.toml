@@ -15,6 +15,15 @@
 #   rigs[].pack    → expands rig agents only (witness, refinery, polecat)
 #
 # Crew members are individually named and declared inline in city.toml.
+#
+# A [[named_session]] agent must NOT set pool-scaling keys
+# (max_active_sessions / min_active_sessions) in its agents/<name>/agent.toml.
+# The two encode opposed lifecycles: a named session survives empty-demand
+# windows, while max_active_sessions=1 makes a canonical singleton that drains
+# when scale_check returns 0. Named sessions are already singletons by name
+# (session "gastown__mayor", not "gastown__mayor-<id>"), so the cap buys
+# nothing and gc lint rejects the combination. Pool agents (polecat, dog) are
+# the inverse: they carry the scaling keys and no [[named_session]] entry.
 
 [pack]
 name = "gastown"

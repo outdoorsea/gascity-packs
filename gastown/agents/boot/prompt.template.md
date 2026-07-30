@@ -114,7 +114,7 @@ with a fresh provider context.
 | View deacon output | `{{ cmd }} session peek {{ .BindingPrefix }}deacon --lines 30` |
 | Check deacon work | `gc bd list --assignee={{ .BindingPrefix }}deacon --status=in_progress --json` |
 | Nudge deacon | `{{ cmd }} session nudge {{ .BindingPrefix }}deacon "message"` |
-| File stuck warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck warrant | `gc bd create --type=task --labels=warrant --metadata '{"target":"{{ .BindingPrefix }}deacon","reason":"...","requester":"boot","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
 | Check active sessions | `{{ cmd }} session list` |
 
 Working directory: {{ .WorkDir }}

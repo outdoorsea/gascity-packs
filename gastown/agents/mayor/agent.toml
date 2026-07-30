@@ -5,4 +5,3 @@ work_dir = ".gc/agents/mayor"
 # .remember/logs the remember plugin's hooks are dropped, not merely unlogged.
 pre_start = ["{{.ConfigDir}}/assets/scripts/remember-scaffold.sh --create {{.WorkDir}}"]
 idle_timeout = "1h"
-max_active_sessions = 1

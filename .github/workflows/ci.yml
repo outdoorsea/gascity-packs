@@ -50,7 +50,13 @@ jobs:
           for pack in gascity gascity/roles bmad compound-engineering gstack superpowers profiler; do
             "$GC_BIN" lint "$pack"
           done
-          GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py -q
+          # gastown is linted by test_gastown_lint_baseline.py rather than the loop
+          # above: `gc lint gastown` still exits 1 on findings that are defects in
+          # the linter's own flag model (see that test's WAIVED_BD_FLAGS for the
+          # per-flag evidence). The test gates the pack against regression and
+          # fails on anything outside that waiver set, so do NOT move gastown into
+          # the loop until the waivers are gone -- it would wedge CI on known bugs.
+          GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py tests/test_gastown_lint_baseline.py -q
 
       - name: Run Gastown shell tests
         run: |

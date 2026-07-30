@@ -4,4 +4,3 @@ work_dir = ".gc/agents/boot"
 # Plain work_dir, not a worktree, so nothing else scaffolds it: without
 # .remember/logs the remember plugin's hooks are dropped, not merely unlogged.
 pre_start = ["{{.ConfigDir}}/assets/scripts/remember-scaffold.sh --create {{.WorkDir}}"]
-max_active_sessions = 1

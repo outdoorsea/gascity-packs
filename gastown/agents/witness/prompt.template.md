@@ -399,7 +399,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
 | Delete worktree | `git worktree remove <path> --force` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |
-| File stuck-agent warrant | `gc bd create --type=task --label=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
+| File stuck-agent warrant | `gc bd create --type=task --labels=warrant --metadata '{"target":"<session>","reason":"<reason>","requester":"witness","gc.routed_to":"{{ .BindingPrefix }}dog"}'` |
 | Find parked sessions | `gc gastown parked-check` (never a path under `$GC_PACK_DIR` — unset in your shell) |
 | Recover a parked session | `gc session reset <session-id-or-alias>` (clean worktree first; never a warrant, never drain) |
 | List landed worktrees | `gc gastown worktree-reap` (report only; never a path under `$GC_PACK_DIR` — unset in your shell) |

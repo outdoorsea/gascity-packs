@@ -13,4 +13,3 @@ idle_timeout = "1h"
 # on idle: a mid-turn witness is left alone until it settles. See gascity#2025.
 max_session_age = "5h"
 max_session_age_jitter = "15m"
-max_active_sessions = 1

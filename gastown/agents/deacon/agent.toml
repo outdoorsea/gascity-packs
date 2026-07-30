@@ -6,4 +6,3 @@ nudge = "Run 'gc prime' to check patrol status and begin heartbeat cycle."
 # .remember/logs the remember plugin's hooks are dropped, not merely unlogged.
 pre_start = ["{{.ConfigDir}}/assets/scripts/remember-scaffold.sh --create {{.WorkDir}}"]
 idle_timeout = "1h"
-max_active_sessions = 1
