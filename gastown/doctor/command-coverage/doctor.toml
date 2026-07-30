@@ -1,0 +1,9 @@
+description = 'every pack subcommand invoked by a materialized prompt or formula actually exists in the city pin that supplies the command namespace, so no agent fails closed on an unknown command'
+
+# No `fix` key, and deliberately no sibling fix.sh — a sibling fix.sh is
+# auto-discovered and would opt this check into `--fix`. The remedy for a
+# cross-pin gap is to move one of the two pins so the pair agrees, then
+# reinstall and reload. Which pin should move is a versioning decision (advance
+# the city pin, or roll the rig pins back to match it), and picking one
+# unattended would change which code every agent in the city runs. Same
+# reasoning as the sibling import-drift and pin-materialization checks.

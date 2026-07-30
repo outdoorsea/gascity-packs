@@ -1,0 +1,9 @@
+description = 'the pin this city DECLARES for the pack is the pin actually materialized and wired up, cloned from the declared remote, and on the mainline of the branch it claims to come from'
+
+# No `fix` key, and deliberately no sibling fix.sh — a sibling fix.sh is
+# auto-discovered and would opt this check into `--fix` without any manifest
+# change. Every failure this check reports is a versioning decision with a
+# restart attached: re-pointing an import, re-running `gc import install`, and
+# `gc reload`. Repairing that behind an operator's back is how a city silently
+# changes which code its agents run, which is the class of failure this check
+# exists to make loud. Same reasoning as the sibling import-drift check.
