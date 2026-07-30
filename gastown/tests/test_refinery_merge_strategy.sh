@@ -20,7 +20,14 @@
 #      and a gh query that gh REJECTS is loud rather than silently downgraded
 #      to "no API". The field names themselves are pinned against the real gh
 #      binary in test_gh_json_fields.sh; a fixture cannot catch a rename.
-#   6. The awaiting_merge park/skip contract, INCLUDING the stored value's type.
+#   6. Protection is probed against the repo the refinery PUSHES TO -- origin --
+#      and not against whatever `gh repo view` calls the current repo. On a fork
+#      those differ: gh reports the PARENT, so a protected upstream silently
+#      turned an unprotected origin into pr-merge and then had the direct path
+#      refuse the push too. The fixture makes the two repos disagree, so a probe
+#      that reads the wrong one gets the wrong verdict rather than the right one
+#      by luck.
+#   7. The awaiting_merge park/skip contract, INCLUDING the stored value's type.
 #      `--set-metadata awaiting_merge=true` stores a JSON boolean, and a
 #      type-strict jq compare against the string "true" silently kept the parked
 #      bead -- livelocking the queue and force-pushing over a published PR. The
@@ -121,6 +128,13 @@ SH
 #
 #   GH_PROTECTION_JSON  body for repos/*/branches/*/protection; unset => 404
 #   GH_PROTECTED_FLAG   .protected for repos/*/branches/*; unset => failure
+#   GH_REPO             what `gh repo view` claims the current repo is. On a
+#                       fork that is the PARENT, not origin -- which is why
+#                       nothing may resolve repo IDENTITY through it.
+#   GH_FORK_PARENT      repo that answers with the GH_PARENT_* values below
+#                       instead of the GH_PROTEC* ones; unset => no such repo
+#   GH_PARENT_PROTECTION_JSON  /protection body for GH_FORK_PARENT; unset => 404
+#   GH_PARENT_PROTECTED_FLAG   .protected for GH_FORK_PARENT; unset => failure
 #   GH_WATCH_EXIT       exit status of `gh pr checks --watch`
 #   GH_CHECKS_JSON      stdout of `gh pr checks --json ...`
 #   GH_CHECKS_ERR       stderr of the same
@@ -142,6 +156,24 @@ case "$1" in
         exit 0
         ;;
     api)
+        # The fork parent, when a test declares one, answers DIFFERENTLY from
+        # every other repo. That asymmetry is the whole point: it is what makes
+        # "which repo did the probe ask about?" observable in the verdict itself,
+        # so a probe pointed at the parent cannot reach the right answer by luck.
+        if [ -n "${GH_FORK_PARENT:-}" ]; then
+            case "$2" in
+                "repos/$GH_FORK_PARENT/"*/protection)
+                    [ -n "${GH_PARENT_PROTECTION_JSON:-}" ] || exit 1
+                    printf '%s\n' "$GH_PARENT_PROTECTION_JSON"
+                    exit 0
+                    ;;
+                "repos/$GH_FORK_PARENT/"*)
+                    [ -n "${GH_PARENT_PROTECTED_FLAG:-}" ] || exit 1
+                    printf '%s\n' "$GH_PARENT_PROTECTED_FLAG"
+                    exit 0
+                    ;;
+            esac
+        fi
         case "$2" in
             */protection)
                 [ -n "${GH_PROTECTION_JSON:-}" ] || exit 1
@@ -185,7 +217,14 @@ SH
 }
 
 # Fresh sandbox: stub bin on PATH, a bead whose metadata the test can shape,
-# and an empty mutation log.
+# an empty mutation log, and a git repo whose `origin` is the repo under test.
+# $1 overrides the origin URL (default: the ordinary non-fork case).
+#
+# That repo is load-bearing, not scenery. The formula resolves ORIGIN_REPO with
+# `git remote get-url origin`, so a block run anywhere else would read the
+# remote of whatever checkout the suite happens to be invoked from -- passing or
+# failing on the contributor's own fork rather than on the formula. Every test
+# that runs a block touching ORIGIN_REPO runs it inside $SANDBOX_REPO.
 new_sandbox() {
     SANDBOX=$(mktemp -d)
     BIN="$SANDBOX/bin"
@@ -195,6 +234,11 @@ new_sandbox() {
     GC_LOG="$SANDBOX/gc.log"
     : >"$GC_LOG"
     GC_BEAD_JSON="$SANDBOX/bead.json"
+    SANDBOX_REPO="$SANDBOX/repo"
+    mkdir -p "$SANDBOX_REPO"
+    git -C "$SANDBOX_REPO" init -q >/dev/null 2>&1
+    git -C "$SANDBOX_REPO" remote add origin \
+        "${1:-https://github.com/acme/widgets.git}"
     # Pin the rig so assertions do not depend on the ambient GC_RIG of whoever
     # runs the suite.
     GC_RIG=testrig
@@ -202,7 +246,8 @@ new_sandbox() {
     # Unset per-scenario knobs so a previous test cannot leak into the next.
     unset GH_PROTECTION_JSON GH_PROTECTED_FLAG GH_WATCH_EXIT \
         GH_CHECKS_JSON GH_CHECKS_ERR GH_CHECKS_EXIT GH_PR_VIEW_JSON \
-        GH_PR_VIEW_ERR GH_PR_VIEW_EXIT GC_LIST_AWAITING GC_LIST_WORK
+        GH_PR_VIEW_ERR GH_PR_VIEW_EXIT GC_LIST_AWAITING GC_LIST_WORK \
+        GH_REPO GH_FORK_PARENT GH_PARENT_PROTECTION_JSON GH_PARENT_PROTECTED_FLAG
 }
 
 # Bead with the given merge_strategy ("" = unset, i.e. let the formula decide).
@@ -215,13 +260,14 @@ write_bead() {
 JSON
 }
 
-# Run the strategy-resolution block and report what it decided.
+# Run the strategy-resolution block and report what it decided. Runs inside the
+# sandbox repo because the block resolves ORIGIN_REPO from origin.
 resolve_strategy() {
     extract_block 'probe_target_protection "$TARGET"' >"$SANDBOX/resolve.sh"
-    PATH="$BIN:$PATH" WORK=bd-1 bash -c \
-        'set -u; . "$1/resolve.sh"; printf "strategy=%s protected=%s pr_mode=%s\n" \
-            "$MERGE_STRATEGY" "$TARGET_PROTECTED" "$PR_MODE"' \
-        _ "$SANDBOX"
+    (cd "$SANDBOX_REPO" && PATH="$BIN:$PATH" WORK=bd-1 bash -c \
+        'set -u; . "$1/resolve.sh"; printf "strategy=%s protected=%s pr_mode=%s repo=%s\n" \
+            "$MERGE_STRATEGY" "$TARGET_PROTECTED" "$PR_MODE" "$ORIGIN_REPO"' \
+        _ "$SANDBOX")
 }
 
 test_protected_target_never_resolves_to_direct() {
@@ -284,6 +330,74 @@ test_unprotected_target_keeps_direct() {
     esac
 }
 
+test_protection_is_probed_against_origin_not_the_fork_parent() {
+    # Measured on rig gascity-packs: origin is outdoorsea/gascity-packs (a fork,
+    # and the only repo this refinery ever pushes to) while `gh repo view`
+    # reports gastownhall/gascity-packs, whose main IS protected. Resolving
+    # identity through gh therefore probed a branch in a repo the refinery never
+    # writes to, and the wrong answer was silent in three places at once:
+    # merge_strategy flipped to pr-merge, the direct path's own guard refused
+    # the push it was about to make, and any PR opened was scoped to the wrong
+    # repository. A refinery following the formula literally could not land work.
+    #
+    # The two repos disagree here on purpose. A probe that reads the parent gets
+    # protected=true and resolves pr-merge, so this test fails against the
+    # gh-resolved identity rather than passing on it by coincidence.
+    new_sandbox https://github.com/outdoorsea/gascity-packs.git
+    write_bead ""
+    export GH_REPO=gastownhall/gascity-packs
+    export GH_FORK_PARENT=gastownhall/gascity-packs
+    # Faithful to the measured asymmetry: the parent 404s on /protection for a
+    # non-admin token yet reports .protected=true, while the fork genuinely is
+    # unprotected. Both arrive as a 404 on /protection -- only the repo differs.
+    export GH_PARENT_PROTECTED_FLAG=true
+    export GH_PROTECTED_FLAG=false
+
+    result=$(resolve_strategy)
+    case "$result" in
+        *"strategy=direct"*"protected=false"*"repo=outdoorsea/gascity-packs"*) : ;;
+        *) fail "protection must be read from origin, the push target, not the fork parent, got: $result" ;;
+    esac
+
+    # Behaviour pinned above; this pins the mechanism, so a future rewrite that
+    # reaches the right verdict by some other route still cannot start probing
+    # the wrong repository.
+    grep -q "gh api repos/outdoorsea/gascity-packs/branches/main" "$GC_LOG" ||
+        fail "the protection probe must name origin, log: $(cat "$GC_LOG")"
+    ! grep -q "gastownhall/gascity-packs" "$GC_LOG" ||
+        fail "no API call may name the fork parent, log: $(cat "$GC_LOG")"
+    # gh stays available for API calls; what it must never do again is answer
+    # the question "which repo is this?".
+    ! grep -q "^gh repo" "$GC_LOG" ||
+        fail "repo identity must come from git remote, not gh repo view, log: $(cat "$GC_LOG")"
+}
+
+test_non_github_origin_is_reported_rather_than_guessed() {
+    # The REST fallback hardcodes api.github.com and every PR-URL parser in this
+    # step matches on github.com, so a non-github origin has nowhere to go. It
+    # has to surface as a NAMED error and a hard stop -- an unresolved origin
+    # that merely failed closed to pr-merge would be indistinguishable from a
+    # transient API problem, and would retry against nothing forever.
+    new_sandbox https://gitlab.com/acme/widgets.git
+    write_bead ""
+    export GH_PROTECTED_FLAG=false
+
+    status=0
+    result=$(resolve_strategy) || status=$?
+    [ "$status" -ne 0 ] ||
+        fail "an unusable origin must stop, not proceed, got: $result"
+    case "$result" in
+        *"Only github.com origin remotes are supported"*"gitlab.com/acme/widgets"*) : ;;
+        *) fail "the stop must name the origin it could not use, got: $result" ;;
+    esac
+    # No probe fired, and -- the load-bearing half -- no bead state was touched
+    # on the way out.
+    ! grep -q "gh api" "$GC_LOG" ||
+        fail "an unresolved origin must not be probed, log: $(cat "$GC_LOG")"
+    ! grep -q "gc bd" "$GC_LOG" ||
+        fail "an unresolved origin must not mutate the bead, log: $(cat "$GC_LOG")"
+}
+
 # A PATH on which gh genuinely does not exist. Deleting the stub is not enough
 # -- a real gh lives in /opt/homebrew/bin on macOS and /usr/bin on CI -- so
 # build an allow-list of just the tools the block needs and nothing else.
@@ -307,19 +421,21 @@ test_missing_gh_preserves_legacy_direct_default() {
     new_sandbox
     write_bead ""
     ghfree=$(make_gh_free_path)
-    # Real git remote, so the no-gh origin-URL fallback has something to parse.
-    # That fallback never runs while gh is present.
-    repo="$SANDBOX/repo"
-    mkdir -p "$repo"
-    git -C "$repo" init -q
-    git -C "$repo" remote add origin https://github.com/acme/widgets.git
     extract_block 'probe_target_protection "$TARGET"' >"$SANDBOX/resolve.sh"
-    result=$(cd "$repo" && PATH="$ghfree" WORK=bd-1 bash -c \
-        'set -u; . "$1/resolve.sh"; printf "strategy=%s protected=%s\n" \
-            "$MERGE_STRATEGY" "$TARGET_PROTECTED"' _ "$SANDBOX")
+    result=$(cd "$SANDBOX_REPO" && PATH="$ghfree" WORK=bd-1 bash -c \
+        'set -u; . "$1/resolve.sh"; printf "strategy=%s protected=%s repo=%s\n" \
+            "$MERGE_STRATEGY" "$TARGET_PROTECTED" "$ORIGIN_REPO"' _ "$SANDBOX")
     case "$result" in
         *"strategy=direct"*"protected=unknown_no_gh"*) : ;;
         *) fail "absent gh should keep the legacy direct default, got: $result" ;;
+    esac
+
+    # Identity still resolves with gh gone, because it never came from gh. This
+    # used to be a separate no-gh-only fallback; the gh and no-gh paths can no
+    # longer disagree about which repo they mean, because there is only one path.
+    case "$result" in
+        *"repo=acme/widgets"*) : ;;
+        *) fail "origin repo must resolve from git with no gh present, got: $result" ;;
     esac
 }
 
@@ -395,9 +511,9 @@ test_direct_push_still_lands_on_unprotected_target() {
 run_checks_block() {
     extract_block 'probe_target_protection "$TARGET"' >"$SANDBOX/resolve.sh"
     extract_block 'CHECKS_VERDICT' >"$SANDBOX/checks.sh"
-    PATH="$BIN:$PATH" WORK=bd-1 PR_NUMBER=42 \
+    (cd "$SANDBOX_REPO" && PATH="$BIN:$PATH" WORK=bd-1 PR_NUMBER=42 \
         PR_URL=https://github.com/acme/widgets/pull/42 \
-        bash -c 'set -u; . "$1/resolve.sh"; . "$1/checks.sh"' _ "$SANDBOX" \
+        bash -c 'set -u; . "$1/resolve.sh"; . "$1/checks.sh"' _ "$SANDBOX") \
         >"$SANDBOX/checks.out" 2>&1
 }
 
@@ -963,6 +1079,8 @@ test_real_park_path_writes_a_flag_the_selector_excludes() {
 
 test_protected_target_never_resolves_to_direct
 test_unprotected_target_keeps_direct
+test_protection_is_probed_against_origin_not_the_fork_parent
+test_non_github_origin_is_reported_rather_than_guessed
 test_missing_gh_preserves_legacy_direct_default
 test_direct_push_guard_refuses_protected_target
 test_direct_push_still_lands_on_unprotected_target

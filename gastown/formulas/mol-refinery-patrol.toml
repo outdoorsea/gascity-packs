@@ -911,24 +911,39 @@ BRANCH=$(gc bd show $WORK --json | jq -r '.[0].metadata.branch')
 TARGET=$(gc bd show $WORK --json | jq -r '.[0].metadata.target // "{{target_branch}}"')
 MERGE_STRATEGY=$(gc bd show $WORK --json | jq -r '.[0].metadata.merge_strategy // empty')
 EXISTING_PR=$(gc bd show $WORK --json | jq -r '.[0].metadata.existing_pr // empty')
+# ORIGIN_REPO is the repo this refinery PUSHES TO, so it has to be read off the
+# origin remote itself. `gh repo view` answers a different question -- on a fork
+# it reports the PARENT -- and every probe below then reads branch protection in
+# a repo the refinery never writes to. That misread is silent and it is total: a
+# protected upstream turns an unprotected origin into merge_strategy=pr-merge,
+# the direct path's own second guard refuses the very push it was about to make,
+# and any PR the pr-merge path opens is scoped to the wrong repository.
+#
+# So resolve identity from git and use gh only to CALL the API. `gh api` takes an
+# explicit repos/<owner>/<name>/... path, so nothing here needs gh to work out
+# which repo it is talking about. Both the gh and no-gh paths now agree, because
+# there is only one path.
+#
+# github.com only, deliberately: the REST fallback hardcodes api.github.com and
+# every PR-URL parser in this step matches on github.com, so a GHE origin has
+# nowhere to go and should say so here rather than fail later and further away.
+ORIGIN_REPO=""
 ORIGIN_REPO_ERROR=""
-if command -v gh >/dev/null 2>&1; then
-  if ! ORIGIN_REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>&1); then
-    ORIGIN_REPO_ERROR="gh repo view failed while resolving origin repository: $ORIGIN_REPO"
-    ORIGIN_REPO=""
-  fi
-else
-  ORIGIN_URL=$(git remote get-url origin)
-  case "$ORIGIN_URL" in
-    git@github.com:*|https://github.com/*)
-      ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
-        | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\\.git$##')
-      ;;
-    *)
-      ORIGIN_REPO_ERROR="GitHub REST fallback supports only github.com origin remotes; install gh for $ORIGIN_URL."
-      ;;
-  esac
+if ! ORIGIN_URL=$(git remote get-url origin 2>&1); then
+  ORIGIN_REPO_ERROR="Could not resolve origin repository: git remote get-url origin failed: $ORIGIN_URL"
+  ORIGIN_URL=""
 fi
+case "$ORIGIN_URL" in
+  "")
+    ;;
+  git@github.com:*|https://github.com/*|ssh://git@github.com/*)
+    ORIGIN_REPO=$(printf '%s\n' "$ORIGIN_URL" \
+      | sed -E 's#^ssh://git@github.com/##; s#^git@github.com:##; s#^https://github.com/##; s#\\.git$##; s#/+$##')
+    ;;
+  *)
+    ORIGIN_REPO_ERROR="Only github.com origin remotes are supported; origin is $ORIGIN_URL."
+    ;;
+esac
 case "$MERGE_STRATEGY" in
   pr) MERGE_STRATEGY="mr" ;;
   pr_merge|pr-land) MERGE_STRATEGY="pr-merge" ;;
