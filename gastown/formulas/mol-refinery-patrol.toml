@@ -519,6 +519,13 @@ alternative operator, so it falls through on `false` as well as `null`. A
 boolean `false` therefore collapses to `""` before `tostring` runs, and the
 bead is correctly treated as not parked.
 
+This is a class, not a rule about these two lines: any in-jq comparison of a
+metadata field against a quoted `"true"`/`"false"` has the same defect.
+`scripts/gascity_pack_inference_gate.py` scans every formula and agent prompt in
+the pack for that shape and fails the gate on an un-cast read, so a *new*
+filter cannot ship inert the way `awaiting_merge` did (gp-dc0). Adding one is
+fine — write the `tostring` cast and the gate stays quiet.
+
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
 database. Without it, `gc bd list` routes to the HQ database and never
 sees rig-scoped work beads — the `assignee` field alone does not route

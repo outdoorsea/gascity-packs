@@ -1084,6 +1084,57 @@ def test_validate_gastown_orchestration_contract_rejects_missing_refinery_false_
         gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
 
 
+def test_current_gastown_pack_casts_every_in_jq_metadata_boolean() -> None:
+    # The sweep half of gp-dc0: `awaiting_merge` was the reported site, but the
+    # defect is a class. Assert the whole pack is clean, not just that one query.
+    assert (
+        gascity_pack_inference_gate.find_uncast_jq_metadata_booleans(
+            gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+        )
+        == []
+    )
+
+
+def test_uncast_jq_metadata_boolean_detector_does_not_flag_correct_forms() -> None:
+    # A scanner that cries wolf gets weakened until it is useless, so pin the
+    # shapes it must stay quiet on. Each of these is already correct: the cast
+    # form, the server-side flag that coerces natively, a shell comparison
+    # against a value `jq -r` already rendered, and a genuinely string-valued
+    # metadata field that has nothing to do with booleans.
+    quiet = (
+        'select(((.metadata.awaiting_merge // "") | tostring) != "true")',
+        'select(((.metadata["branch_ready"] // "") | tostring) != "true")',
+        "--metadata-field=no_code_change=true",
+        'if [ "$AW_STALE" != "true" ]; then',
+        'select((.metadata["halt_reason"] // "") != "auto_push_false")',
+    )
+    for line in quiet:
+        match = gascity_pack_inference_gate.JQ_METADATA_BOOLEAN_COMPARISON.search(line)
+        assert match is None or "tostring" in match.group("between"), line
+
+
+def test_validate_gastown_orchestration_contract_rejects_uncast_jq_metadata_boolean(tmp_path) -> None:
+    # Deliberately a *new* filter rather than a mutation of a pinned one: the
+    # fragment pins already defend the three known call sites and would fire
+    # first, so mutating one would prove nothing about the class. This is the
+    # case the pins structurally cannot reach — an un-normalized read nobody
+    # pinned, which is how the original defect shipped green.
+    formulas = tmp_path / "gastown" / "formulas"
+    formulas.mkdir(parents=True)
+    for formula_name, fragments in gascity_pack_inference_gate.all_gastown_formula_contracts().items():
+        text = "\n".join(fragments)
+        if formula_name == "mol-refinery-patrol":
+            text += (
+                "\nPARKED=$(gc bd list --json | jq -r "
+                "'[.[] | select((.metadata.human_review_required // \"\") != \"true\")][0].id // empty')\n"
+            )
+        (formulas / f"{formula_name}.toml").write_text(text, encoding="utf-8")
+
+    with pytest.raises(gascity_pack_inference_gate.GateError, match="tostring") as excinfo:
+        gascity_pack_inference_gate.validate_gastown_orchestration_contract(tmp_path / "gastown")
+    assert "human_review_required" in str(excinfo.value)
+
+
 def test_validate_methodology_flow_contracts_accept_current_packs() -> None:
     for pack_name in gascity_pack_inference_gate.METHODOLOGY_PACKS:
         gascity_pack_inference_gate.validate_methodology_flow_contract(

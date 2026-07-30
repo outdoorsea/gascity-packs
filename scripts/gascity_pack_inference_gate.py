@@ -201,6 +201,42 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "gc bd dep add",
     ),
 }
+# `--set-metadata k=true` stores a JSON *boolean*, but jq's `!=`/`==` are
+# type-strict: `true != "true"` is TRUE. An in-jq comparison of a metadata field
+# against the string "true" therefore matches nothing, and the filter goes on
+# reading as load-bearing while doing exactly nothing. That is not hypothetical —
+# it is how the refinery's `awaiting_merge` exclusion shipped inert (gp-d5u),
+# livelocking the merge queue behind one parked PR and force-pushing over it on
+# every patrol.
+#
+# The fragment pins in GASTOWN_BUILD_WORKFLOW_CONTRACTS above cover two of the
+# three live call sites (`awaiting_merge` and `no_code_change` in
+# mol-refinery-patrol); the third, `branch_ready` in mol-witness-patrol, is
+# pinned by nothing. That gap is the general case, not an oversight: a pin only
+# ever defends the line it quotes, so the *next* un-normalized read ships green
+# no matter how diligently the last one was pinned. This pattern closes the
+# class instead: it
+# matches a `.metadata` access compared against a quoted "true"/"false" on the
+# same line, capturing the text between the access and the comparison so the
+# check can require a `tostring` cast in that span — which is exactly where the
+# correct form `((.metadata.k // "") | tostring) != "true"` puts it.
+#
+# Deliberately quiet on the three shapes that are already correct, so the gate
+# stays silent until something is genuinely wrong:
+#   - `--metadata-field=k=true`  — a server-side CLI filter that coerces natively
+#   - `[ "$VAR" = "true" ]`      — shell, where `jq -r` already rendered the bool
+#   - `.metadata.halt_reason != "auto_push_false"` — a genuinely string-valued field
+# Single-line by construction (`[^\n]`): every real call site is written on one
+# line, and bounding the span is what keeps an unrelated `.metadata` read far
+# above a comparison from producing a false positive.
+JQ_METADATA_BOOLEAN_COMPARISON = re.compile(
+    r"""\.metadata
+        (?:\.[A-Za-z_][A-Za-z0-9_.]*|\[\s*"[^"]+"\s*\])
+        (?P<between>[^\n]{0,80}?)
+        (?:!=|==)\s*"(?:true|false)"
+    """,
+    re.VERBOSE,
+)
 METHODOLOGY_FLOW_CONTRACTS = {
     "superpowers": {
         "review_expansion": "superpowers-code-review",
@@ -2851,6 +2887,30 @@ def list_values(value: Any) -> list[Any]:
     return [value]
 
 
+def find_uncast_jq_metadata_booleans(pack_source: Path) -> list[str]:
+    """Report in-jq metadata comparisons against "true"/"false" that skip `tostring`.
+
+    Scans every formula and agent prompt in the pack rather than only the
+    contracted call sites: the failure this prevents is a *new* filter, and a new
+    filter is by definition not yet pinned. Returns `path:line: source` strings so
+    the caller can name each offender precisely.
+    """
+    findings: list[str] = []
+    targets = sorted(pack_source.glob("formulas/*.toml")) + sorted(pack_source.glob("agents/**/*.md"))
+    for path in targets:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for lineno, line in enumerate(text.splitlines(), 1):
+            for match in JQ_METADATA_BOOLEAN_COMPARISON.finditer(line):
+                if "tostring" in match.group("between"):
+                    continue
+                try:
+                    label = path.relative_to(pack_source)
+                except ValueError:  # pragma: no cover - defensive
+                    label = path
+                findings.append(f"{label}:{lineno}: {match.group(0).strip()}")
+    return findings
+
+
 def validate_gastown_orchestration_contract(pack_source: Path) -> None:
     missing: list[str] = []
     for formula_name, required_fragments in all_gastown_formula_contracts().items():
@@ -2864,6 +2924,23 @@ def validate_gastown_orchestration_contract(pack_source: Path) -> None:
                 missing.append(f"{formula_name}: missing contract fragment {fragment!r}")
     if missing:
         raise GateError("Gastown orchestration contract drifted:\n" + "\n".join(f"- {item}" for item in missing))
+
+    # Checked after the fragment pins, and reported separately, because it is a
+    # different kind of failure: the pins catch a contract that was *removed*,
+    # this catches one that is present, reads correctly, and silently matches
+    # nothing. Both halves of the park/skip contract have to hold.
+    uncast = find_uncast_jq_metadata_booleans(pack_source)
+    if uncast:
+        raise GateError(
+            "Gastown formulas compare a metadata field against a quoted boolean in jq "
+            "without a `tostring` cast. `--set-metadata k=true` stores a JSON boolean and "
+            'jq evaluates `true != "true"` as TRUE, so each of these filters matches nothing '
+            "while reading as load-bearing:\n"
+            + "\n".join(f"- {item}" for item in uncast)
+            + '\n\nWrite `select(((.metadata.KEY // "") | tostring) != "true")` instead. '
+            "Fix the reader, never the writer: normalizing on read keeps beads already "
+            "parked in the wild with the boolean spelling parked."
+        )
 
 
 def stop_city(gc_bin: str, workspace: GateWorkspace, *, env: Mapping[str, str]) -> None:
