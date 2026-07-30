@@ -1138,7 +1138,10 @@ def test_gastown_build_workflow_contract_covers_orchestration_roles() -> None:
     }
     assert "gc session wake \"$REFINERY_TARGET\"" in contracts["mol-polecat-work"]
     assert 'git worktree add --detach "$MERGE_WT" "origin/$TARGET"' in contracts["mol-refinery-patrol"]
-    assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"' in contracts["mol-refinery-patrol"]
+    # The close carries `$DEPLOY_NOTE`: a close proves the patch is an ancestor
+    # of the target and nothing about whether a city runs it, so the deployment
+    # verdict is pinned alongside the merge breadcrumb (gp-apx).
+    assert 'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT$DEPLOY_NOTE"' in contracts["mol-refinery-patrol"]
     # `mr` must NOT close on PR-open: it parks the bead at awaiting_merge and
     # find-work closes it only against a verified merge.
     assert "--set-metadata awaiting_merge=true" in contracts["mol-refinery-patrol"]

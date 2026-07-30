@@ -326,6 +326,13 @@ for AW in $(printf '%s' "$AWAITING" | jq -r '.[].id'); do
   # forensics and the close as one chained command so a closed bead can never
   # lack the merge breadcrumbs that prove why it closed.
   if [ -n "$AW_MERGED_AT" ]; then
+    # Deployment verdict, exactly as the merge-push closes do. `mr` is the one
+    # path whose commit can be imprecise: the PR's `mergeCommit.oid` names the
+    # fix, while the git-verified fallback records the tip of $AW_TARGET. A
+    # tip that has moved on can only over-report "not deployed", never
+    # under-report it, so the error direction keeps the bead visible rather
+    # than hiding it.
+    DEPLOY_NOTE=$(gc gastown deploy-check "${AW_MERGE_SHA:-unknown}" --stamp "$AW" 2>/dev/null || true)
     if gc bd update "$AW" \\
          --set-metadata merge_result=merged \\
          --set-metadata merged_target="$AW_TARGET" \\
@@ -335,7 +342,7 @@ for AW in $(printf '%s' "$AWAITING" | jq -r '.[].id'); do
          --unset-metadata awaiting_merge_since_epoch \\
          --unset-metadata awaiting_merge_stale \\
          --unset-metadata rejection_reason && \\
-       gc bd close "$AW" --reason "Merged to $AW_TARGET via PR ${AW_URL:-#$AW_PR} (verified at $AW_MERGED_AT)"; then
+       gc bd close "$AW" --reason "Merged to $AW_TARGET via PR ${AW_URL:-#$AW_PR} (verified at $AW_MERGED_AT)$DEPLOY_NOTE"; then
       echo "AWAITING_MERGE: $AW merged and closed (PR ${AW_URL:-#$AW_PR}, $AW_MERGED_AT)."
     else
       echo "AWAITING_MERGE: $AW is merged but the close did not land; bead stays open. A later patrol retries."
@@ -1184,12 +1191,13 @@ case "$ANCESTOR_STATUS" in
     if [ -n "$FORK_SHA" ] && [ "$REAL_COMMITS" -ge 1 ]; then
       ALREADY_SHA=$(git rev-parse "origin/$BRANCH")
       ALREADY_SHORT=$(git rev-parse --short "origin/$BRANCH")
+      DEPLOY_NOTE=$(gc gastown deploy-check "$ALREADY_SHA" --stamp "$WORK" 2>/dev/null || true)
       if gc bd update "$WORK" \
            --set-metadata merge_result=already_merged \
            --set-metadata merged_sha="$ALREADY_SHA" \
            --set-metadata merged_target="$TARGET" \
            --unset-metadata rejection_reason && \
-         gc bd close "$WORK" --reason "Already merged to $TARGET at $ALREADY_SHORT (branch is an ancestor of target; closed instead of halting)"; then
+         gc bd close "$WORK" --reason "Already merged to $TARGET at $ALREADY_SHORT (branch is an ancestor of target; closed instead of halting)$DEPLOY_NOTE"; then
         echo "ALREADY_MERGED: origin/$BRANCH is an ancestor of origin/$TARGET with $REAL_COMMITS commit(s) since fork — closed $WORK as merged. Skip the merge script; run Cleanup, then patrol-summary + next-iteration."
         exit 0
       fi
@@ -1317,12 +1325,14 @@ case "$CONTAINED_STATUS" in
     ;;
 esac
 
+DEPLOY_NOTE=$(gc gastown deploy-check "$MERGED_SHA" --stamp "$WORK" 2>/dev/null || true)
+
 gc bd update "$WORK" \
   --set-metadata merge_result=merged \
   --set-metadata merged_sha="$MERGED_SHA" \
   --set-metadata merged_target="$TARGET" \
   --unset-metadata rejection_reason && \
-gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"
+gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT$DEPLOY_NOTE"
 ```
 
 If the script exits non-zero: STOP. Debug and retry. Do NOT write merge
@@ -1333,6 +1343,33 @@ Both the `--set-metadata` write and the `gc bd close` are required —
 closed bead to its merge commit on `$TARGET`. `--unset-metadata
 rejection_reason` clears any stale rejection field from an earlier
 rejected/reworked attempt before the successful close.
+
+**`DEPLOY_NOTE` — closing asserts authorship, so state deployment separately.**
+
+A close proves the patch is an ancestor of `$TARGET`. It does NOT prove anyone
+RUNS it: a city reads a commit pinned in `packs.lock`, and advancing that pin is
+a separate act (`gc import install` + `gc reload`) that no close path performs or
+waits for. Three P1 pack fixes were closed while still live as bugs — gp-haf,
+gp-dlq and gp-px5 — and read exactly like the beads beside them that were
+genuinely fixed. `gc gastown deploy-check` records which one this is (gp-apx).
+
+The same one-line call precedes every close in this formula. Keep it that way:
+the deployment rule drifted into three independent copies once already, as
+gp-dlq's reconcile query did, which is why it lives in one tested place.
+
+- It NEVER blocks the close. The merge landed, and the refinery cannot advance a
+  pin, so refusing to close would jam the queue on every fix and fix nothing.
+- `|| true` is required, not defensive. A non-zero exit is a VERDICT (1 = not
+  deployed, 2 = undetermined, 3 = not applicable), and this block runs under
+  `set -euo pipefail`, where it would otherwise abort a landed merge.
+- `2>/dev/null` keeps the evidence lines out of `$DEPLOY_NOTE`; stdout carries
+  only the reason suffix, which is empty for an ordinary application rig.
+- Pass the commit that represents THE FIX, never the current tip of `$TARGET`. A
+  tip that has moved past the pin reports "not deployed" for a fix the pin
+  genuinely contains.
+
+The verdict also lands in `metadata.deploy_status`, so closed-but-undeployed work
+is queryable rather than only legible in the close reason.
 
 **2. Cleanup:**
 ```bash
@@ -1822,6 +1859,8 @@ if [ "$VERIFY_OK" != "true" ]; then
 fi
 
 MERGED_SHORT=$(git rev-parse --short "$POST_MERGE_SHA")
+DEPLOY_NOTE=$(gc gastown deploy-check "$POST_MERGE_SHA" --stamp "$WORK" 2>/dev/null || true)
+
 gc bd update $WORK \
   --set-metadata merge_result=merged \
   --set-metadata merged_sha="$POST_MERGE_SHA" \
@@ -1829,8 +1868,11 @@ gc bd update $WORK \
   --set-metadata pr_url="$PR_URL" \
   --set-metadata pr_number="$PR_NUMBER" \
   --unset-metadata rejection_reason && \
-gc bd close $WORK --reason "Merged to $TARGET at $MERGED_SHORT via PR #$PR_NUMBER: $PR_URL"
+gc bd close $WORK --reason "Merged to $TARGET at $MERGED_SHORT via PR #$PR_NUMBER: $PR_URL$DEPLOY_NOTE"
 ```
+
+`$DEPLOY_NOTE` carries the deployment verdict; see the `direct` path above for
+why a close cannot assert it and why `|| true` is mandatory here.
 
 If the verification script exits non-zero: STOP. Do NOT write merge
 metadata, close the bead, or delete the source branch.

@@ -699,8 +699,128 @@ test_wisp_reconcile_is_the_only_implementation() {
     done
 }
 
+test_every_close_states_whether_the_fix_is_deployed() {
+    # gp-apx: closing a pack bead asserts AUTHORSHIP — the patch is an ancestor of
+    # the target branch. It says nothing about DEPLOYMENT. A city runs a commit
+    # pinned in packs.lock, and advancing that pin is a separate act no close path
+    # performs or waits for. gp-haf, gp-dlq and gp-px5 were each closed while
+    # still live as bugs, and read exactly like the beads beside them that were
+    # genuinely fixed.
+    local formula check cmd
+    formula="$GASTOWN/formulas/mol-refinery-patrol.toml"
+    check="$GASTOWN/assets/scripts/deploy-check.sh"
+    cmd="$GASTOWN/commands/deploy-check/run.sh"
+
+    [[ -x "$check" ]] || fail "missing or non-executable assets/scripts/deploy-check.sh"
+    [[ -x "$cmd" ]] || fail "missing or non-executable commands/deploy-check/run.sh"
+    [[ -f "$GASTOWN/commands/deploy-check/help.md" ]] ||
+        fail "missing commands/deploy-check/help.md"
+
+    # Same wrapper contract as every other check in this pack: gc sets
+    # GC_PACK_DIR for pack COMMANDS and never in an agent's shell. Here it is
+    # doubly load-bearing — GC_PACK_DIR *is* the installed artifact the check
+    # reports on, so resolving it by hand would answer the deployment question
+    # against the wrong deployment.
+    grep -F 'gc gastown deploy-check' "$formula" >/dev/null ||
+        fail "the refinery patrol must invoke the check as 'gc gastown deploy-check'"
+    grep -F 'GC_PACK_DIR' "$cmd" >/dev/null ||
+        fail "commands/deploy-check/run.sh must resolve the check through GC_PACK_DIR"
+
+    # The load-bearing guard: EVERY close in this formula must state the
+    # deployment verdict. A close that forgets it is indistinguishable from a
+    # deployed one, which is the whole defect. Checked structurally rather than by
+    # counting, so a new close path added later cannot quietly skip it.
+    python3 - "$formula" <<'PY' || fail "see above"
+import re
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    doc = tomllib.load(handle)
+
+problems = []
+calls = 0
+closes = 0
+for step in doc.get("steps", []):
+    body = step.get("description", "")
+    sid = step.get("id", "?")
+
+    # Fold backslash continuations so a close whose --reason wraps across lines
+    # is still seen as one command. Three of these closes wrap.
+    folded = re.sub(r"\\\s*\n\s*", " ", body)
+
+    for line in folded.splitlines():
+        stripped = line.strip()
+
+        if "gc bd close" in stripped and "--reason" in stripped:
+            closes += 1
+            if "$DEPLOY_NOTE" not in stripped:
+                problems.append(
+                    f"{sid}: close without a deployment verdict: {stripped[:120]}"
+                )
+
+        if "gc gastown deploy-check" in stripped and "DEPLOY_NOTE=" in stripped:
+            calls += 1
+            # A non-zero exit is a VERDICT (1 not deployed, 2 undetermined,
+            # 3 not applicable), and the merge blocks run under
+            # `set -euo pipefail`. Without `|| true` the check would abort a
+            # close whose merge already landed — strictly worse than the
+            # missing field it was added to record.
+            if "|| true" not in stripped:
+                problems.append(
+                    f"{sid}: deploy-check call without '|| true'; a verdict would abort a landed merge: {stripped[:120]}"
+                )
+            # Evidence lines belong on stderr; only the reason suffix may reach
+            # $DEPLOY_NOTE or the close reason turns into a key=value dump.
+            if "2>/dev/null" not in stripped:
+                problems.append(
+                    f"{sid}: deploy-check call must send evidence to stderr with 2>/dev/null: {stripped[:120]}"
+                )
+            # The current tip of the target is NOT the fix. A tip that moved past
+            # the pin reports "not deployed" for a fix the pin genuinely
+            # contains, so the fix's own commit is what gets passed.
+            if 'deploy-check "$(git rev-parse' in stripped:
+                problems.append(
+                    f"{sid}: deploy-check must receive the fix's commit, not a freshly-resolved tip: {stripped[:120]}"
+                )
+
+if not closes:
+    problems.append("no 'gc bd close --reason' found at all; this guard would be vacuous")
+if calls != closes:
+    problems.append(f"{closes} close(s) but {calls} deploy-check call(s); every close needs its own")
+
+if problems:
+    print("\n".join(problems))
+    raise SystemExit(1)
+PY
+}
+
+test_deployment_verdict_is_documented_for_the_refinery() {
+    # The formula step is where the verdict is produced; the prompt is where a
+    # refinery reading its own role finds out what it means — including on a cycle
+    # where the check could not run. Same split as the parked-session remedy.
+    local prompt="$GASTOWN/agents/refinery/prompt.template.md"
+
+    grep -F 'gc gastown deploy-check' "$prompt" >/dev/null ||
+        fail "the refinery prompt must name the deployment check"
+    grep -F 'authored_not_deployed' "$prompt" >/dev/null ||
+        fail "the refinery prompt must name the authored-not-deployed verdict"
+    ! grep -F 'GC_PACK_DIR/assets/scripts/deploy' "$prompt" >/dev/null ||
+        fail "the prompt must not resolve the check via \$GC_PACK_DIR; it is unset in an agent shell"
+
+    # The two instructions most likely to be "improved" into bugs later: an
+    # undeployed bead must still CLOSE (refusing would jam the queue on every
+    # fix), and an unevaluable verdict must not read as healthy.
+    grep -F 'Still close the bead' "$prompt" >/dev/null ||
+        fail "the prompt must say an undeployed bead is still closed; blocking the close would jam the merge queue"
+    grep -F 'Treat as NOT deployed' "$prompt" >/dev/null ||
+        fail "the prompt must say an undetermined verdict is not deployed; a check that cannot run is not health"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
+test_every_close_states_whether_the_fix_is_deployed
+test_deployment_verdict_is_documented_for_the_refinery
 test_witness_salvage_reads_work_dir_metadata
 test_polecat_health_check_is_measured_not_improvised
 test_no_formula_step_executes_through_ambient_gc_pack_dir

@@ -301,6 +301,38 @@ distinguish a flag set by the filer at dispatch from one a polecat set on
 itself. Closing on the flag alone would hand every polecat a one-key escape from
 the false-completion guard, which is strictly worse than the halt it replaces.
 
+## Deployment Status on Close
+
+Closing asserts authorship, not deployment — so state deployment too.
+
+A close proves the patch is an ancestor of the target branch. It does NOT prove
+anyone RUNS it. A city reads a commit pinned in `packs.lock` and materialized
+into the pack cache; advancing that pin is a separate act (`gc import install`
++ `gc reload`) that you neither perform nor wait for. For a pack rig those are
+independent facts, and the ledger used to record only the first: gp-haf, gp-dlq
+and gp-px5 were each closed while still live as bugs, reading exactly like the
+beads beside them that were genuinely fixed (gp-apx).
+
+Every close in `merge-push` and in the `awaiting_merge` re-check therefore
+splices in `gc gastown deploy-check "<merged-sha>" --stamp "$WORK"`, which
+records `metadata.deploy_status` and appends the verdict to the close reason:
+
+- `deployed` — the pin contains the commit AND the installed artifact resolves
+  to that pin. Both are required: gp-9pa is the case where the pin carried the
+  fix while the copy agents loaded did not, so the bug stayed live.
+- `authored_not_deployed` — merged, provably not live. **Still close the bead.**
+  The merge landed and you cannot advance a pin, so refusing to close would jam
+  the queue on every fix and fix nothing. The mark is what keeps it visible.
+- `undetermined` — could not evaluate. Treat as NOT deployed, never as green.
+- `not_applicable` — this repo is nobody's pack source. Ordinary application
+  rigs land here and get no suffix; that silence is deliberate.
+
+Never hand-roll this verdict, and never resolve the script by path — the check
+reads `GC_PACK_DIR`, which `gc` sets only for pack commands, so a path spelled
+by hand would answer against the wrong deployment (the wiring that shipped four
+dead checks: gp-fid, gp-px5, gp-3qb). A non-zero exit is a VERDICT, not a
+failure; the call sites end in `|| true` so a landed merge always closes.
+
 ## Merge Strategy
 
 `metadata.merge_strategy` controls the terminal handoff:

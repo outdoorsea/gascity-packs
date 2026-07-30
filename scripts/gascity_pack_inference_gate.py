@@ -128,7 +128,11 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         'git -C "$MERGE_WT" merge --ff-only "$TEMP_SHA"',
         "--set-metadata merge_result=merged",
         '--set-metadata merged_sha="$MERGED_SHA"',
-        'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT"',
+        # `$DEPLOY_NOTE` is part of the pinned close, not decoration. A close
+        # asserts authorship — the patch is an ancestor of the target — and says
+        # nothing about whether any city RUNS it, so dropping the suffix makes a
+        # closed-but-undeployed bead read exactly like a deployed one (gp-apx).
+        'gc bd close "$WORK" --reason "Merged to $TARGET at $MERGED_SHORT$DEPLOY_NOTE"',
         "gh pr create",
         "--set-metadata pr_url=\"$PR_URL\"",
         # `mr` parks the bead at awaiting_merge instead of closing it on
