@@ -93,6 +93,41 @@ Work beads carry structured metadata for lifecycle tracking and handoff:
 | `rejection_reason` | refinery (on failure) | On reject | Why the merge was rejected |
 | `usage.*` | `gc gastown usage-stamp` (submit) | Late | Token spend joined from the runtime's usage sink |
 
+### Two namespaces, two scopes — do not collapse them
+
+The bead also carries `gc.`-prefixed keys written by gc core when it stamps your
+session. They look like duplicates of the fields above. They are not, and
+"normalizing" them onto one spelling breaks the refinery handoff:
+
+| key | scope | written by | example |
+|---|---|---|---|
+| `work_dir` | this BEAD's worktree | polecat, at branch-setup | `<home>/worktrees/gp-6k8` |
+| `gc.work_dir` | your AGENT's persistent home | gc core, at session stamp | `<city>/.gc/worktrees/<rig>/polecats/gastown.rictus` |
+| `branch` | this BEAD's feature branch — the refinery's merge target | polecat, at branch-setup | `polecat/gp-6k8` |
+| `gc.work_branch` | the base branch of the rig | gc core, at session stamp | `main` |
+
+`gc.work_dir` is the PARENT DIRECTORY of `work_dir`. `branch` and
+`gc.work_branch` name different branches, not one branch twice.
+
+Write only the unprefixed keys. The `gc.` namespace belongs to gc core — writing
+into it clobbers the session stamp the churn-watcher and witness recovery key on,
+and recording your per-bead branch as `gc.work_branch` would leave
+`metadata.branch` empty, so the refinery would have no merge target and the work
+would be silently stranded (gastownhall/gascity#2082).
+
+Two consequences when READING metadata — yours or another agent's:
+
+- **An absent `work_dir` is not an empty workspace.** It is the normal state
+  before branch-setup runs, and the edits are in the `gc.work_dir` agent home.
+  Check both scopes.
+- **`gc.work_branch` is not the branch checked out in `gc.work_dir`.** It records
+  the base branch, while an agent home sits on its own
+  `gc-<agent>-<sha>` branch. Read the branch from git, not from this field.
+
+Never assert "nothing is at risk on disk" from metadata alone. Metadata is a
+hint; the filesystem is the truth — verify with `git status --porcelain`,
+`git log origin/<base>..HEAD`, and `git stash list` in the directory itself.
+
 **On branch-setup:** You record `work_dir` and `branch` immediately.
 This enables crash recovery — the witness can find and salvage your work.
 

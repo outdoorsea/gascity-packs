@@ -87,7 +87,11 @@ bead metadata; do not use template-pattern or fixed-prefix matching.
 
 **Recovery follows the canonical chain.** Read `metadata.work_dir` and
 `metadata.branch` from the bead — polecats record both early in
-branch-setup. For each orphaned bead:
+branch-setup — AND `metadata.gc.work_dir`, the agent home workspace that gc
+core stamps. The two directory keys are different scopes, not two spellings:
+`gc.work_dir` is the persistent agent workspace and `work_dir` is the per-bead
+worktree inside it. A polecat that halted before branch-setup has only the
+former. For each orphaned bead:
 
 1. **Branch on origin** (`metadata.branch` exists, verified on remote) ->
    worktree disposable. Delete worktree, reset bead to pool.
@@ -100,7 +104,47 @@ branch-setup. For each orphaned bead:
 3. **Worktree exists, only uncommitted/untracked changes** ->
    same as above. All work is useful work — never discard.
 
-4. **No worktree, no branch on origin** -> nothing to salvage. Reset bead.
+4. **No directory in EITHER scope, no branch on origin** -> nothing to
+   salvage. Reset bead. Confirm with git in each directory the bead names
+   before you conclude this — see the rule below.
+
+**Never conclude "nothing is at risk on disk" from metadata alone.** Absent
+metadata is absent information, not evidence of an empty workspace, and the
+inference runs the wrong way: a missing `metadata.work_dir` is the NORMAL state
+for a polecat parked before branch-setup, whose edits are sitting in the
+`gc.work_dir` agent home. Escalating "no branch and no work_dir, so nothing was
+lost" on the unprefixed key alone is how live unpushed work gets discarded
+(gp-6k8). Verify against git in every directory the bead names:
+
+```bash
+gc bd show "$BEAD" --json | jq -r '
+  .[0].metadata
+  | [ (.work_dir // empty), (."gc.work_dir" // empty) ]
+  | map(select(. != "")) | unique | .[]' |
+while IFS= read -r D; do
+  [ -d "$D" ] || { echo "$D: absent"; continue; }
+  echo "--- $D (branch $(git -C "$D" branch --show-current 2>/dev/null || echo '?')) ---"
+  git -C "$D" status --porcelain      # uncommitted + untracked
+  git -C "$D" log --oneline origin/main..HEAD   # unpushed commits
+  git -C "$D" stash list              # stashed work
+done
+```
+
+Metadata is a hint; the filesystem is the truth. Report which directories you
+actually probed, so a reader can tell a verified-clean workspace from an
+unmeasured one. Read the checked-out branch from git too — never from
+`metadata.gc.work_branch`, which records the base branch (`main`) and not the
+branch in the directory.
+
+**Before reporting "no record of why it halted", read the whole metadata map.**
+The reason is often recorded under a key you did not check: `blocked_reason` and
+`halt_reason` empty does not mean unexplained, and in the gp-6k8 incident the
+full reasoning was in `metadata.refinery_verification` the entire time. Dump the
+map before asserting an absence:
+
+```bash
+gc bd show "$BEAD" --json | jq '.[0].metadata'
+```
 
 **"Reset to pool" always includes routing.** In every case above, after
 `gc workflow reopen-source` you must also set the pool target:
