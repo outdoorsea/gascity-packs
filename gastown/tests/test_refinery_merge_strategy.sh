@@ -20,6 +20,12 @@
 #      and a gh query that gh REJECTS is loud rather than silently downgraded
 #      to "no API". The field names themselves are pinned against the real gh
 #      binary in test_gh_json_fields.sh; a fixture cannot catch a rename.
+#   6. The awaiting_merge park/skip contract, INCLUDING the stored value's type.
+#      `--set-metadata awaiting_merge=true` stores a JSON boolean, and a
+#      type-strict jq compare against the string "true" silently kept the parked
+#      bead -- livelocking the queue and force-pushing over a published PR. The
+#      fixtures here therefore carry the real types, and one test parks through
+#      the real `gc bd` writer so no assertion rests on a believed type.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -509,18 +515,28 @@ test_no_required_checks_anywhere_proceeds() {
 # An `mr` bead already parked at awaiting_merge, as find-work will find it.
 # since_epoch/stale shape the staleness arithmetic; fork is the recorded fork
 # point the git-side predicate needs to tell "landed" from "empty branch".
+#
+# The JSON types here mirror what `--set-metadata` actually stores, which is NOT
+# all strings: `awaiting_merge=true` and `awaiting_merge_stale=true` land as
+# booleans, `pr_number=42` and `awaiting_merge_since_epoch=<epoch>` as numbers.
+# Keeping the fixture faithful is the point -- a stringified copy is what let a
+# type-strict jq compare on awaiting_merge pass here while the merge queue
+# livelocked in production. The recheck block survives the real types because it
+# lifts them out with `jq -r`, which renders a boolean as the bare text `true`
+# and a number as its digits before any shell test or arithmetic sees them; this
+# fixture is what proves that rather than assuming it.
 write_awaiting_bead() {
     aw_since="$1"
     aw_stale_field=""
-    [ -n "${2:-}" ] && aw_stale_field=",\"awaiting_merge_stale\":\"$2\""
+    [ -n "${2:-}" ] && aw_stale_field=",\"awaiting_merge_stale\":$2"
     aw_fork_field=""
     [ -n "${3:-}" ] && aw_fork_field=",\"fork_sha\":\"$3\""
     cat >"$GC_BEAD_JSON" <<JSON
 [{"id":"bd-1","title":"Fix the thing",
   "metadata":{"branch":"polecat/bd-1","target":"main","merge_strategy":"mr",
-    "awaiting_merge":"true","pr_number":"42",
+    "awaiting_merge":true,"pr_number":42,
     "pr_url":"https://github.com/acme/widgets/pull/42",
-    "awaiting_merge_since_epoch":"$aw_since"$aw_stale_field$aw_fork_field}}]
+    "awaiting_merge_since_epoch":$aw_since$aw_stale_field$aw_fork_field}}]
 JSON
     GC_LIST_AWAITING="$SANDBOX/awaiting.json"
     printf '[{"id":"bd-1"}]\n' >"$GC_LIST_AWAITING"
@@ -810,31 +826,139 @@ test_recheck_escalates_a_stale_pr_exactly_once() {
         fail "an already-flagged stale PR must not re-escalate every patrol"
 }
 
+# Feed QUEUE_JSON to the find-work selection block and echo the bead it chose
+# ("" = the refinery goes idle). Requires $SANDBOX/select.sh already extracted.
+select_work_from() {
+    printf '%s' "$1" >"$GC_LIST_WORK"
+    PATH="$BIN:$PATH" GC_AGENT=testrig/refinery bash -c \
+        '. "$1/select.sh"; printf "%s\n" "$WORK"' _ "$SANDBOX"
+}
+
 test_awaiting_bead_never_starves_the_merge_queue() {
     # Parked beads stay open and assigned to the refinery on purpose, so a
     # naive --limit=1 work query would hand back the same waiting-on-a-human PR
     # forever and every other branch would queue behind it.
+    #
+    # BOTH spellings of the flag are exercised, because the reader has to
+    # tolerate both. `--set-metadata awaiting_merge=true` stores a JSON
+    # *boolean*, which is what every bead parked in the wild carries and what
+    # the type-strict jq compare silently let through; the quoted string is the
+    # shape a hand-written fixture takes. A reader that handles only one of them
+    # is the bug -- and pinning only the string is how this passed while the
+    # merge queue livelocked in production.
     new_sandbox
     extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
     GC_LIST_WORK="$SANDBOX/work.json"
     export GC_LIST_WORK
-    cat >"$GC_LIST_WORK" <<'JSON'
-[{"id":"bd-parked","metadata":{"branch":"polecat/bd-parked","awaiting_merge":"true"}},
- {"id":"bd-fresh","metadata":{"branch":"polecat/bd-fresh"}}]
-JSON
-    selected=$(PATH="$BIN:$PATH" GC_AGENT=testrig/refinery bash -c \
-        '. "$1/select.sh"; printf "%s\n" "$WORK"' _ "$SANDBOX")
-    [ "$selected" = "bd-fresh" ] ||
-        fail "work selection must skip the parked bead and take fresh work, got: '$selected'"
 
-    # Only parked work: the refinery must go idle, not re-process the PR.
-    cat >"$GC_LIST_WORK" <<'JSON'
-[{"id":"bd-parked","metadata":{"branch":"polecat/bd-parked","awaiting_merge":"true"}}]
-JSON
-    selected=$(PATH="$BIN:$PATH" GC_AGENT=testrig/refinery bash -c \
-        '. "$1/select.sh"; printf "%s\n" "$WORK"' _ "$SANDBOX")
-    [ -z "$selected" ] ||
-        fail "a queue of only parked beads must select nothing, got: '$selected'"
+    for parked_flag in 'true' '"true"'; do
+        # Parked bead listed FIRST so `[0]` lands on it unless the filter truly
+        # skips it. Ordering is load-bearing in this fixture: real query order is
+        # not specified, and a queue that happens to put fresh work first passes
+        # even with the filter deleted outright.
+        selected=$(select_work_from \
+"[{\"id\":\"bd-parked\",\"metadata\":{\"branch\":\"polecat/bd-parked\",\"awaiting_merge\":$parked_flag}},
+ {\"id\":\"bd-fresh\",\"metadata\":{\"branch\":\"polecat/bd-fresh\"}}]")
+        [ "$selected" = "bd-fresh" ] ||
+            fail "work selection must skip the parked bead (awaiting_merge=$parked_flag) and take fresh work, got: '$selected'"
+
+        # Only parked work: the refinery must go idle, not re-process the PR.
+        # This is the exact shape the live incident took -- a single parked bead
+        # in the queue -- and the case that rebases, re-tests and force-pushes a
+        # published PR, resetting its checks on every patrol.
+        selected=$(select_work_from \
+"[{\"id\":\"bd-parked\",\"metadata\":{\"branch\":\"polecat/bd-parked\",\"awaiting_merge\":$parked_flag}}]")
+        [ -z "$selected" ] ||
+            fail "a queue of only parked beads (awaiting_merge=$parked_flag) must select nothing, got: '$selected'"
+    done
+
+    # Not-parked must stay selectable. `//` is jq's alternative operator, so it
+    # falls through on `false` as well as `null` -- correct here, but only by
+    # coincidence, so pin it before a rewrite "simplifies" it away.
+    selected=$(select_work_from \
+'[{"id":"bd-unparked","metadata":{"branch":"polecat/bd-unparked","awaiting_merge":false}}]')
+    [ "$selected" = "bd-unparked" ] ||
+        fail "awaiting_merge=false is not parked and must remain selectable, got: '$selected'"
+}
+
+test_real_park_path_writes_a_flag_the_selector_excludes() {
+    # The regression test that cannot pass while production is broken: it parks
+    # a bead with the REAL writer and hands the REAL stored JSON to the formula's
+    # own selection block. No fixture anywhere in the path.
+    #
+    # This exists because a fixture can only ever assert the type its author
+    # believed was stored, and believing "string" is exactly how this bug
+    # survived a green suite.
+    #
+    # The writer is spelled `gc bd`, matching the park path in merge-push
+    # verbatim -- that routing wrapper is part of the contract under test, not
+    # incidental, so reaching for the bare binary would test something the
+    # formula never runs. Beads drives an embedded Dolt engine, so a throwaway
+    # city needs no server; it does need the `gc` binary, which the PR gate
+    # (ci.yml) installs for the lint step but does not put on PATH for this
+    # suite. Where it is missing the check announces the skip instead of passing
+    # quietly, and the fixture test above still covers both spellings.
+    if ! command -v gc >/dev/null 2>&1; then
+        echo "SKIP: gc not on PATH; the real-park-path round trip did not run" >&2
+        return 0
+    fi
+    new_sandbox
+    extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
+    GC_LIST_WORK="$SANDBOX/work.json"
+    export GC_LIST_WORK
+
+    # Throwaway city with a throwaway ledger inside it. `gc bd` refuses to run
+    # outside a city, and a stub city.toml plus .gc/ is all it needs to route.
+    # Every ambient BEADS_*/GC_* pointer is dropped and HOME is redirected, so a
+    # test run can never reach a real rig's bead database. It warns about
+    # unimported builtin packs, which is harmless here and why stderr is quiet.
+    city="$SANDBOX/city"
+    mkdir -p "$city/.gc" "$SANDBOX/home"
+    (cd "$city" && git init -q .)
+    printf 'name = "refinerytest"\n' >"$city/city.toml"
+    gc_bd_hermetic() {
+        (cd "$city" && env \
+            -u BEADS_DIR -u BEADS_DOLT_SERVER_PORT -u BEADS_DOLT_AUTO_START \
+            -u BEADS_HOLDER_TOKEN -u BEADS_ACTOR -u GC_BEADS_SCOPE_ROOT \
+            -u GC_RIG -u GC_CITY -u GC_CITY_PATH -u GC_DIR -u GC_AGENT \
+            HOME="$SANDBOX/home" BD_NON_INTERACTIVE=1 BD_METRICS_ENABLED=0 \
+            BEADS_DIR="$city/.beads" \
+            gc bd "$@")
+    }
+    if ! gc_bd_hermetic init --prefix=aw --non-interactive >/dev/null 2>&1; then
+        echo "SKIP: hermetic 'gc bd init' failed; the real-park-path round trip did not run" >&2
+        return 0
+    fi
+
+    parked=$(gc_bd_hermetic q "parked pull request" 2>/dev/null | tail -1 | tr -d '[:space:]')
+    # Match the prefix, not merely non-empty: first-run notices on stdout would
+    # otherwise be mistaken for a bead id and the failure would be inscrutable.
+    case "$parked" in
+        aw-*) : ;;
+        *) fail "hermetic 'gc bd q' did not return a bead id, got: '$parked'" ;;
+    esac
+
+    # THE PARK PATH, spelled exactly as the mr branch of merge-push writes it.
+    gc_bd_hermetic update "$parked" --set-metadata branch="polecat/$parked" \
+        --set-metadata awaiting_merge=true >/dev/null 2>&1 ||
+        fail "the real park path failed to write awaiting_merge"
+
+    # Canary. If the store ever holds this as something other than a boolean the
+    # hermetic fixtures above no longer mirror production -- fail loudly and name
+    # the test to update rather than let the two drift apart in silence.
+    stored=$(gc_bd_hermetic show "$parked" --json 2>/dev/null | jq -r '.[0].metadata.awaiting_merge | type')
+    [ "$stored" = "boolean" ] ||
+        fail "'--set-metadata awaiting_merge=true' now stores a '$stored', not a boolean; test_awaiting_bead_never_starves_the_merge_queue encodes boolean and must be updated to match"
+
+    # The queue a refinery would really be handed. A single parked bead is the
+    # decisive case: with anything else in the list `[0]` can land on fresh work
+    # and hide a filter that never fired -- which is what real list ordering did
+    # when this test was written.
+    queue=$(gc_bd_hermetic list --status=open --has-metadata-key=branch --limit=0 --json 2>/dev/null)
+    selected=$(select_work_from "$queue")
+    # Summarise rather than dumping whole bead records, which run to hundreds of
+    # lines and would bury the assertion message.
+    [ -z "$selected" ] || fail "a bead parked through the real writer must not be selected as merge work, got: '$selected' (queue: $(printf '%s' "$queue" | jq -c '[.[] | {id, awaiting_merge: .metadata.awaiting_merge, type: (.metadata.awaiting_merge | type)}]'))"
 }
 
 test_protected_target_never_resolves_to_direct
@@ -857,5 +981,6 @@ test_recheck_strands_squash_merge_when_gh_query_is_rejected
 test_recheck_makes_a_rejected_gh_query_loud
 test_recheck_escalates_a_stale_pr_exactly_once
 test_awaiting_bead_never_starves_the_merge_queue
+test_real_park_path_writes_a_flag_the_selector_excludes
 
 echo "PASS: $(basename "${BASH_SOURCE[0]}")"

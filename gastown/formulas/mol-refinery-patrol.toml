@@ -501,6 +501,17 @@ reads as present and load-bearing while doing exactly nothing — which is how t
 `--metadata-field=k=true` flag used in steps 1 and 2 does match the boolean;
 only in-jq comparisons need the cast.
 
+**Fix the reader, never the writer.** Normalizing on read tolerates both
+spellings, so beads already parked in the wild with the boolean stay parked. Do
+NOT resolve a future recurrence by making the writer emit a string — that
+strands every already-parked bead in exactly the livelock described above, with
+no migration to catch them.
+
+One quirk to keep in mind if either predicate is ever rewritten: `//` is jq's
+alternative operator, so it falls through on `false` as well as `null`. A
+boolean `false` therefore collapses to `""` before `tostring` runs, and the
+bead is correctly treated as not parked.
+
 `${GC_RIG:+--rig="$GC_RIG"}` scopes the query to this refinery's rig
 database. Without it, `gc bd list` routes to the HQ database and never
 sees rig-scoped work beads — the `assignee` field alone does not route
