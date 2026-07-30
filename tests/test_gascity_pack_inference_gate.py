@@ -7,6 +7,7 @@ import re
 import shutil
 import shlex
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -1368,6 +1369,59 @@ def test_gastown_formula_contract_pins_resolved_refinery_address() -> None:
         fragment.startswith('REFINERY_TARGET="')
         for fragment in fragments
     ), "pinning the composed-and-written refinery address reinstates the gp-0fz stranding bug"
+
+
+def test_setting_no_code_change_always_carries_evidence_and_provenance() -> None:
+    """An agent may SET `no_code_change`, but never bare.
+
+    The marker's entire job is to route a bead out of the merge queue and onto
+    a human's desk, so the only question its reader has is whether it describes
+    a deliverable that lives somewhere else or a build that did not finish.
+    `gc bd history` versions the issue row but NOT its metadata, so the flag
+    carries no provenance of its own -- which is why the refinery refuses to
+    auto-close on it, and why a bare set is worth nothing to the human who
+    inherits it.
+
+    Gate the class, not the one call site (gp-dc0): a formula that learns to
+    set the marker later inherits this requirement instead of re-deriving it
+    the hard way. Deliberately NOT a restatement of the registry pins, which
+    would be the second copy of the contract that gp-8h3 is about -- the pins
+    assert the set EXISTS, this asserts what must travel with it.
+
+    Checked against the parsed description, where TOML has already collapsed
+    the backslash-continued `gc bd update` into the single command it renders
+    as, so "the same invocation" is literally the same line. That collapse is
+    also what makes `gc bd update` on the same line the right predicate for a
+    real set: it excludes the prose and bash comments that quote the flag while
+    explaining it, without needing to guess at comment syntax.
+    """
+    source = gascity_pack_inference_gate.PACK_SPECS["gastown"].source
+    bare: list[str] = []
+    setters = 0
+    for path in sorted(source.glob("formulas/*.toml")):
+        payload = tomllib.loads(path.read_text(encoding="utf-8"))
+        descriptions = [payload.get("description", "")]
+        descriptions += [step.get("description", "") for step in payload.get("steps", [])]
+        for description in descriptions:
+            for line in description.splitlines():
+                if "--set-metadata no_code_change=true" not in line:
+                    continue
+                if "gc bd update" not in line:
+                    continue
+                setters += 1
+                for required in ("no_code_change_evidence", "no_code_change_source"):
+                    if required not in line:
+                        bare.append(
+                            f"{path.name}: sets no_code_change without {required}: "
+                            f"{line.strip()[:120]}"
+                        )
+    assert setters, (
+        "no formula sets no_code_change anywhere. A marker that only ever gets READ "
+        "is the gp-dn1 defect exactly: the refinery's no-patch triage selects on it, "
+        "so an unset marker means validation-only beads reach a merge gate that must "
+        "refuse them."
+    )
+    assert not bare, "\n".join(bare)
 
 
 def test_build_basic_work_item_targets_code_and_pytest() -> None:

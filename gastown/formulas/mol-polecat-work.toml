@@ -58,12 +58,21 @@ has the flag cleared (a patch that exists must merge), and a flagged bead with a
 genuinely empty branch is annotated with the deliverable's evidence so the
 refinery can route it out of the merge queue instead of halting on it.
 
+**Zero-diff-terminal.** An *unflagged* empty branch — the shape that had no exit
+at all, because nothing ever SET the marker the triage selects on (gp-dn1) — is
+classified on the spot rather than pushed into a merge queue that must refuse it.
+Either the deliverable is external, and the flag is set here carrying its
+provenance and the evidence, or it is not, and the bead halts to a human saying
+so. Both outcomes are terminal for the polecat; neither is a hand-close request.
+
 ## Failure Modes
 
 | Situation | Action |
 |-----------|--------|
 | Deliverable already on target | Confirm it, then halt with evidence. Never hand an empty branch to the refinery. |
 | Deliverable is not a patch | Reconcile `no_code_change` with the real diff, attach the evidence, hand off. Never set the flag to escape a failing build. |
+| Empty branch, no flag, external deliverable you can re-verify | Set `no_code_change` with its source and evidence, push, hand off. |
+| Empty branch, no flag, nothing to cite | Halt to a human with what you did and where you stopped. Do not push; do not flag your way out. |
 | Tests fail | Fix them. Do not proceed with failures. |
 | Blocked on external | Mail Witness, mark yourself stuck |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
@@ -559,18 +568,112 @@ Refinery: there is no merge to assert. Confirm the deliverable at the source, th
 fi
 ```
 
+**Flag absent and the branch is genuinely empty** → this is the case the formula
+had no exit for at all, and it is the one that kept reaching humans: five beads,
+three in a single day, each spending a polecat's remaining context rediscovering
+the same mechanism (gp-dn1).
+
+Both arms above only ever RECONCILE a flag somebody else set. Nothing SET it —
+and the marker was in fact absent on three of those five beads, so the refinery's
+no-patch triage, which selects on `--metadata-field=no_code_change=true`, never
+saw them. An unflagged empty branch falls through this step untouched, into the
+merge selector, onto `branch_has_real_change()`, and out through
+`halt_false_completion`. That gate is right to refuse it — a zero-diff branch
+cannot evidence a merge — which left the formula's sole exit routed into a
+guaranteed rejection, with no compliant path to done.
+
+You are the only agent that can tell the two causes apart. An empty branch means
+either **the deliverable was never a patch** — the bead asked you to validate,
+record, or correct something in an external system, and that system now holds the
+result — or **you produced nothing**. From outside your session those are
+indistinguishable. From inside it, one question separates them:
+
+> Can you name the system, the identifiers, and the check you ran THERE to
+> confirm the deliverable landed?
+
+Answer it against the source right now, not from your memory of having looked
+earlier in the session. Then take **exactly one** of the two arms below — never
+both, never neither.
+
+```bash
+if [ "$NO_CODE_CHANGE" != "true" ] && [ "$COMMITS_AHEAD" = "0" ]; then
+  echo "UNEXPLAINED ZERO DIFF: $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}} and carries no no_code_change flag."
+  echo "Classify it before handing off. Arm 1 (external deliverable) or arm 2 (nothing to cite)."
+fi
+```
+
+**Arm 1 — there IS an external deliverable you just re-verified.** Set the flag
+here, with its provenance, then continue to the push:
+```bash
+SETTER="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-unknown-session}}}}"
+gc bd update "$WORK_BEAD_ID" \
+  --set-metadata no_code_change=true \
+  --set-metadata no_code_change_source="set by polecat $SETTER at submit-and-exit, discovered from the empty diff; NOT filed with the bead at dispatch" \
+  --set-metadata no_code_change_evidence="<system>: <what you recorded or changed there>; verified by <the check you ran at the source>" \
+  --notes "NO PATCH BY DESIGN — flag set here, not at dispatch. Branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}}; the empty diff is the intended outcome, not a failure.
+DELIVERABLE: <what the bead asked for, and where it now lives — the system, the ids, the values>.
+VERIFIED: <the independent check you ran at the source, and what it returned>.
+Refinery: there is no merge to assert. Confirm the deliverable at the source, then close as done-without-merge."
+NO_CODE_CHANGE=true
+```
+
+`no_code_change_source` exists because the refinery states — correctly — that it
+cannot tell a flag filed at dispatch from one a polecat set on itself, since
+`gc bd history` versions the issue row but NOT its metadata. Recording who set it
+buys you no close whatsoever; the refinery re-confirms the empty diff itself and
+routes the bead to a human either way. It buys the human the one fact they would
+otherwise have to interrupt someone to get.
+
+**Arm 2 — you cannot cite one.** Then the empty diff is not a design outcome, it
+is unfinished work, and the honest disposition is to say so plainly. Do not set
+the flag, and do not push: there is nothing for anyone downstream to verify
+against, so an empty ref here would evidence nothing.
+```bash
+gc bd update "$WORK_BEAD_ID" \
+  --status=blocked \
+  --assignee="" \
+  --set-metadata gc.routed_to=human \
+  --set-metadata halt_reason=zero_diff_unexplained \
+  --notes "ZERO DIFF, UNEXPLAINED — branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}} and I could not name an external deliverable that accounts for it.
+Deliberately NOT flagged no_code_change: I have no source to cite, and that flag is a claim about where a deliverable LIVES, never a way out of a build.
+WHAT I DID: <the steps you actually took>.
+WHERE I STOPPED: <the specific thing that blocked you, or what you found already true>.
+No branch pushed — an empty ref proves nothing when there is no deliverable to point at.
+HUMAN CALL: re-scope the bead, or close it if the ask is already moot."
+WITNESS_TARGET=$(gc gastown agent-address witness --quiet \
+    --candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness") || WITNESS_TARGET=""
+if [ -n "$WITNESS_TARGET" ]; then
+  gc session nudge "$WITNESS_TARGET" "ZERO-DIFF UNEXPLAINED: $WORK_BEAD_ID — no patch and no external deliverable to cite; halted before push, routed to human." || true
+fi
+gc runtime drain-ack
+exit 0
+```
+
+Arm 2 halts to a human rather than to the refinery for the same reason the
+already-delivered gate does: the refinery's whole job is asserting that a branch
+landed, and there is no branch worth asserting anything about. `blocked` +
+`gc.routed_to=human` keeps it out of the polecat pool, which would otherwise
+spend another session reaching this identical dead end. And unlike the
+`halt_false_completion` this replaces — a negative inference drawn after the
+fact, with nothing to act on — the note above carries what you actually did, so
+the human decides instead of investigating.
+
 Then continue to the push below. **Push the empty branch anyway — do not skip
 it.** The pushed ref is the positive evidence that you ran to completion and
 deliberately produced no patch. Its absence is indistinguishable from a polecat
 that died before pushing, and removing that ambiguity is the whole point of this
-path.
+path. (Arm 2 is the deliberate exception: it never reaches the push, because
+nothing downstream will fetch that ref to verify anything against.)
 
-**Never set `no_code_change` yourself to escape a build you could not finish.**
-You cannot prove to anyone when the flag was set — `gc bd history` versions the
-issue row but NOT its metadata — so downstream it is treated as a claim
-requiring evidence, never as a clearance, and it never auto-closes a bead. A
-polecat that flags its way out of unfinished work is producing a false
-completion by a quieter route than the one the halt catches.
+**Setting `no_code_change` is a claim about where the deliverable LIVES — never
+about how your build went.** Arm 1 is the only circumstance in which you may set
+it yourself, and it is gated on evidence you re-read at the source, not on
+effort. Setting it because you could not finish is a false completion by a
+quieter route than the one the halt catches, and it is what arm 2 exists to
+absorb: the way out of an unfinishable build is to say the build is unfinished.
+Downstream the flag is treated as a claim requiring evidence, never as a
+clearance, and it never auto-closes a bead. There is no version of this that
+closes a bead for you.
 
 **3. Push your branch:**
 ```bash

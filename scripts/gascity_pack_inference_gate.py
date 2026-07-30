@@ -146,6 +146,22 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "--status=open --assignee=\"$REFINERY_TARGET\"",
         "gc session wake \"$REFINERY_TARGET\"",
         "gc runtime drain-ack",
+        # The zero-diff exit (gp-dn1). Before it existed, submit-and-exit's only
+        # terminal path pushed an unflagged empty branch into the merge selector,
+        # where `branch_has_real_change()` must refuse it — so a validation-only
+        # bead had no compliant route to done and halted onto a human every time
+        # (five beads, three in one day). The refinery's no-patch triage was
+        # already built, but it selects on `--metadata-field=no_code_change=true`
+        # and NOTHING SET that marker; it was absent on three of the five. Pin
+        # all three halves, because each fails silently on its own:
+        #   - the SET is the fix itself; drop it and the triage never sees the bead
+        #   - the source stamps provenance the refinery says it otherwise lacks,
+        #     which is what keeps a polecat's self-certification legible as one
+        #   - the halt is the honest arm; drop it and "I produced nothing"
+        #     collapses back into flagging your way out of an unfinished build
+        "--set-metadata no_code_change=true",
+        "--set-metadata no_code_change_source=",
+        "--set-metadata halt_reason=zero_diff_unexplained",
     ),
     "mol-refinery-patrol": (
         "gc bd list ${GC_RIG:+--rig=\"$GC_RIG\"} --assignee=$GC_AGENT --status=open",
