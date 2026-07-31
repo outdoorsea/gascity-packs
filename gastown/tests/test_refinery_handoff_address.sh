@@ -356,6 +356,14 @@ test_stdout_is_capture_safe() {
 test_command_is_dispatchable() {
     [ -f "$COMMAND_DIR/run.sh" ] \
         || fail "missing $COMMAND_DIR/run.sh — a directory without run.sh is not dispatchable"
+    # Present is not the same as dispatchable: gc fork/execs run.sh directly, so
+    # a 100644 wrapper is EACCES at the call site, not a missing file. This bit
+    # was lost in git and stranded every polecat handoff town-wide (gp-ia7) —
+    # every other commands/*/run.sh is asserted executable, this one was not.
+    # Fix a failure here at the SOURCE tree (git update-index --chmod=+x); never
+    # chmod the materialized pack, whose integrity hash covers file mode.
+    [ -x "$COMMAND_DIR/run.sh" ] \
+        || fail "$COMMAND_DIR/run.sh is not executable — gc fork/execs it, so this is 'permission denied' at dispatch"
     [ -f "$COMMAND_DIR/help.md" ] || fail "missing $COMMAND_DIR/help.md"
     grep -q 'assets/scripts/agent-address.sh' "$COMMAND_DIR/run.sh" \
         || fail "the command wrapper must delegate to assets/scripts/agent-address.sh"
