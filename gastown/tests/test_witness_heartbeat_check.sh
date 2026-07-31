@@ -24,6 +24,78 @@ SH
     chmod +x "$bin/gc"
 }
 
+# write_bsd_date_stub <bin> — a date(1) that behaves like BSD/macOS for the two
+# calls ts_epoch makes, so the BSD parse branch is exercised on ANY host.
+#
+# Why this exists: CI runs Linux only. On GNU, `date -d` swallows the RFC3339
+# colon offset ("-07:00") on the FIRST branch, so the BSD fallback never
+# executes there and a plain offset fixture passes whether or not that fallback
+# is correct. That is exactly how gp-ra8 shipped: the offset form is what
+# `gc session list` emits for last_active, it failed to parse on macOS, ts_epoch
+# returned 0, and the check silently degraded into a nudge-age meter that called
+# every witness stalled forever — with a green suite the whole time.
+#
+# The two rules below are not assumed, they were measured on macOS 25.5:
+#   date -u -d ...                                        -> illegal option -- d
+#   date -u -j -f '%Y-%m-%dT%H:%M:%S%z' '...T15:29:51-07:00' -> illegal time format
+#   date -u -j -f '%Y-%m-%dT%H:%M:%S%z' '...T15:29:51-0700'  -> 1785450591
+# Everything else delegates to the real date, so the epochs stay real and the
+# stub cannot quietly turn into a passthrough that proves nothing.
+write_bsd_date_stub() {
+    local bin="$1"
+    mkdir -p "$bin"
+    cat >"$bin/date" <<'SH'
+#!/usr/bin/env sh
+set -u
+mode=passthrough
+fmt=''
+input=''
+want_fmt=0
+for arg in "$@"; do
+    if [ "$want_fmt" -eq 1 ]; then
+        fmt=$arg
+        want_fmt=0
+        continue
+    fi
+    case "$arg" in
+        -d) mode=gnu_parse ;;
+        -j) mode=bsd_parse ;;
+        -f) want_fmt=1 ;;
+        -*|+*) ;;
+        *) input=$arg ;;
+    esac
+done
+case "$mode" in
+    gnu_parse)
+        # BSD has no -d. Record that the GNU branch was tried and refused.
+        echo "gnu-refused" >>"$DATE_STUB_MARKER"
+        echo "date: illegal option -- d" >&2
+        exit 1
+        ;;
+    bsd_parse)
+        echo "bsd-tried" >>"$DATE_STUB_MARKER"
+        # The whole defect, in one rule: BSD strptime %z takes +hhmm/-hhmm and
+        # rejects the RFC3339 colon form.
+        case "$input" in
+            *[+-][0-9][0-9]:[0-9][0-9])
+                echo "date: illegal time format" >&2
+                exit 1
+                ;;
+        esac
+        if "$REAL_DATE" -u -d '@0' +%s >/dev/null 2>&1; then
+            "$REAL_DATE" -u -d "$input" +%s
+        else
+            "$REAL_DATE" -u -j -f "$fmt" "$input" +%s
+        fi
+        ;;
+    *)
+        exec "$REAL_DATE" "$@"
+        ;;
+esac
+SH
+    chmod +x "$bin/date"
+}
+
 # run_check <sessions-json-literal> [env assignments...] — prints the TSV rows,
 # sets RC to the exit code. stderr is captured separately so row assertions stay
 # clean.
@@ -39,6 +111,25 @@ run_check() {
     RC=$?
     set -e
     ERR=$(cat "$ERRFILE")
+}
+
+# run_check_bsd — run_check with a BSD/macOS date(1) shadowing the real one, and
+# STUB_TRACE set to what the stub recorded. Use it for anything that must hold on
+# the BSD parse path regardless of the host running the suite.
+run_check_bsd() {
+    local payload="$1"
+    shift
+    : >"$MARKER"
+    printf '%s' "$payload" >"$SESSIONS"
+    set +e
+    OUT=$(env GC_CITY="$CITY" GC_SESSIONS_JSON="$SESSIONS" \
+        REAL_DATE="$REAL_DATE" DATE_STUB_MARKER="$MARKER" \
+        PATH="$BSDBIN:$BIN:$PATH" ${1+"$@"} \
+        bash "$SCRIPT" 2>"$ERRFILE")
+    RC=$?
+    set -e
+    ERR=$(cat "$ERRFILE")
+    STUB_TRACE=$(cat "$MARKER")
 }
 
 # run_wrapper <sessions-json-literal> [env assignments...] — invoke the command
@@ -105,17 +196,40 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 CITY="$tmp/city"
 BIN="$tmp/bin"
+# Separate dir so the BSD date stub can be layered in front of $BIN for the
+# tests that want it, without shadowing date for every other test.
+BSDBIN="$tmp/bsdbin"
+MARKER="$tmp/date-stub.trace"
 SESSIONS="$tmp/sessions.json"
 ERRFILE="$tmp/stderr.txt"
+# Resolved BEFORE anything shadows date, so the stub can still reach the real
+# one. An unresolvable date would make the stub silently useless.
+REAL_DATE=$(command -v date) || REAL_DATE=''
+[ -n "$REAL_DATE" ] || { echo "FAIL: cannot resolve a real date(1)" >&2; exit 1; }
 # A cwd with no city.toml above it, for the wrapper tests. mktemp -d roots this
 # under the system temp dir, which is not inside any city.
 NOCITY="$tmp/nocity"
-mkdir -p "$CITY" "$NOCITY"
+mkdir -p "$CITY" "$NOCITY" "$BSDBIN"
 : >"$CITY/city.toml"
 write_gc_stub "$BIN"
+write_bsd_date_stub "$BSDBIN"
 
 FRESH=$(ts_ago 45)
 STALE=$(ts_ago 72000)   # 20h — inside the 14h-63h band this check exists for
+
+# offset_ago — the same instant as ts_ago, but rendered the way `gc session list`
+# renders last_active: a numeric ±HH:MM offset instead of Z. Fixtures built only
+# with the Z form are what let gp-ra8 sit green in this suite; production never
+# sent Z for that field.
+if date -u -d '@0' +%Y >/dev/null 2>&1; then
+    offset_ago() { date -d "@$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%S%:z; }
+else
+    offset_ago() { date -r "$(( $(date -u +%s) - $1 ))" +%Y-%m-%dT%H:%M:%S%z \
+        | sed -E 's/([+-][0-9]{2})([0-9]{2})$/\1:\2/'; }
+fi
+
+FRESH_OFFSET=$(offset_ago 45)
+STALE_OFFSET=$(offset_ago 72000)
 
 test_fresh_heartbeat_is_not_flagged() {
     run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","template":"gastown.witness","state":"asleep","last_active":"%s","closed":false}]}' "$FRESH")"
@@ -172,6 +286,77 @@ test_fractional_seconds_parse() {
     [ "$RC" -eq 0 ] || fail "a fractional-second timestamp should parse as fresh, got $RC ($OUT)"
     printf '%s' "$OUT" | grep -q '^fresh	' ||
         fail "a fractional-second timestamp should report fresh, got: $OUT"
+}
+
+test_numeric_offset_timestamp_parses() {
+    # gp-ra8: `gc session list` emits last_active as "...-07:00", never Z. Every
+    # fixture in this suite used the Z form, so the offset form — the only shape
+    # production actually sends — went untested and unparsed.
+    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","template":"gastown.witness","state":"active","last_active":"%s","closed":false}]}' "$FRESH_OFFSET")"
+    [ "$RC" -eq 0 ] || fail "a ±HH:MM offset heartbeat must parse as fresh, got $RC ($OUT)"
+    printf '%s' "$OUT" | grep -q '^fresh	alpha	alpha/witness	active	' ||
+        fail "an offset-stamped fresh witness should report fresh, got: $OUT"
+    printf '%s' "$OUT" | grep -q 'no-heartbeat' &&
+        fail "an offset timestamp is parseable — it must not read as no-heartbeat"
+    return 0
+}
+
+test_numeric_offset_staleness_is_still_detected() {
+    # The mirror of the test above. A fix that made offsets parse as "now" would
+    # turn every witness fresh and silence the check in the other direction —
+    # which is the more dangerous failure, since it reads as health.
+    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$STALE_OFFSET")"
+    [ "$RC" -eq 1 ] || fail "a genuinely stale offset heartbeat must still exit 1, got $RC ($OUT)"
+    printf '%s' "$OUT" | grep -q '^stalled	alpha	alpha/witness	asleep	7[0-9][0-9][0-9][0-9]	' ||
+        fail "a 20h-old offset heartbeat should report stalled with its real age, got: $OUT"
+}
+
+test_offset_last_active_beats_older_z_nudge() {
+    # The exact production shape from gp-ra8, and the reason the bug was invisible
+    # rather than loud: last_active carries the offset form and last_nudge_delivered_at
+    # carries Z. When the offset fails to parse it scores 0, the nudge always wins,
+    # and the check silently stops measuring liveness and starts measuring nudge
+    # age — reporting healthy witnesses stalled forever off a day-old nudge.
+    run_check "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"active","last_active":"%s","last_nudge_delivered_at":"%s","closed":false}]}' "$FRESH_OFFSET" "$STALE")"
+    [ "$RC" -eq 0 ] ||
+        fail "a fresh offset last_active must outrank a stale Z nudge, got $RC ($OUT)"
+    printf '%s' "$OUT" | grep -q "^fresh	alpha	alpha/witness	active	[0-9]*	$FRESH_OFFSET\$" ||
+        fail "the offset last_active should be the reported heartbeat, not the nudge, got: $OUT"
+}
+
+test_offset_parses_on_the_bsd_branch_on_any_host() {
+    # The one that has to hold in CI. CI is Linux-only, so GNU `date -d` accepts
+    # the colon offset on the FIRST branch and the BSD fallback never runs there —
+    # meaning the three tests above pass on CI whether or not that fallback works.
+    # That is the same blind spot gp-2st named: the bug lives on the platform the
+    # suite could not exercise. Shadowing date with a measured BSD simulator moves
+    # the check onto the broken branch everywhere.
+    run_check_bsd "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"active","last_active":"%s","closed":false}]}' "$FRESH_OFFSET")"
+
+    # Prove the stub actually engaged before trusting the verdict. Without this a
+    # passthrough stub would make the whole test decorative.
+    printf '%s' "$STUB_TRACE" | grep -q 'gnu-refused' ||
+        fail "the BSD simulator never saw the GNU attempt — stub not engaged: '$STUB_TRACE'"
+    printf '%s' "$STUB_TRACE" | grep -q 'bsd-tried' ||
+        fail "the check never reached the BSD parse branch — stub not engaged: '$STUB_TRACE'"
+
+    [ "$RC" -eq 0 ] ||
+        fail "an offset heartbeat must parse on the BSD branch, got $RC ($OUT / $ERR)"
+    printf '%s' "$OUT" | grep -q '^fresh	alpha	alpha/witness	active	' ||
+        fail "the BSD branch should report the offset-stamped witness fresh, got: $OUT"
+}
+
+test_bsd_branch_still_handles_z_and_staleness() {
+    # Guards the simulator itself: if its BSD arm returned garbage rather than a
+    # real epoch, the test above could pass for the wrong reason. Z form must keep
+    # working on that arm, and a stale offset must still be caught there.
+    run_check_bsd "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$FRESH")"
+    [ "$RC" -eq 0 ] || fail "Z form must still parse on the BSD branch, got $RC ($OUT / $ERR)"
+
+    run_check_bsd "$(printf '{"sessions":[{"id":"s1","name":"alpha/witness","rig":"alpha","state":"asleep","last_active":"%s","closed":false}]}' "$STALE_OFFSET")"
+    [ "$RC" -eq 1 ] || fail "a stale offset must still be stalled on the BSD branch, got $RC ($OUT)"
+    printf '%s' "$OUT" | grep -q '^stalled	alpha	alpha/witness	asleep	7[0-9][0-9][0-9][0-9]	' ||
+        fail "the BSD branch should report the real age, got: $OUT"
 }
 
 test_future_heartbeat_is_clock_skew_not_stale() {
@@ -408,6 +593,11 @@ test_zero_time_sentinel_is_no_heartbeat_not_stalled
 test_malformed_timestamp_is_no_heartbeat_not_stalled
 test_newer_of_the_two_stamps_wins
 test_fractional_seconds_parse
+test_numeric_offset_timestamp_parses
+test_numeric_offset_staleness_is_still_detected
+test_offset_last_active_beats_older_z_nudge
+test_offset_parses_on_the_bsd_branch_on_any_host
+test_bsd_branch_still_handles_z_and_staleness
 test_future_heartbeat_is_clock_skew_not_stale
 test_threshold_is_configurable
 test_bad_threshold_fails_loudly

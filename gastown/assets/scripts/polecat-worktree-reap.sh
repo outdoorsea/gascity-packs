@@ -205,6 +205,15 @@ NOW=$(date -u +%s)
 # signal": empty, null, or the Go zero-time sentinel bd emits for an unset
 # field. 0 means unknown, never "ancient". Shared idiom with
 # polecat-progress-check.sh: GNU `-d` first, BSD `-j -f` second.
+#
+# The BSD arm strips the colon out of a `±HH:MM` offset as well as rewriting `Z`,
+# because BSD `%z` accepts only the compact RFC822 spelling. `bd` stamps closed_at
+# in Z form today, so this arm is not currently reached with an offset and the
+# rewrite is a no-op here — it is carried anyway because gp-ra8 was exactly this
+# line failing in witness-heartbeat-check.sh, where the input DOES arrive as
+# `-07:00` from `gc session list`. The two producers already disagree on spelling,
+# so leaving the identical helper unhardened here just parks the same silent
+# 0-means-unknown misread behind a future field change.
 ts_epoch() {
   local ts="$1" norm epoch
   case "$ts" in
@@ -213,7 +222,8 @@ ts_epoch() {
   norm=$(printf '%s' "$ts" | sed -E 's/\.[0-9]+(Z|[+-][0-9:]+)?$/\1/')
   epoch=$(date -u -d "$norm" +%s 2>/dev/null) \
     || epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%S%z' \
-                 "$(printf '%s' "$norm" | sed 's/Z$/+0000/')" +%s 2>/dev/null) \
+                 "$(printf '%s' "$norm" | sed -e 's/Z$/+0000/' \
+                    -e 's/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/')" +%s 2>/dev/null) \
     || epoch=''
   case "$epoch" in
     ''|*[!0-9]*) printf '0'; return 0 ;;

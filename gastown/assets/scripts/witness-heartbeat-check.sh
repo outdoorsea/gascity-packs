@@ -102,6 +102,20 @@ NOW=$(date -u +%s)
 # GNU `date -d` first, BSD `date -j -f` second: the fleet includes macOS.
 # Fractional seconds are stripped because `gc` emits them and BSD `date -f`
 # cannot parse them.
+#
+# The BSD arm normalizes the offset twice over, because BSD `%z` accepts only the
+# compact RFC822 spelling: `Z` becomes `+0000`, and a `±HH:MM` offset loses its
+# colon. Both rewrites are confined to that arm so the GNU input stays untouched.
+#
+# The colon strip is gp-ra8, and it is worth spelling out because the failure was
+# silent rather than loud. `gc session list` emits last_active as `...-07:00` but
+# last_nudge_delivered_at as `...Z`. Without the strip, BSD rejected every
+# last_active, ts_epoch scored it 0 = unknown, and the newest-stamp pick below
+# could only ever choose the nudge — so on macOS this check quietly stopped
+# measuring liveness and started measuring nudge age, reporting healthy witnesses
+# stalled forever. The deacon's health-scan treats a stalled verdict as
+# deterministic evidence, so that reading was one step away from warranting three
+# live witnesses off a day-old nudge.
 ts_epoch() {
   local ts="$1" norm epoch
   case "$ts" in
@@ -110,7 +124,8 @@ ts_epoch() {
   norm=$(printf '%s' "$ts" | sed -E 's/\.[0-9]+(Z|[+-][0-9:]+)?$/\1/')
   epoch=$(date -u -d "$norm" +%s 2>/dev/null) \
     || epoch=$(date -u -j -f '%Y-%m-%dT%H:%M:%S%z' \
-                 "$(printf '%s' "$norm" | sed 's/Z$/+0000/')" +%s 2>/dev/null) \
+                 "$(printf '%s' "$norm" | sed -e 's/Z$/+0000/' \
+                    -e 's/\([+-][0-9][0-9]\):\([0-9][0-9]\)$/\1\2/')" +%s 2>/dev/null) \
     || epoch=''
   # Anything non-numeric or pre-epoch is another unusable value, not "ancient".
   case "$epoch" in
