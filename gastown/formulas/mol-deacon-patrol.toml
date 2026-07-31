@@ -193,7 +193,7 @@ findings, one TSV row per witness
 | verdict | meaning | action |
 |---------|---------|--------|
 | `fresh` | heartbeat inside the window | nothing |
-| `stalled` | heartbeat older than the window — the patrol loop is gone | nudge, then warrant if the stall survives the nudge |
+| `stalled` | heartbeat older than the window — the patrol loop MAY be gone | peek the pane first; if it corroborates, nudge, then warrant if the stall survives the nudge |
 | `no-heartbeat` | no usable timestamp recorded yet | do NOT warrant. A freshly-spawned witness has no heartbeat yet; only a no-heartbeat that persists across cycles is a real signal |
 
 Exit 2 means the check could not run — bad config, an unreadable session
@@ -205,18 +205,51 @@ roster, or a `gc session list` schema drift that hid `last_active`. That is
 gc mail send mayor/ -s "DEACON: witness heartbeat check cannot run" -m "<the check's stderr>"
 ```
 
-A `stalled` verdict is deterministic evidence and needs no further judgment,
-but it takes the same escalation route as everything else in this step — nudge
-first, so a witness that is merely wedged mid-turn gets to recover on its own:
+**A `stalled` verdict is a reason to LOOK, never on its own grounds for a
+warrant.** Corroborate it against the pane before you escalate:
+
+```bash
+gc session peek "$STALLED_SESSION" --lines 30
+```
+
+The check answers "when did this session last stamp a heartbeat?" The pane
+answers "is this session doing anything right now?" Those are different
+questions, and only the second one can justify a shutdown dance. **If the check
+and the pane disagree, BELIEVE THE PANE** — active output means the measurement
+is wrong, not the witness. File a defect against the check and do not warrant.
+
+This is not hypothetical caution. On 2026-07-31 this check reported all three
+witnesses `stalled` (14.1h/21.5h/22.3h) while all three were alive and mid-turn,
+one of them mid `worktree-reap --reap`. Its BSD `date -j -f %z` arm could not
+parse the `±HH:MM` offset `gc session list` emits for `last_active`, so that
+field never parsed, scored 0, and the newest-stamp pick could only ever choose
+`last_nudge_delivered_at`. The check silently stopped measuring liveness and
+measured nudge age instead — reporting `stalled` for any witness not nudged
+inside the window, and blind to genuine stalls at the same time. Three healthy
+witnesses came one compliant step from a dog-pool shutdown dance. What stopped
+it was an agent looking at the pane and refusing to believe its own query.
+(That specific parser bug is fixed — do not re-fix it here. The rule below is
+what survives it.)
+
+The rule generalizes past that one bug: a silently-wrong signal is
+indistinguishable from a correct one at the point of use, so being mechanical
+never exempts a verdict from corroboration. Looking is the only thing that
+separates the two, which is why it is mandatory here rather than advisory —
+the next wrong signal will not announce itself either.
+
+Once the pane corroborates that the session is genuinely not progressing, it
+takes the same escalation route as everything else in this step — nudge first,
+so a witness that is merely wedged mid-turn gets to recover on its own:
 
 ```bash
 gc session nudge "$STALLED_SESSION" "Heartbeat silent for <age>. Run gc hook and resume your patrol."
 ```
 
-If the next cycle still reports the same session `stalled`, file a deduped
-warrant with the snippet at the end of this step. Do not invent a second
-escalation path, and do not mail a named role directly for a single stall —
-systemic patterns are what the mayor escalation at the end of this step is for.
+If the next cycle still reports the same session `stalled` **and the pane still
+shows no progress**, file a deduped warrant with the snippet at the end of this
+step. Do not invent a second escalation path, and do not mail a named role
+directly for a single stall — systemic patterns are what the mayor escalation at
+the end of this step is for.
 
 **For each active rig, assess witness health:**
 
@@ -224,9 +257,12 @@ Check witness patrol wisp freshness. Each patrol cycle burns a wisp.
 If the last wisp is much older than the maximum backoff cap (300s) plus
 buffer, the witness may be stuck. But if there's no active work in the
 rig, the witness is legitimately idle — not stuck. Idle only excuses a stale
-*wisp*: the heartbeat pass above already ruled on whether the loop itself is
-alive, and an empty queue does not stop a live witness from waking. If the
-heartbeat pass returned `stalled`, do not talk yourself out of it here.
+*wisp*: an empty queue does not stop a live witness from waking, so if the
+heartbeat pass returned `stalled`, idleness alone does not clear it.
+
+What clears it is the pane, not the queue. A quiet rig is not evidence the
+witness is fine, and a `stalled` verdict is not evidence it is broken — only
+`gc session peek` distinguishes them, and it outranks both.
 
 **For each active rig, assess refinery health:**
 
