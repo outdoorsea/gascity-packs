@@ -136,25 +136,67 @@ description = """
 Claude Code's Task tool spawns subagent processes that sometimes don't
 clean up. These accumulate and consume significant memory.
 
-**Detection:** Orphaned subagent processes have TTY = "?" in `ps` output.
-They are child processes of claude/node that lost their parent.
+**Candidate generation — NOT a list of orphans:**
 
 ```bash
 ps aux | grep -E 'claude|node' | grep '?'
 ```
 
-**Judgment required:** Not all TTY=? processes are orphaned. Some are
-legitimate background processes. Look for:
-- Processes consuming significant memory (>500MB RSS)
-- Processes that have been running much longer than any active session
-- Multiple identical processes (accumulated from repeated crashes)
+**This query names suspects, never convicts.** It matches on command text and
+TTY, and neither answers who is running a process. On 2026-07-31 it returned 95
+processes on a healthy town containing ZERO orphans (gp-aik): five separate
+cities' tmux servers, Discord and Claude.app helpers, a gemini node process,
+live MCP servers, and every live agent in this town — all 11 of which shared the
+live tmux server as their parent.
 
-**Action:** Kill confirmed orphans:
+Worst of all it matches **this town's own tmux server**. `ps aux` prints that
+server's full argv, which contains the `exec claude ...` it launched, so it
+matches a 'claude' grep. It then sits at ppid=1 with TTY `?` — satisfying both
+heuristics this step used to call proof of orphanhood. Killing it takes down
+every agent in the town, including the deacon running this step.
+
+**Triage every candidate before proposing any kill. This is mandatory:**
+
+```bash
+gc gastown kill-triage --pid <pid>            # repeat --pid per candidate
+```
+
+Invoke it through `gc`, not by path. `GC_PACK_DIR` is unset in your session, so
+a path invocation resolves to `/assets/scripts/...`, fails its own guard, and
+prints nothing — which for a triage whose entire job is to REFUSE reads exactly
+like a clean bill of health.
+
+| verdict | meaning | action |
+|---------|---------|--------|
+| `refuse-not-ours` | ancestry/cwd place it in another city, or nowhere we can claim | leave it alone — not ours to kill |
+| `refuse-live-agent` | descends from this town's session host | leave it alone — it is working |
+| `refuse-session-host` | it IS a session host, or has live children | NEVER kill — takes dependents with it |
+| `refuse-not-zombie` | reported as a zombie, but the kernel disagrees | leave it alone |
+| `refuse-unverifiable` | state unreadable | leave it alone; unreadable is not permission |
+| `kill-candidate` | ours, abandoned, hosting nothing | may be killed |
+
+Exit 2 means the triage could not run — bad city context, or a pack version
+without it. **Nothing was triaged, so kill nothing** and report it:
+```bash
+gc mail send mayor/ -s "DEACON: kill-triage cannot run" -m "<the triage's stderr>"
+```
+
+**Action — only for pids the triage returned as `kill-candidate`:**
 ```bash
 kill <pid>
 ```
 
-Use judgment — this is exactly why an LLM does it, not Go code.
+`ppid=1` is a hypothesis, not proof. Reparenting to init is what a genuine
+orphan looks like AND what the town's session host looks like AND what every
+daemon on the host looks like; on its own it distinguishes nothing. The triage
+is what separates them, which is why it is mandatory here rather than advisory.
+
+**Do not restore "use judgment" here.** That instruction is what this step used
+to rely on, and it is precisely what failed: judgment does not survive the
+fresh-context restarts these agents run on, and a silently-wrong signal is
+indistinguishable from a correct one at the point of use. gp-9ur required pane
+corroboration before any WARRANT for the same reason. This is that rule on the
+KILL path, which gp-9ur does not cover.
 
 Close this step after check (even if no orphans found)."""
 
@@ -522,7 +564,7 @@ are wedged (the latter is what first prompted this check to exist).
 | `server.latency_ms > 5000` | 5 s | Server may be overloaded |
 | `databases[].commits > 50000` | 50 k | Compactor dog may have stalled |
 | `backups.dolt_stale == true` | >30 min | Backup dog may have failed |
-| `processes.zombie_count > 0` | any | Zombie Dolt servers detected |
+| `processes.zombie_count > 0` | any | Advisory only — the name lies. NOT Unix zombies, and NOT safe to kill; triage per-PID first |
 | `orphans` non-empty | any | Advisory only — NEVER act on this count directly; verify with `gc dolt-cleanup` (hyphen, dry-run) first |
 
 **Step 3: React to alerts**
@@ -550,11 +592,41 @@ nudge if order hasn't self-healed:
 gc session nudge dog/ "Backup needed: dolt backup is <age> old"
 ```
 
-**Zombie processes:**
-Kill zombie Dolt servers not on the expected port:
+**"Zombie" processes (`processes.zombie_count > 0`):**
+
+**`zombie_count` does not mean Unix zombie, and it is not a kill list.** It
+counts Dolt servers the reporter did not expect on this port — a live, healthy,
+in-use server is exactly the shape that gets counted. Read it as "servers I
+cannot account for", never as "processes safe to reap".
+
+On 2026-07-31 this reported `zombie_count=1`, pid 61677, on a healthy town
+(gp-aik). That pid was `stat=Ss` — not `Z` — six minutes old, 669MB resident,
+with `ppid=36698`: a LIVE agent that had spawned it and was actively using it.
+Killing it breaks that agent mid-task. This was at least the second occurrence;
+a prior cycle found 2 of 14 flagged servers live and in use.
+
+**Triage every reported pid before proposing any kill. This is mandatory:**
+
 ```bash
-kill <zombie_pid>
+gc gastown kill-triage --require-zombie --pid <zombie_pid>
 ```
+
+`--require-zombie` adds the check the field name only implies: the kernel must
+actually report `stat=Z`. It also refuses a server with a live ancestor or live
+children, which is what makes "somebody's working server" distinguishable from
+a leak. Invoke it through `gc`, not by path — `GC_PACK_DIR` is unset in your
+session, and a path invocation prints nothing, which reads like a clearance.
+
+Kill ONLY pids it returns as `kill-candidate`. Every `refuse-*` verdict, and
+exit 2 (could not run — nothing was triaged), means leave the process alone:
+```bash
+kill <pid>    # only for a pid the triage returned as kill-candidate
+```
+
+If the triage refuses everything the reporter flagged, that is a finding about
+the reporter, not about the servers. Log it and move on; do not escalate a
+single cycle's disagreement, and never split the difference by killing "just the
+obvious ones" — obviousness is the property that was wrong both times.
 
 **Orphan DBs (`orphans` non-empty):**
 Do NOT act on the health `orphans` count directly — the reporter can

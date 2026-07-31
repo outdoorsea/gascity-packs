@@ -817,6 +817,55 @@ test_deployment_verdict_is_documented_for_the_refinery() {
         fail "the prompt must say an undetermined verdict is not deployed; a check that cannot run is not health"
 }
 
+test_kill_paths_require_triage_not_judgment() {
+    # gp-aik: two patrol steps turned a heuristic signal straight into an
+    # irreversible kill. Both fired on a HEALTHY town. orphan-process-cleanup's
+    # `ps aux | grep -E 'claude|node'` matched 95 processes across five cities
+    # — including this town's OWN tmux server, which appears in that grep
+    # because its argv carries the `exec claude ...` it launched, and which sits
+    # at ppid=1 with TTY '?' like a textbook orphan. dolt-health's
+    # `zombie_count` counted a live, in-use server as a zombie.
+    #
+    # gp-9ur required pane corroboration before a WARRANT. These guards keep the
+    # same rule on the KILL paths, which gp-9ur does not cover.
+    local formula check cmd
+    formula="$GASTOWN/formulas/mol-deacon-patrol.toml"
+    check="$GASTOWN/assets/scripts/kill-triage.sh"
+    cmd="$GASTOWN/commands/kill-triage/run.sh"
+
+    [[ -x "$check" ]] || fail "missing or non-executable assets/scripts/kill-triage.sh"
+    [[ -x "$cmd" ]] || fail "missing or non-executable commands/kill-triage/run.sh"
+    [[ -f "$GASTOWN/commands/kill-triage/help.md" ]] ||
+        fail "missing commands/kill-triage/help.md"
+    parse_toml "$formula"
+
+    # Both kill paths must route through the triage, via `gc` — the same
+    # GC_PACK_DIR trap as worktree-reap. For a triage whose whole job is to
+    # REFUSE, a silent no-op is the worst failure: no refusal is printed and
+    # the caller proceeds to the kill.
+    grep -F 'gc gastown kill-triage' "$formula" >/dev/null ||
+        fail "the deacon patrol must triage kill candidates via 'gc gastown kill-triage'"
+    grep -F 'gc gastown kill-triage --require-zombie' "$formula" >/dev/null ||
+        fail "the dolt-health kill path must pass --require-zombie; zombie_count does not mean stat=Z"
+    ! grep -F 'GC_PACK_DIR' "$formula" | grep -F 'kill-triage' >/dev/null ||
+        fail "kill-triage must not be resolved via \$GC_PACK_DIR; it is unset in an agent shell"
+    grep -F 'GC_PACK_DIR' "$cmd" >/dev/null ||
+        fail "commands/kill-triage/run.sh must resolve the triage through GC_PACK_DIR"
+
+    # The struck authorization. "Use judgment" is exactly what failed here:
+    # judgment does not survive the fresh-context restarts these agents run on.
+    ! grep -F 'Use judgment — this is exactly why an LLM does it' "$formula" >/dev/null ||
+        fail "orphan-process-cleanup must not re-authorize killing on judgment alone"
+
+    # The detection query may stay, but only as a candidate generator.
+    grep -F 'names suspects, never convicts' "$formula" >/dev/null ||
+        fail "the ps/grep detection must be labelled as candidate generation, not an orphan list"
+
+    # zombie_count must never read as "safe to kill".
+    grep -F 'zombie_count` does not mean Unix zombie' "$formula" >/dev/null ||
+        fail "dolt-health must state that zombie_count is not a Unix zombie count"
+}
+
 test_dog_assets_are_pack_local
 test_retired_dog_formulas_are_not_reintroduced
 test_every_close_states_whether_the_fix_is_deployed
@@ -834,5 +883,6 @@ test_composition_is_documented
 test_polecat_startup_uses_standard_hook_claim
 test_review_leg_contract_forbids_synthetic_mutation
 test_refinery_direct_merge_is_worktree_safe_and_fail_closed
+test_kill_paths_require_triage_not_judgment
 
 echo "gastown pack asset tests passed"
