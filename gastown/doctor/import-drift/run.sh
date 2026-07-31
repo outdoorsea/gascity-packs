@@ -18,14 +18,31 @@
 # So staleness was invisible until someone diffed a formula by hand. This check
 # makes it loud.
 #
-# Semantics: the count is a LOWER BOUND. It is measured against the remote refs
-# already in the pack clone, which were last updated by `gc import install`. No
-# network access happens here — doctor runs under a per-check time budget and a
-# fetch would make it slow and flaky. A clone whose refs are themselves stale
-# therefore under-reports drift; it never over-reports it. Wrong in the safe
-# direction: no false alarms, and the reported number is never worse than the
-# truth. The details block prints how old that view of upstream is so the number
-# can be read with the right confidence.
+# Semantics: the local count is a LOWER BOUND, and at zero it is not a verdict
+# at all (gp-jlt). The pack clone is content-addressed by (source, sha) and
+# cloned ONCE when the pin is created, then never fetched again — so its
+# `origin/main` is a fossil recording where main stood at pin time. For the
+# ordinary pin, cut from the tip of main, that fossil equals HEAD forever, and
+# `rev-list --count HEAD..origin/main` returns 0 however far main has since
+# advanced. Measured on this city's own pack cache: six of eleven clones had
+# HEAD == origin/main exactly, including the one pinned at 06c8a63f, which
+# reported 0 while main had moved 9 commits past it.
+#
+# So the check written to make staleness loud could only ever catch a pin that
+# was BORN behind. A pin that BECAME stale — the entire case it exists for —
+# read as "pin is current with origin/main". That is not wrong in the safe
+# direction. A missing check leaves you looking; a false green stops you
+# looking, and this one stopped three shipped fixes from being noticed while
+# each still had an active symptom in the town.
+#
+# Currency is therefore established by asking the remote, not by trusting the
+# fossil: one bounded `git ls-remote` for the branch tip. That is a single
+# refs-only round trip with no object transfer — not the fetch the original
+# design rightly refused on doctor's per-check time budget. When the probe
+# answers, the verdict is authoritative. When it cannot answer (offline, no way
+# to bound the call, or an operator-named local ref), the check falls back to
+# the local view and says which one it used — and a zero measured against refs
+# that have never been re-fetched is reported as UNVERIFIED, never as current.
 #
 # Exit codes: 0=OK, 1=Warning, 2=Error
 # stdout: first line=message, rest=details
@@ -34,6 +51,18 @@
 #   GC_PACK_DIR         — absolute pack directory (set by gc; e.g. <clone>/gastown)
 #   GC_PACK_DRIFT_REF   — override the reference branch (e.g. "origin/release").
 #                         Also the seam the tests drive.
+#   GC_PACK_DRIFT_NO_NETWORK — set to any non-empty value to skip the remote
+#                         probe entirely (air-gapped cities; also the seam the
+#                         tests drive to exercise the fallback deterministically).
+#                         Note this is not a mute switch: a pin whose currency
+#                         cannot be established still reports UNVERIFIED rather
+#                         than green, because that is the true state. Silencing
+#                         it would rebuild the false green this check exists to
+#                         prevent.
+#   GC_PACK_DRIFT_PROBE_TIMEOUT — seconds to bound the probe (default 5).
+#   GC_PACK_DRIFT_FORCE_SHELL_BOUND — bound the probe with the built-in
+#                         watchdog even where timeout(1) exists. Test seam, so
+#                         the fallback stock macOS always takes is covered.
 #
 # Note there is deliberately no GC_PACK_NAME here. gc injects that for pack
 # COMMAND dispatch and for orders, but the doctor runner does not: it passes
@@ -165,31 +194,215 @@ fetch_age() {
     printf '%s' $(( ( $(date +%s) - newest ) / 86400 ))
 }
 
-age=$(fetch_age)
-age_note="upstream view: last fetched ${age:-unknown} day(s) ago"
-[ -n "$age" ] || age_note="upstream view: last fetch time unknown"
+# Has anything ever refreshed this clone's remote-tracking refs?
+#
+# `git clone` does not write FETCH_HEAD; `git fetch` (and pull, and remote
+# update) does. Its absence is therefore positive evidence that no fetch has
+# ever run here, which means every remote-tracking ref still holds exactly what
+# it held at clone time. That is the ordinary state of a content-addressed pack
+# clone — and it is precisely what makes a local drift count of 0 worthless as
+# a claim about the present.
+refs_never_refetched() {
+    local gitdir
+    gitdir=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)
+    [ -n "$gitdir" ] || return 1
+    [ -e "$gitdir/FETCH_HEAD" ] && return 1
+    return 0
+}
 
-if [ "$behind" -eq 0 ]; then
-    echo "$pack pin is current with $ref"
-    echo "pinned at ${head_sha:0:12}"
-    echo "$age_note"
-    suspect_note
-    exit 0
+# Ask the remote for a branch tip. One refs-only round trip, bounded,
+# best-effort: sets PROBE_SHA and returns 0 only when the answer was actually
+# measured. Every failure mode — no bounding tool, transport error, auth,
+# timeout, or a branch that no longer exists upstream — collapses to "unknown"
+# rather than to a verdict. That is the same discipline
+# assets/scripts/polecat-worktree-reap.sh applies to its own ls-remote probes:
+# unreachable is not absent, and a probe that did not run is not a finding.
+PROBE_SHA=""
+
+probe_remote_tip() {
+    local branch="$1"
+    PROBE_SHA=""
+    [ -n "$branch" ] || return 1
+    [ -z "${GC_PACK_DRIFT_NO_NETWORK:-}" ] || return 1
+
+    local timeout_s="${GC_PACK_DRIFT_PROBE_TIMEOUT:-5}"
+    local tmp rc=0
+    tmp=$(mktemp 2>/dev/null) || return 1
+
+    # GC_PACK_DRIFT_FORCE_SHELL_BOUND is the seam the tests drive. Without it the
+    # hand-rolled branch below would only ever execute on hosts that happen to
+    # lack coreutils — i.e. never in CI, and always on a stock Mac. An untested
+    # bound on the one call that can hang is not a risk this check gets to take.
+    local forced="${GC_PACK_DRIFT_FORCE_SHELL_BOUND:-}"
+    if [ -z "$forced" ] && command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout_s" git -C "$dir" ls-remote --heads origin "refs/heads/$branch" >"$tmp" 2>/dev/null
+        rc=$?
+    elif [ -z "$forced" ] && command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "$timeout_s" git -C "$dir" ls-remote --heads origin "refs/heads/$branch" >"$tmp" 2>/dev/null
+        rc=$?
+    else
+        # No timeout(1) — stock macOS, minimal containers. Bound it by hand
+        # rather than skip: skipping would send every such host down the
+        # unverified path forever, which reintroduces the fossil blind spot by
+        # another route.
+        local probe_pid watchdog_pid
+        git -C "$dir" ls-remote --heads origin "refs/heads/$branch" >"$tmp" 2>/dev/null &
+        probe_pid=$!
+        ( sleep "$timeout_s"; kill -TERM "$probe_pid" 2>/dev/null ) >/dev/null 2>&1 &
+        watchdog_pid=$!
+        wait "$probe_pid" 2>/dev/null
+        rc=$?
+        kill -TERM "$watchdog_pid" 2>/dev/null
+        wait "$watchdog_pid" 2>/dev/null
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        # `--heads <pattern>` matches by tail glob, so compare the refname
+        # exactly rather than trusting the first line.
+        PROBE_SHA=$(awk -v r="refs/heads/$branch" '$2 == r { print $1; exit }' "$tmp" 2>/dev/null)
+    fi
+    rm -f "$tmp"
+    [ -n "$PROBE_SHA" ]
+}
+
+# Only a remote-tracking ref can be checked against a remote. An operator who
+# names a local ref through GC_PACK_DRIFT_REF is naming exactly the thing they
+# want compared, and no fossil problem arises there — that ref mirrors nothing.
+remote_branch=""
+case "$ref" in
+    origin/*) remote_branch="${ref#origin/}" ;;
+esac
+
+# Test the opt-out here rather than only inside the probe: a probe that was
+# never attempted must not be reported as one that failed to reach origin.
+# Same rule the verdicts follow — do not describe an unrun check as a finding.
+probe_state="skipped"
+if [ -n "$remote_branch" ] && [ -z "${GC_PACK_DRIFT_NO_NETWORK:-}" ]; then
+    if probe_remote_tip "$remote_branch"; then
+        probe_state="verified"
+    else
+        probe_state="unknown"
+    fi
+fi
+
+case "$probe_state" in
+    verified) probe_note="remote check: asked origin for $remote_branch just now" ;;
+    unknown) probe_note="remote check: could not reach origin — falling back to this clone's refs" ;;
+    *)
+        if [ -n "${GC_PACK_DRIFT_NO_NETWORK:-}" ]; then
+            probe_note="remote check: disabled by GC_PACK_DRIFT_NO_NETWORK"
+        else
+            probe_note="remote check: not applicable — $ref is not a remote-tracking ref"
+        fi
+        ;;
+esac
+
+age=$(fetch_age)
+if refs_never_refetched; then
+    # Saying "last fetched" here would be a fabrication: nothing was ever
+    # fetched, and the mtime being read is the clone's own birthday. Reported
+    # as a fetch age it looks reassuringly fresh on exactly the clones whose
+    # view of upstream is frozen solid.
+    age_note="upstream view: never re-fetched — refs are as of clone time, ${age:-unknown} day(s) ago"
+else
+    age_note="upstream view: last fetched ${age:-unknown} day(s) ago"
+    [ -n "$age" ] || age_note="upstream view: last fetch time unknown"
 fi
 
 ref_sha=$(git -C "$dir" rev-parse "$ref" 2>/dev/null)
 
-echo "$pack is $behind commit(s) behind $ref — agents load the pinned version, not $ref"
-echo "pinned at  ${head_sha:0:12}"
-echo "$ref is at ${ref_sha:0:12}"
-echo "$age_note (count is a lower bound)"
-echo "pack dir: $dir"
+# Every warning ends the same way, so the remediation lives in one place.
+remediation() {
+    echo
+    echo "Agents resolve formulas and commands from the PIN, not from the rig working"
+    echo "tree. Returning a checkout to its default branch does not move this pin."
+    echo "Remediation: advance the import pin, then reinstall and reload —"
+    echo "  update the import in city.toml (or the rig's [rigs.imports] entry)"
+    echo "  gc import install"
+    echo "  gc reload"
+}
+
+# --- the remote answered, so its tip decides ----------------------------------
+if [ "$probe_state" = verified ]; then
+    if [ "$PROBE_SHA" = "$head_sha" ]; then
+        echo "$pack pin is current with $ref — verified against origin"
+        echo "pinned at ${head_sha:0:12}"
+        echo "origin/$remote_branch tip is the same commit"
+        echo "$probe_note"
+        suspect_note
+        exit 0
+    fi
+
+    if [ "$behind" -gt 0 ]; then
+        echo "$pack is $behind commit(s) behind $ref — agents load the pinned version, not $ref"
+        echo "pinned at  ${head_sha:0:12}"
+        echo "$ref is at ${ref_sha:0:12}"
+        echo "origin/$remote_branch tip is ${PROBE_SHA:0:12}"
+        echo "$age_note (local count is a lower bound)"
+    else
+        # The gp-jlt shape exactly: the clone's own refs report zero because
+        # they are a snapshot of pin time, while the live branch has moved.
+        #
+        # State only what was measured. The pin differing from the live tip is
+        # a fact; "N commits behind" is not available here, because counting
+        # would need the intervening objects and this clone never fetched them.
+        # Nor is the direction certain — a pin cut from a commit that never
+        # landed on the branch also lands in this arm — and asserting one would
+        # be the same overclaiming that made the old green false.
+        echo "$pack pin is NOT current with $ref — pin and live $ref tip differ"
+        echo "pinned at  ${head_sha:0:12}"
+        echo "$ref tip is ${PROBE_SHA:0:12} (live, just asked)"
+        echo "this clone's $ref still reads ${ref_sha:0:12}, which is why a local count reports 0"
+        echo "distance is not countable here: the commits between were never fetched"
+        echo "$age_note"
+    fi
+    echo "$probe_note"
+    echo "pack dir: $dir"
+    suspect_note
+    remediation
+    exit 1
+fi
+
+# --- no remote answer: fall back to the local view, and say which one it is ---
+if [ "$behind" -gt 0 ]; then
+    echo "$pack is $behind commit(s) behind $ref — agents load the pinned version, not $ref"
+    echo "pinned at  ${head_sha:0:12}"
+    echo "$ref is at ${ref_sha:0:12}"
+    echo "$age_note (count is a lower bound)"
+    echo "$probe_note"
+    echo "pack dir: $dir"
+    suspect_note
+    remediation
+    exit 1
+fi
+
+# A local count of zero. Whether that is a currency claim or a fossil artefact
+# depends entirely on whether the refs it was measured against were ever
+# updated — so this is the branch where the false green used to live.
+if [ -n "$remote_branch" ] && refs_never_refetched; then
+    echo "$pack pin cannot be confirmed current with $ref — drift is UNVERIFIED"
+    echo "pinned at ${head_sha:0:12}"
+    echo "this clone's $ref also reads ${ref_sha:0:12}, so the local count is 0 —"
+    echo "but no fetch has ever run here, so that ref is a snapshot of pin time."
+    echo "A zero measured against it means the pin was current when it was CUT,"
+    echo "not that it is current now."
+    echo "$probe_note"
+    echo "pack dir: $dir"
+    suspect_note
+    remediation
+    exit 1
+fi
+
+# Either the operator named a local ref (nothing is mirroring anything, so the
+# comparison is exactly what they asked for), or the remote refs really have
+# been fetched at some point. Pass — but never silently about which it was.
+if [ -z "$remote_branch" ]; then
+    echo "$pack pin is current with $ref"
+else
+    echo "$pack pin is current with $ref as of the last fetch — not re-verified just now"
+fi
+echo "pinned at ${head_sha:0:12}"
+echo "$age_note"
+echo "$probe_note"
 suspect_note
-echo
-echo "Agents resolve formulas and commands from the PIN, not from the rig working"
-echo "tree. Returning a checkout to its default branch does not move this pin."
-echo "Remediation: advance the import pin, then reinstall and reload —"
-echo "  update the import in city.toml (or the rig's [rigs.imports] entry)"
-echo "  gc import install"
-echo "  gc reload"
-exit 1
+exit 0

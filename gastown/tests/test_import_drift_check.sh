@@ -59,8 +59,26 @@ make_pack_clone() {
 run_check() {
     local packdir="$1"
     shift
-    env -u GC_PACK_NAME -u GC_PACK_DRIFT_REF GC_PACK_DIR="$packdir" "$@" \
+    env -u GC_PACK_NAME -u GC_PACK_DRIFT_REF \
+        -u GC_PACK_DRIFT_NO_NETWORK -u GC_PACK_DRIFT_PROBE_TIMEOUT \
+        -u GC_PACK_DRIFT_FORCE_SHELL_BOUND \
+        GC_PACK_DIR="$packdir" "$@" \
         bash "$SCRIPT" 2>"$TMP/stderr"
+}
+
+# Move the fixture's upstream forward, leaving the clone's remote-tracking refs
+# untouched. This is the shape that made the check false-green (gp-jlt): the
+# pack clone is made once at pin time and never fetched again, so its
+# `origin/main` keeps reading the pin while the real branch advances past it.
+# Nothing here touches the clone, which is exactly the point.
+advance_upstream() {
+    local name="$1" n="$2"
+    local up="$TMP/$name-upstream" i
+    for ((i = 1; i <= n; i++)); do
+        echo "advance $i" >"$up/advanced.txt"
+        git_q -C "$up" add advanced.txt
+        git_q -C "$up" commit -m "advance $i"
+    done
 }
 
 # --- a pack with no upstream cannot drift ------------------------------------
@@ -89,17 +107,130 @@ test_current_pin_passes() {
     [ "$rc" -eq 0 ] || fail "current pin should exit 0, got $rc: $out"
     grep -qi "is current" <<<"$out" ||
         fail "current pin should report it is current, got: $out"
-    # The OK path is the one place this check can be quietly wrong, so it must
-    # still disclose how fresh its view of upstream is.
-    grep -qi "upstream view" <<<"$out" ||
-        fail "OK path must still report upstream freshness, got: $out"
 
-    # And that disclosure has to be a real number. The age probe resolves paths
+    # A green is only allowed to say "current" when something actually
+    # established currency. The local drift count cannot: in a pack clone it is
+    # measured against refs frozen at pin time (gp-jlt). So the OK path must
+    # name the remote it checked, and that claim is what this pins.
+    grep -qi "verified against origin" <<<"$out" ||
+        fail "OK path must say the claim was verified against the remote, got: $out"
+    grep -qi "asked origin for main" <<<"$out" ||
+        fail "OK path must disclose the remote probe it relied on, got: $out"
+}
+
+# --- the false green this check shipped with (gp-jlt) -------------------------
+
+# The whole incident in one test. A pack clone is content-addressed by
+# (source, sha), cloned once when the pin is created and never fetched again,
+# so its `origin/main` is frozen at pin time. Pin cut from the tip of main =>
+# HEAD == origin/main forever => `rev-list --count HEAD..origin/main` == 0
+# however far main advances. The check reported "pin is current with
+# origin/main" while the pin was nine commits behind and three shipped fixes
+# sat unnoticed behind it.
+test_fossil_refs_do_not_read_as_current() {
+    local clone
+    clone=$(make_pack_clone fossil 5 0)   # pinned at the tip: locally 0 behind
+    advance_upstream fossil 9             # main moves on; the clone never hears
+
+    # Assert the fixture really reproduces the shape, so this test cannot pass
+    # for the wrong reason if the clone layout ever changes.
+    local local_count
+    local_count=$(git -C "$clone" rev-list --count "HEAD..origin/main")
+    [ "$local_count" -eq 0 ] ||
+        fail "fixture is not reproducing the fossil shape (local count $local_count, want 0)"
+
+    local out rc
+    out=$(run_check "$clone") && rc=0 || rc=$?
+
+    [ "$rc" -eq 1 ] || fail "a pin upstream has moved past must warn, got $rc: $out"
+    grep -qi "not current" <<<"$out" ||
+        fail "must say the pin is not current, got: $out"
+    # The bead's requirement, as one assertion: a green must be unreachable for
+    # a pin that upstream has moved past, whatever the local count says.
+    if head -n1 <<<"$out" | grep -qiE "pin is current"; then
+        fail "first line must not read as a clean green, got: $(head -n1 <<<"$out")"
+    fi
+}
+
+# When the remote cannot be asked, a local zero is not evidence of currency —
+# it only says the pin was current when it was CUT. Passing green on it is the
+# same false green by a quieter route, so the unverifiable state gets its own
+# verdict rather than borrowing the healthy one.
+test_zero_drift_without_a_remote_answer_is_not_green() {
+    local clone
+    clone=$(make_pack_clone unverified 5 0)
+
+    local out rc
+    out=$(run_check "$clone" GC_PACK_DRIFT_NO_NETWORK=1) && rc=0 || rc=$?
+
+    [ "$rc" -eq 1 ] || fail "an unverifiable zero must not pass green, got $rc: $out"
+    grep -qi "UNVERIFIED" <<<"$out" ||
+        fail "must label the state unverified, got: $out"
+    # A probe that was never attempted must not be reported as one that failed
+    # to reach origin: describing an unrun check as a finding is the same class
+    # of defect as the false green itself.
+    grep -qi "disabled by GC_PACK_DRIFT_NO_NETWORK" <<<"$out" ||
+        fail "must report the probe was opted out, not that it failed, got: $out"
+}
+
+# A clone whose refs really have been fetched is measuring against something
+# real, so it may pass without the remote — but it must not overclaim, because
+# "fetched at some point" is not "current now".
+test_refetched_clone_passes_offline_but_says_it_was_not_re_verified() {
+    local clone
+    clone=$(make_pack_clone refetched 5 0)
+    git_q -C "$clone" fetch origin   # a real fetch, which writes FETCH_HEAD
+
+    local out rc
+    out=$(run_check "$clone" GC_PACK_DRIFT_NO_NETWORK=1) && rc=0 || rc=$?
+
+    [ "$rc" -eq 0 ] || fail "a genuinely fetched clone at zero drift should pass, got $rc: $out"
+    grep -qi "not re-verified just now" <<<"$out" ||
+        fail "an offline pass must disclose it was not re-verified, got: $out"
+
+    # The age disclosure has to be a real number. The age probe resolves paths
     # against the git dir, which sits one level above GC_PACK_DIR; when that
     # resolution broke, the line still printed but degraded to "unknown" and no
     # assertion noticed. Pin the number, not the label.
     grep -qE "last fetched [0-9]+ day" <<<"$out" ||
         fail "upstream freshness must report a numeric age, got: $out"
+}
+
+# The converse: a clone that never fetched must not be described as having
+# fetched. The mtime available on such a clone is its own birthday, and
+# reporting it as a fetch age reads reassuringly fresh on precisely the clones
+# whose view of upstream is frozen solid.
+test_never_refetched_clone_does_not_claim_a_fetch_age() {
+    local clone
+    clone=$(make_pack_clone neverfetched 5 2)
+
+    local out
+    out=$(run_check "$clone" GC_PACK_DRIFT_NO_NETWORK=1) || true
+
+    grep -qi "never re-fetched" <<<"$out" ||
+        fail "a clone that was never fetched must say so, got: $out"
+    if grep -qi "last fetched" <<<"$out"; then
+        fail "must not report a fetch age for a clone that never fetched, got: $out"
+    fi
+}
+
+# The probe is the only call here that can hang, so the bound around it is
+# load-bearing. On a host with coreutils that bound is timeout(1); on a stock
+# Mac it is the hand-rolled watchdog, which no CI runner would otherwise
+# execute. Drive the fallback explicitly and require the same verdict.
+test_shell_bounded_probe_reaches_the_same_verdict() {
+    local clone
+    clone=$(make_pack_clone shellbound 5 0)
+    advance_upstream shellbound 4
+
+    local out rc
+    out=$(run_check "$clone" GC_PACK_DRIFT_FORCE_SHELL_BOUND=1) && rc=0 || rc=$?
+
+    [ "$rc" -eq 1 ] || fail "watchdog-bounded probe must still catch drift, got $rc: $out"
+    grep -qi "not current" <<<"$out" ||
+        fail "watchdog-bounded probe must report the pin is not current, got: $out"
+    grep -qi "asked origin" <<<"$out" ||
+        fail "watchdog-bounded probe must still count as a remote answer, got: $out"
 }
 
 # --- the case this check was written for --------------------------------------
@@ -171,9 +302,17 @@ test_override_beats_a_contaminated_origin_head() {
     git_q -C "$clone" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/abandoned
     git_q -C "$clone" checkout "$fork"
 
+    # This assertion used to require a clean green here — a stale pin measured
+    # against a stale branch, reported healthy. That was the same false green
+    # gp-jlt is about, so the contract is now the opposite: a reference the
+    # remote cannot confirm is unverifiable, never OK. The override below is
+    # still what turns it into an actionable count.
     local out rc
     out=$(run_check "$clone") && rc=0 || rc=$?
-    [ "$rc" -eq 0 ] || fail "sanity: pin should look current against contaminated origin/HEAD, got $rc: $out"
+    [ "$rc" -eq 1 ] || fail "a contaminated origin/HEAD must not yield a green, got $rc: $out"
+    if head -n1 <<<"$out" | grep -qiE "pin is current"; then
+        fail "contaminated reference must not read as current, got: $(head -n1 <<<"$out")"
+    fi
 
     out=$(run_check "$clone" GC_PACK_DRIFT_REF=origin/main) && rc=0 || rc=$?
     [ "$rc" -eq 1 ] || fail "override should expose drift hidden by origin/HEAD, got $rc: $out"
