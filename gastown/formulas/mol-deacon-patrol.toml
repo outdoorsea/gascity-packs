@@ -75,6 +75,14 @@ default = "60"
 description = "Minutes of witness heartbeat silence before health-scan's deterministic pass calls the patrol loop stalled. The default is 1.5x the witness idle_timeout (1h) — the longest legitimate silence for a healthy witness, and an order of magnitude under the multi-hour stalls this catches. Lower it only if your witness idle_timeout is lower."
 default = "90"
 
+[vars.starvation_stale_min]
+description = "Minutes a coordination or merge session may hold a non-empty queue without the queue changing before queue-starvation-check calls it starved. The default is ~6x the 300s max patrol backoff: these agents cycle in seconds when work is present, so half an hour of silence on a non-empty queue is an eternity rather than a lull."
+default = "30"
+
+[vars.starvation_polecat_min]
+description = "The same window for polecats, which legitimately spend longer inside a single implement step. Deliberately a longer window rather than an exemption — exempting polecats is how a stuck one becomes invisible."
+default = "120"
+
 [[steps]]
 id = "check-inbox"
 title = "Context check, then mail"
@@ -316,41 +324,86 @@ The deacon's wisp-freshness check catches "no patrol activity" but not
 "active polling, wrong filter, queue silently piling up." This step
 closes that gap.
 
-**Step 1: For each active coordination/merge session, compute the pair:**
-- `A` = count of open beads assigned to the session's agent identity
-- `B` = the most recent bead.updated_at across those beads (work signal)
+**Config: starvation_stale_min = {{starvation_stale_min}}**
+**Config: starvation_polecat_min = {{starvation_polecat_min}}**
+
+**Step 1: Measure. Do not eyeball this.**
 
 ```bash
-gc agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
-    ASSIGNED=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
-    LATEST=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 \\
-        | jq -r '[.[].updated_at] | max // ""')
-    printf '%s\\t%s\\t%s\\n' "$AGENT" "$ASSIGNED" "$LATEST"
-done
+STARVE_OUT=$(mktemp)
+STARVE_ERR=$(mktemp)
+GASTOWN_STARVATION_STALE_MIN={{starvation_stale_min}} \\
+GASTOWN_STARVATION_POLECAT_MIN={{starvation_polecat_min}} \\
+    gc gastown queue-starvation-check >"$STARVE_OUT" 2>"$STARVE_ERR"
+STARVE_RC=$?
 ```
 
-The latest bead.updated_at is the cheapest proxy for "did this session
-move work recently?" — every claim, status transition, metadata update,
-or note bumps it.
+For every session in a working state the check computes the pair this step
+has always been about, and prints one TSV row per session:
 
-**Step 2: Flag when queue > 0 and signal is stale (judgment call,
-guideline ~30min):**
+    verdict  rig  session  role  queued  age_seconds  identity
 
-If `A > 0` AND `now - B` has grown well past the patrol's natural
-cadence (default guideline: 30min — roughly 6x the 300s max patrol
-backoff), the session is holding work without making progress. This
-is exactly why an LLM does it, not Go code. Consider:
-- Coordination agents (refinery, witness) naturally cycle in seconds
-  when work is present; 30min is an eternity, not a lull.
-- Polecats may take longer per step; be more lenient before flagging.
-- A freshly-assigned bead with no prior activity gets `updated_at` at
-  assignment time; if it's hours old, the session picked it up but
-  never acted.
+- `queued` = open+in_progress beads assigned to that session, counted across
+  BOTH assignee spellings. `--assignee` is an exact match and Gas Town writes
+  two: a polecat self-claim lands the session NAME
+  (`gastown__polecat-gk-s4j0`), a refinery handoff lands the agent ADDRESS
+  (`meety-local/gastown.refinery`).
+- `age_seconds` = time since the newest `updated_at` in that queue — the work
+  signal. Every claim, status transition, metadata update or note bumps it.
 
-**Step 3: For flagged sessions, nudge first, then warrant:**
+Verdicts: `idle` (no work — healthy), `working` (queue moved inside the
+window), `starved` (queue has not moved), and `schema-drift` /
+`query-failed`, which mean nothing was measured for that session.
+
+Exit codes: 0 = all idle or working, 1 = findings on stdout, 2 = could not run.
+
+**Step 2: Decide what the exit status means BEFORE reading any rows.**
 
 ```bash
-gc session nudge "$STUCK_SESSION" "Queue has $ASSIGNED open beads, no bead activity for <duration>. Run gc hook."
+if [ "$STARVE_RC" -eq 2 ] || { [ "$STARVE_RC" -ne 0 ] && [ ! -s "$STARVE_OUT" ]; }; then
+    echo "queue-starvation-check DID NOT RUN: $(head -1 "$STARVE_ERR")"
+    # Carry this into the patrol summary as UNMEASURED and stop treating the
+    # work layer as scanned. Never record a clean health scan on the strength
+    # of a check that did not run.
+fi
+```
+
+A non-zero exit with empty stdout is `gc` refusing to dispatch the
+subcommand — a city whose pack pin predates this command — not a clean
+queue. Keeping those two apart is the entire reason this step was rewritten
+(gp-b3x). What it replaced called `gc agents list --json --active`, which
+does not exist: `gc` printed an `{"ok":false}` envelope to stdout and exited
+1, but the call sat at the head of a pipeline whose status the shell takes
+from the tail, so nothing noticed and jq turned the envelope into zero rows.
+It also queried `--status=open`, which cannot see a CLAIMED bead, and probed
+a single identity namespace. Each fault produced zero rows; zero rows read as
+an empty queue. The step returned A=0 for every session forever and reported
+clean — so upstream #1833, the incident it exists to catch, would have passed
+it silently. A detector whose failure mode is silence has the same defect
+class as the thing it detects.
+
+**Step 3: Apply judgment to the `starved` rows.**
+
+The check measures; you decide. It never nudges, mails, or files warrants —
+those are this step's calls, and routing them through an LLM is the point.
+Weigh each starved row:
+- Coordination agents (refinery, witness) cycle in seconds when work is
+  present, so a starved verdict on one is strong evidence.
+- Polecats already get the longer `starvation_polecat_min` window, so a
+  starved polecat has been silent well past a normal implement step.
+- A freshly-assigned bead gets `updated_at` at assignment time; an age of
+  hours means the session took the work and never acted on it.
+- `schema-drift` and `query-failed` rows are findings about the CHECK, not
+  about the session. Never warrant on one — report it and get it fixed.
+
+**Step 4: For flagged sessions, nudge first, then warrant:**
+
+`$STUCK_SESSION` is the `session` column of the starved row and `$QUEUED` its
+`queued` column — take them from the row, not from a count you recomputed by
+hand.
+
+```bash
+gc session nudge "$STUCK_SESSION" "Queue has $QUEUED beads (open+in_progress), no bead activity for <duration>. Run gc hook."
 ```
 
 If the nudge doesn't unstick within the next patrol cycle, escalate
@@ -367,7 +420,7 @@ if [ "${EXISTING_WARRANT:-0}" -gt 0 ]; then
     echo "Skipping warrant for $TARGET_SESSION — an open warrant already exists."
 else
     gc bd create --type=task --label=warrant \
-        --title="Stuck queue: <session> — $ASSIGNED beads, no activity $duration" \
+        --title="Stuck queue: <session> — $QUEUED beads, no activity $duration" \
         --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 fi
 ```
@@ -375,11 +428,14 @@ fi
 The dog runs `mol-shutdown-dance` and the controller respawns a fresh
 session that re-reads the queue with a correct filter.
 
-**Step 4: A genuinely-idle session (no assigned beads) is NOT flagged.**
-If `A == 0`, this step is a no-op for that session. Idle-but-ready
-refineries and witnesses are healthy.
+**Step 5: A genuinely-idle session (no assigned beads) is NOT flagged.**
+The check reports those as `idle` and they are healthy — an idle-but-ready
+refinery or witness is what a quiet town looks like. Flagging them is how a
+starvation detector gets muted.
 
-Close this step after the cross-check runs for every active session."""
+Close this step after the check has run and every `starved` row has been
+acted on or explicitly dismissed. If the check DID NOT RUN, say so in the
+patrol summary — an unmeasured work layer is not a healthy one."""
 
 [[steps]]
 id = "utility-agent-health"

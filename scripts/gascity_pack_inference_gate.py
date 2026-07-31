@@ -223,7 +223,25 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
     "mol-deacon-patrol": (
         "Work-layer health",
         "queue-starvation-check",
-        "gc agents list --json --active",
+        # Was "gc agents list --json --active" until gp-b3x. That pin guarded a
+        # roster call that does not exist in any city — `gc agent` is config and
+        # the roster is `gc session list` — so the step it pinned could not fire.
+        # It sat at the head of a pipeline, whose exit status the shell takes
+        # from the tail, so `gc`'s {"ok":false} envelope became zero rows and
+        # zero rows read as an empty queue.
+        #
+        # The guarantee now lives in the command, not the snippet: measurement
+        # moved into assets/scripts/queue-starvation-check.sh behind
+        # `gc gastown queue-starvation-check`, which is testable (every failure
+        # path exits 2 — "NOT measured" — instead of degrading to a clean
+        # report) and covered by gastown/tests/test_queue_starvation_check.sh,
+        # including a true positive on a synthetic starved queue. Pinning the
+        # invocation keeps the step wired to that command; pinning DID NOT RUN
+        # keeps it able to tell "gc refused to dispatch" (a city whose pin
+        # predates the command) from "the queue is clean", which is the exact
+        # confusion that made the original silent.
+        "gc gastown queue-starvation-check",
+        "DID NOT RUN",
         "gc bd create --type=task --label=warrant",
         "\"gc.routed_to\":\"{{binding_prefix}}dog\"",
     ),
