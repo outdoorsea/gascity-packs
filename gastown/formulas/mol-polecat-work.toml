@@ -602,19 +602,31 @@ if [ "$NO_CODE_CHANGE" != "true" ] && [ "$COMMITS_AHEAD" = "0" ]; then
 fi
 ```
 
+Both arms below repeat that same condition rather than relying on the block
+above having established it. The repetition is load-bearing, not clutter: each
+block is run on its own, and an unguarded `gc bd update --set-metadata
+no_code_change=true` is a one-line self-certification out of the false-completion
+guard the moment it is reached with a branch that carries commits. Guarded, the
+worst case is a no-op — an arm reached in a fresh shell sees an empty
+`$COMMITS_AHEAD`, fails the `= "0"` test, and does nothing. That is the correct
+direction to fail: the flag is a claim about a deliverable, and a block that
+cannot see the diff has no basis to make it.
+
 **Arm 1 — there IS an external deliverable you just re-verified.** Set the flag
 here, with its provenance, then continue to the push:
 ```bash
-SETTER="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-unknown-session}}}}"
-gc bd update "$WORK_BEAD_ID" \
-  --set-metadata no_code_change=true \
-  --set-metadata no_code_change_source="set by polecat $SETTER at submit-and-exit, discovered from the empty diff; NOT filed with the bead at dispatch" \
-  --set-metadata no_code_change_evidence="<system>: <what you recorded or changed there>; verified by <the check you ran at the source>" \
-  --notes "NO PATCH BY DESIGN — flag set here, not at dispatch. Branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}}; the empty diff is the intended outcome, not a failure.
+if [ "$NO_CODE_CHANGE" != "true" ] && [ "$COMMITS_AHEAD" = "0" ]; then
+  SETTER="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-unknown-session}}}}"
+  gc bd update "$WORK_BEAD_ID" \
+    --set-metadata no_code_change=true \
+    --set-metadata no_code_change_source="set by polecat $SETTER at submit-and-exit, discovered from the empty diff; NOT filed with the bead at dispatch" \
+    --set-metadata no_code_change_evidence="<system>: <what you recorded or changed there>; verified by <the check you ran at the source>" \
+    --notes "NO PATCH BY DESIGN — flag set here, not at dispatch. Branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}}; the empty diff is the intended outcome, not a failure.
 DELIVERABLE: <what the bead asked for, and where it now lives — the system, the ids, the values>.
 VERIFIED: <the independent check you ran at the source, and what it returned>.
 Refinery: there is no merge to assert. Confirm the deliverable at the source, then close as done-without-merge."
-NO_CODE_CHANGE=true
+  NO_CODE_CHANGE=true
+fi
 ```
 
 `no_code_change_source` exists because the refinery states — correctly — that it
@@ -629,24 +641,26 @@ is unfinished work, and the honest disposition is to say so plainly. Do not set
 the flag, and do not push: there is nothing for anyone downstream to verify
 against, so an empty ref here would evidence nothing.
 ```bash
-gc bd update "$WORK_BEAD_ID" \
-  --status=blocked \
-  --assignee="" \
-  --set-metadata gc.routed_to=human \
-  --set-metadata halt_reason=zero_diff_unexplained \
-  --notes "ZERO DIFF, UNEXPLAINED — branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}} and I could not name an external deliverable that accounts for it.
+if [ "$NO_CODE_CHANGE" != "true" ] && [ "$COMMITS_AHEAD" = "0" ]; then
+  gc bd update "$WORK_BEAD_ID" \
+    --status=blocked \
+    --assignee="" \
+    --set-metadata gc.routed_to=human \
+    --set-metadata halt_reason=zero_diff_unexplained \
+    --notes "ZERO DIFF, UNEXPLAINED — branch $EXPECTED_BRANCH is 0 commits ahead of origin/{{base_branch}} and I could not name an external deliverable that accounts for it.
 Deliberately NOT flagged no_code_change: I have no source to cite, and that flag is a claim about where a deliverable LIVES, never a way out of a build.
 WHAT I DID: <the steps you actually took>.
 WHERE I STOPPED: <the specific thing that blocked you, or what you found already true>.
 No branch pushed — an empty ref proves nothing when there is no deliverable to point at.
 HUMAN CALL: re-scope the bead, or close it if the ask is already moot."
-WITNESS_TARGET=$(gc gastown agent-address witness --quiet \
-    --candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness") || WITNESS_TARGET=""
-if [ -n "$WITNESS_TARGET" ]; then
-  gc session nudge "$WITNESS_TARGET" "ZERO-DIFF UNEXPLAINED: $WORK_BEAD_ID — no patch and no external deliverable to cite; halted before push, routed to human." || true
+  WITNESS_TARGET=$(gc gastown agent-address witness --quiet \
+      --candidate "${GC_RIG:+$GC_RIG/}{{binding_prefix}}witness") || WITNESS_TARGET=""
+  if [ -n "$WITNESS_TARGET" ]; then
+    gc session nudge "$WITNESS_TARGET" "ZERO-DIFF UNEXPLAINED: $WORK_BEAD_ID — no patch and no external deliverable to cite; halted before push, routed to human." || true
+  fi
+  gc runtime drain-ack
+  exit 0
 fi
-gc runtime drain-ack
-exit 0
 ```
 
 Arm 2 halts to a human rather than to the refinery for the same reason the

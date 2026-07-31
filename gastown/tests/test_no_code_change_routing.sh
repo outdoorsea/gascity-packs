@@ -52,18 +52,29 @@ fail() {
 
 command -v jq >/dev/null 2>&1 || fail "jq is required to exercise the merge selector"
 
-# Emit the single fenced bash block of STEP containing ANCHOR, with {{vars}}
-# rendered from the formula's own defaults the way the formula engine renders
-# them. Requiring EXACTLY one match is deliberate: if a step is reorganised and
-# an anchor goes missing or turns ambiguous, this dies loudly instead of quietly
-# exercising nothing.
+# Emit fenced bash block(s) of STEP containing ANCHOR, with {{vars}} rendered
+# from the formula's own defaults the way the formula engine renders them.
+#
+#   extract_step_block FORMULA STEP ANCHOR         -> the one match; dies if != 1
+#   extract_step_block FORMULA STEP ANCHOR INDEX   -> the INDEXth match, 0-based
+#   count_step_blocks  FORMULA STEP ANCHOR         -> how many blocks match
+#
+# The unindexed form's exactly-one requirement is deliberate: if a step is
+# reorganised and an anchor goes missing or turns ambiguous, this dies loudly
+# instead of quietly exercising nothing.
+#
+# An anchor that legitimately has more than one site takes the indexed form and
+# asserts over EVERY one of them. Widening it to "just check the first" would be
+# the same silent under-assertion the exactly-one rule exists to prevent, only
+# reached by a different route -- and the second site is precisely where a
+# guard goes missing, because the first one is the one everybody reads.
 extract_step_block() {
-    python3 - "$1" "$2" "$3" <<'PY'
+    python3 - "$1" "$2" "$3" "${4-}" <<'PY'
 import re
 import sys
 import tomllib
 
-formula, step_id, anchor = sys.argv[1], sys.argv[2], sys.argv[3]
+formula, step_id, anchor, index = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(formula, "rb") as handle:
     data = tomllib.load(handle)
 
@@ -72,13 +83,22 @@ blocks = [
     b for b in re.findall(r"```bash\n(.*?)```", step["description"], re.S)
     if anchor in b
 ]
-if len(blocks) != 1:
-    sys.exit(
-        f"expected exactly 1 {step_id} bash block containing {anchor!r}, "
-        f"found {len(blocks)}"
-    )
+if index == "":
+    if len(blocks) != 1:
+        sys.exit(
+            f"expected exactly 1 {step_id} bash block containing {anchor!r}, "
+            f"found {len(blocks)}"
+        )
+    chosen = blocks[0]
+else:
+    if int(index) >= len(blocks):
+        sys.exit(
+            f"asked for {step_id} bash block {index} containing {anchor!r}, "
+            f"but only {len(blocks)} match"
+        )
+    chosen = blocks[int(index)]
 
-rendered = blocks[0]
+rendered = chosen
 values = {name: spec.get("default", "") for name, spec in data.get("vars", {}).items()}
 values.setdefault("rig_name", "testrig")
 values.setdefault("target_branch", "main")
@@ -86,6 +106,24 @@ values.setdefault("base_branch", "main")
 for name, value in values.items():
     rendered = rendered.replace("{{%s}}" % name, str(value))
 sys.stdout.write(rendered)
+PY
+}
+
+count_step_blocks() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import re
+import sys
+import tomllib
+
+formula, step_id, anchor = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(formula, "rb") as handle:
+    data = tomllib.load(handle)
+step = next(s for s in data["steps"] if s["id"] == step_id)
+blocks = [
+    b for b in re.findall(r"```bash\n(.*?)```", step["description"], re.S)
+    if anchor in b
+]
+sys.stdout.write(str(len(blocks)))
 PY
 }
 
@@ -444,12 +482,45 @@ printf '%s' "$clear_guard" | grep -Fq 'COMMITS_AHEAD' \
 printf '%s' "$clear_guard" | grep -Fq -- '-gt 0' \
     || fail "the flag is cleared only when the branch actually carries commits; guard was: $clear_guard"
 
-POLECAT_EVIDENCE=$(extract_step_block "$POLECAT_FORMULA" submit-and-exit 'no_code_change_evidence')
-evidence_guard=$(guard_condition "$POLECAT_EVIDENCE" 'no_code_change_evidence')
-printf '%s' "$evidence_guard" | grep -Fq 'COMMITS_AHEAD' \
-    || fail "the polecat must confirm the branch is genuinely empty before recording no-patch evidence; guard was: $evidence_guard"
-printf '%s' "$evidence_guard" | grep -Fq '"0"' \
-    || fail "no-patch evidence is recorded only for a branch with zero commits ahead; guard was: $evidence_guard"
+# EVERY site that records no-patch evidence must be guarded on a genuinely empty
+# branch -- not merely the first one. The formula has more than one legitimately:
+# one reconciles a flag someone else filed at dispatch, another sets the flag on
+# an unflagged empty branch (gp-dn1, the case that previously had no exit at
+# all). Asserting only the first would leave the newer site free to record
+# evidence -- or set the marker -- on a branch carrying real commits.
+evidence_sites=$(count_step_blocks "$POLECAT_FORMULA" submit-and-exit 'no_code_change_evidence')
+[ "$evidence_sites" -ge 1 ] \
+    || fail "submit-and-exit records no_code_change_evidence nowhere; the refinery's no-patch triage has nothing to carry to the human"
+site=0
+while [ "$site" -lt "$evidence_sites" ]; do
+    evidence_block=$(extract_step_block "$POLECAT_FORMULA" submit-and-exit 'no_code_change_evidence' "$site")
+    evidence_guard=$(guard_condition "$evidence_block" 'no_code_change_evidence') \
+        || fail "no_code_change_evidence site $site is not inside any \`if\` at all, so nothing stops it running on a branch that carries commits"
+    printf '%s' "$evidence_guard" | grep -Fq 'COMMITS_AHEAD' \
+        || fail "the polecat must confirm the branch is genuinely empty before recording no-patch evidence (site $site of $evidence_sites); guard was: $evidence_guard"
+    printf '%s' "$evidence_guard" | grep -Fq '"0"' \
+        || fail "no-patch evidence is recorded only for a branch with zero commits ahead (site $site of $evidence_sites); guard was: $evidence_guard"
+    site=$((site + 1))
+done
+
+# Setting the marker is the strictly stronger act: evidence is a note, but the
+# flag is what routes the bead out of the merge queue. An unguarded set is a
+# one-line self-certification out of the false-completion guard, so every site
+# that sets it carries the same zero-commit guard.
+setter_sites=$(count_step_blocks "$POLECAT_FORMULA" submit-and-exit '--set-metadata no_code_change=true')
+[ "$setter_sites" -ge 1 ] \
+    || fail "no submit-and-exit block SETS no_code_change; the refinery's triage selects on a marker nothing writes, which is the gp-dn1 defect exactly"
+site=0
+while [ "$site" -lt "$setter_sites" ]; do
+    setter_block=$(extract_step_block "$POLECAT_FORMULA" submit-and-exit '--set-metadata no_code_change=true' "$site")
+    setter_guard=$(guard_condition "$setter_block" '--set-metadata no_code_change=true') \
+        || fail "the block setting no_code_change (site $site) is not inside any \`if\`; a bare set flags any branch it is run against, whatever the diff says"
+    printf '%s' "$setter_guard" | grep -Fq 'COMMITS_AHEAD' \
+        || fail "setting no_code_change must be guarded on the real commit count, never on the polecat's belief about its own work (site $site); guard was: $setter_guard"
+    printf '%s' "$setter_guard" | grep -Fq '"0"' \
+        || fail "no_code_change is set only for a branch with zero commits ahead (site $site); guard was: $setter_guard"
+    site=$((site + 1))
+done
 
 SUBMIT_STEP=$(python3 - "$POLECAT_FORMULA" <<'PY'
 import sys
