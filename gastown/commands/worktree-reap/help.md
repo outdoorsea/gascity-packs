@@ -43,7 +43,11 @@ summary on stderr:
   keep-claimed   a non-closed bead points `metadata.work_dir` at this path.
   keep-cooling   closed too recently; inside the grace window.
   keep-dirty     uncommitted or untracked files are present.
-  keep-unmerged  commits whose PATCHES are not yet on the target ref.
+  keep-unmerged  commits whose PATCHES are not on the target ref, AND which the
+                 subject reconciliation below did not clear either. The detail
+                 column names which signal declined, so a genuinely unpublished
+                 tree reads differently from one whose patch was merely adjusted
+                 on the way in.
   keep-locked    the worktree is locked.
   keep-self      the reaper is running inside this tree.
   unverifiable   the tree was NOT measured — unreadable bead, a basename that
@@ -71,6 +75,29 @@ trees: gp-982 is_ancestor=YES, gp-px5 NO, gp-nrm NO — all three with zero
 unmerged patches. An ancestry-keyed reaper reaps the first and leaks the other
 two forever. `git cherry` compares patch-ids and sees all three as landed.
 
+Why patch-id alone is not enough: patch-id survives a CLEAN rebase, which is
+what makes it stronger than ancestry, but it does NOT survive a rebase that
+CHANGES the diff — a conflict resolved by hand, a reviewer's touch-up, a
+comment reflowed. What lands is a different patch, so `git cherry` reports `+`
+forever and the tree is refused on every cycle the reaper will ever run.
+Measured on gascity-packs (2026-07-31), three closed, clean, branch-deleted
+trees whose work was demonstrably on main: gp-f4m, gp-apx, gp-q6i. gp-q6i's two
+versions have IDENTICAL diffstats and differ by six bytes of reworded comment.
+
+So a second, INDEPENDENT positive signal is consulted only after the patch
+check has already refused. It does not loosen that check; it must clear on its
+own terms, all three of: every flagged commit has a same-subject twin in
+`merge-base(HEAD, target)..target`; each of those subjects names THIS tree's
+bead; and the branch the refinery merges is absent from origin. Subjects
+survive exactly what patch-ids do not — rebase rewrites the diff, never the
+message — which is what makes the two signals independent rather than two
+spellings of one. Requiring the bead id stops a generic subject ("fix: typo")
+from matching an unrelated commit, matches are counted per distinct subject so
+a tree holding two same-subject commits cannot be cleared by one landing, and
+the deleted branch is the refinery's own after-merge signal. Any clause that
+cannot be MEASURED — no merge base, an unreadable subject, an `ls-remote` that
+failed for transport reasons rather than a missing ref — keeps the tree.
+
 Why agent liveness is never an input: "this agent has no session, so its
 workspace is garbage" is wrong in both directions, both observed live. A
 rejected bead resumed by a DIFFERENT polecat keeps `metadata.work_dir` pointing
@@ -88,9 +115,10 @@ only real race, a session that has drain-acked but has not yet been killed,
 using the bead's own `closed_at` rather than an inference about the agent.
 
 Two checks carry the safety argument — `git status --porcelain` is empty, and
-`git cherry <target> HEAD` reports no `+` commits. Together they mean reaping
-cannot lose work. The rest answer a different question, "is anyone still using
-it", and exist to protect in-flight work that merely looks finished.
+the work is demonstrably on the target, either by patch-id or by the subject
+reconciliation above. Together they mean reaping cannot lose work. The rest
+answer a different question, "is anyone still using it", and exist to protect
+in-flight work that merely looks finished.
 
 Deciding to reap is the witness's, taken in the `reap-landed-worktrees` step of
 mol-witness-patrol, which runs this command with `--reap` after orphan salvage

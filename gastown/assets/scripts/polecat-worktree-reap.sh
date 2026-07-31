@@ -50,6 +50,52 @@
 # trap in the other direction is why gp-zs8 stopped inferring a queue bypass
 # from ancestry.)
 #
+# ## C6b: patch-id is not stable when the patch is ADJUSTED on the way in
+#
+# Patch-id survives a CLEAN rebase — same diff, new SHA — which is exactly what
+# makes C6 stronger than ancestry. It does NOT survive a rebase that CHANGES
+# the diff: a conflict resolved by hand, a reviewer's touch-up applied before
+# the merge, a comment reflowed. What lands is a different patch, so its
+# patch-id differs, so `git cherry` reports `+` forever and the tree is refused
+# on every cycle the reaper will ever run. Measured on this rig (2026-07-31),
+# three closed, clean, branch-deleted trees whose work was demonstrably on main:
+#
+#   gp-f4m  6801256 landed as 43d1eda
+#   gp-apx  13629aa landed as 8107684
+#   gp-q6i  43004be landed as c42e259
+#
+# gp-q6i's two versions have IDENTICAL diffstats and differ by six bytes of
+# reworded comment — enough to move the patch-id from 0664cd18 to 95d6a2dd. So
+# this is not an exotic conflict case: any edit at all on the way in does it,
+# and review touch-ups are routine.
+#
+# That makes patch-id the THIRD identity notion to break against a rebasing
+# merge queue, after SHA ancestry (gp-a7z) and commit shape (gp-zs8). So C6b
+# does not replace C6 or loosen it. It is an ALTERNATIVE positive signal,
+# consulted only after C6 has already refused, and it must clear on its own
+# terms — all three of:
+#
+#   * every commit C6 flagged has a same-subject twin in the window
+#     merge-base(HEAD, target)..target;
+#   * each of those subjects names THIS tree's bead;
+#   * the branch the refinery merges is absent from origin.
+#
+# Each clause carries weight. Subjects survive a rebase exactly when patch-ids
+# do not — rebase rewrites the diff, never the message — which is what makes
+# the two signals independent rather than two spellings of one. Requiring the
+# bead id inside the subject is what stops a generic subject ("fix: typo") from
+# matching an unrelated commit; the polecat formula mandates that spelling. The
+# window starts at the merge base because a landing can only be on the target
+# AFTER the tree branched, which also bounds the walk. Matches are counted per
+# distinct subject rather than merely existence-checked, so a tree holding two
+# same-subject commits cannot be cleared by a single landing. And the deleted
+# origin branch is the refinery's own after-merge signal — an independent
+# witness that a merge happened, not a restatement of the subject match.
+#
+# The refusal direction is preserved throughout: any clause that cannot be
+# MEASURED — no merge base, an unreadable subject, an `ls-remote` that failed
+# for transport reasons rather than a missing ref — keeps the tree.
+#
 # ## Why agent liveness is never an input
 #
 # The obvious predicate — "this agent has no session, so its workspace is
@@ -96,7 +142,9 @@
 #   keep-claimed  <TAB> <bead> <TAB> <path> <TAB> claimed by <bead>
 #   keep-cooling  <TAB> <bead> <TAB> <path> <TAB> closed <n>m ago
 #   keep-dirty    <TAB> <bead> <TAB> <path> <TAB> <n> uncommitted paths
-#   keep-unmerged <TAB> <bead> <TAB> <path> <TAB> <n> patches not on <target>
+#   keep-unmerged <TAB> <bead> <TAB> <path> <TAB> <n> patches not on <target>,
+#                 plus why C6b did not clear it either — so a genuinely
+#                 unpublished tree is distinguishable from a near-miss
 #   keep-locked   <TAB> <bead> <TAB> <path> <TAB> worktree is locked
 #   keep-self     <TAB> <bead> <TAB> <path> <TAB> we are running inside it
 #   unverifiable  <TAB> <bead> <TAB> <path> <TAB> <why it was NOT measured>
@@ -145,7 +193,11 @@ while [ $# -gt 0 ]; do
       TARGET_OVERRIDE="$2"; shift 2 ;;
     --target=*) TARGET_OVERRIDE="${1#--target=}"; shift ;;
     -h|--help)
-      sed -n '2,126p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the header block by SHAPE, not by line number: every comment line
+      # after the shebang, stopping at the first line that is not one. A magic
+      # `2,126p` range silently truncates or overruns the moment the header
+      # grows, and this header is where the whole safety argument lives.
+      awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
       exit 0 ;;
     *) echo "$ME: unexpected argument '$1'" >&2; exit 2 ;;
   esac
@@ -246,6 +298,82 @@ normalize_target() {
   esac
 }
 
+# origin_branch_state — present | absent | unknown for the branch the refinery
+# would have deleted after merging.
+#
+# `ls-remote --exit-code` reserves exit 2 for "no matching refs"; every other
+# non-zero is a transport, auth, or repo failure. Collapsing the two would make
+# an offline run report that every branch had been deleted — a fail-OPEN on a
+# signal C6b treats as corroborating evidence, which is the one direction this
+# script never takes. `unknown` therefore keeps the tree, and also keeps the
+# reap evidence honest for the C6 path, which used to print "origin branch
+# deleted" whenever the probe merely failed to run.
+origin_branch_state() {
+  local br="$1" rc=0
+  [ -n "$br" ] || { printf 'unknown'; return 0; }
+  git -C "$REPO" ls-remote --exit-code --heads origin "$br" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) printf 'present' ;;
+    2) printf 'absent' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
+# landed_by_subject — C6b. Does every commit `git cherry` flagged as missing
+# have a same-subject twin already on the target? See the C6b section in the
+# header for why subject survives what patch-id does not, and why each guard
+# below is load-bearing. Returns 0 only when the answer is measured and yes;
+# any unmeasurable input returns non-zero, which keeps the tree.
+landed_by_subject() {
+  local wt="$1" target="$2" bead="$3" cherry="$4"
+  local mb mark sha subj
+
+  # A landing can only be on the target AFTER this tree branched, so the merge
+  # base is both the correct lower bound and the thing that keeps this off a
+  # full-history walk. No merge base (unrelated histories) means no window to
+  # search, which is an abstention, not a clearance.
+  mb=$(git -C "$wt" merge-base HEAD "$target" 2>/dev/null) || return 1
+  [ -n "$mb" ] || return 1
+
+  : >"$SUBJ_LOCAL_FILE"
+  while read -r mark sha; do
+    [ "$mark" = "+" ] || continue
+    [ -n "$sha" ] || return 1
+    subj=$(git -C "$wt" log -1 --format=%s "$sha" 2>/dev/null) || return 1
+    [ -n "$subj" ] || return 1
+    # The subject must name this tree's own bead. Without it, a commit whose
+    # subject is common enough to recur ("fix: typo") could be cleared by an
+    # unrelated landing; with it, the match is anchored to the bead whose id
+    # C1 already proved is this directory's basename.
+    case "$subj" in
+      *"$bead"*) ;;
+      *) return 1 ;;
+    esac
+    printf '%s\n' "$subj" >>"$SUBJ_LOCAL_FILE"
+  done <<EOF
+$cherry
+EOF
+
+  # Empty means we measured nothing — and would also invert awk's NR==FNR
+  # file-discrimination below, silently reading the target's subjects as the
+  # tree's and clearing on a comparison with itself.
+  [ -s "$SUBJ_LOCAL_FILE" ] || return 1
+
+  git -C "$wt" log "$mb..$target" --no-merges --format=%s \
+    >"$SUBJ_TARGET_FILE" 2>/dev/null || return 1
+
+  # Count per distinct subject rather than existence-check: a tree holding two
+  # commits with the same subject must not be cleared by one landing of it.
+  awk '
+    NR == FNR { want[$0]++; next }
+    { have[$0]++ }
+    END {
+      for (s in want) if (have[s] < want[s]) exit 1
+      exit 0
+    }
+  ' "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE"
+}
+
 # Candidate shape, as one place both the filter and the rm -rf fallback consult.
 # The trailing component is a bead id; the `worktrees` segment is what separates
 # a per-bead tree from the agent workspace that contains it.
@@ -267,7 +395,11 @@ RAW_CLAIMED_FILE=$(mktemp)
 LIST_FILE=$(mktemp)
 CANDIDATES_FILE=$(mktemp)
 LOCKED_FILE=$(mktemp)
-trap 'rm -f "$CLAIMED_FILE" "$RAW_CLAIMED_FILE" "$LIST_FILE" "$CANDIDATES_FILE" "$LOCKED_FILE"' EXIT
+# C6b's two subject sets. Hoisted with the rest so the EXIT trap owns them —
+# allocating inside the per-candidate loop would leak one pair per tree.
+SUBJ_LOCAL_FILE=$(mktemp)
+SUBJ_TARGET_FILE=$(mktemp)
+trap 'rm -f "$CLAIMED_FILE" "$RAW_CLAIMED_FILE" "$LIST_FILE" "$CANDIDATES_FILE" "$LOCKED_FILE" "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE"' EXIT
 
 # Every stored status that is not `closed`, taken from bd's own enum
 # (open, in_progress, blocked, deferred, closed) rather than guessed. A
@@ -395,6 +527,11 @@ while IFS= read -r WT; do
   STATUS=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].status // empty' 2>/dev/null || true)
   CLOSED_AT=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].closed_at // empty' 2>/dev/null || true)
   META_TARGET=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.target // empty' 2>/dev/null || true)
+  # The branch the refinery was handed and, on success, deleted. Recorded by
+  # the polecat's branch-setup step; the convention is the fallback for a bead
+  # that predates the metadata contract.
+  META_BRANCH=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.branch // empty' 2>/dev/null || true)
+  MERGE_BRANCH="${META_BRANCH:-polecat/$BEAD}"
 
   # C2 terminal. Anything not closed is in flight — including a rejected bead
   # back in the pool, whose branch a later polecat will resume from this tree.
@@ -463,21 +600,36 @@ while IFS= read -r WT; do
     n_unverifiable=$((n_unverifiable + 1)); continue
   fi
   AHEAD=$(printf '%s' "$CHERRY" | grep -c '^+' || true)
-  if [ "${AHEAD:-0}" -gt 0 ]; then
-    row keep-unmerged "$BEAD" "$WT" "$AHEAD commit(s) whose patches are not on $TARGET"
-    n_kept=$((n_kept + 1)); continue
-  fi
 
-  # Corroborating only, never a gate: the refinery deletes the branch after a
-  # successful merge, so its absence is a second landed-signal. Requiring it
-  # would reopen the leak for any bead whose branch deletion failed, and C6 is
-  # strictly stronger evidence, so it is reported and not enforced.
-  if git -C "$REPO" ls-remote --exit-code --heads origin "polecat/$BEAD" >/dev/null 2>&1; then
-    ORIGIN_NOTE="origin/polecat/$BEAD still present"
+  # The refinery deletes the branch after a successful merge, so its absence is
+  # a second landed-signal — corroborating for C6, which is strictly stronger
+  # evidence, and REQUIRED for C6b, which is not.
+  BRANCH_STATE=$(origin_branch_state "$MERGE_BRANCH")
+  case "$BRANCH_STATE" in
+    present) ORIGIN_NOTE="origin/$MERGE_BRANCH still present" ;;
+    absent)  ORIGIN_NOTE="origin branch $MERGE_BRANCH deleted" ;;
+    *)       ORIGIN_NOTE="origin branch $MERGE_BRANCH state unknown (ls-remote failed)" ;;
+  esac
+
+  if [ "${AHEAD:-0}" -gt 0 ]; then
+    # C6b. C6 has refused; ask the independent question before parking this
+    # tree forever. Every arm below reports WHICH signal declined, because a
+    # bare `keep-unmerged` reads as the reaper working correctly and is how
+    # this leak stayed invisible for three cycles.
+    if ! landed_by_subject "$WT" "$TARGET" "$BEAD" "$CHERRY"; then
+      row keep-unmerged "$BEAD" "$WT" \
+        "$AHEAD commit(s) whose patches are not on $TARGET, and no same-subject landing there either; work looks genuinely unpublished"
+      n_kept=$((n_kept + 1)); continue
+    fi
+    if [ "$BRANCH_STATE" != "absent" ]; then
+      row keep-unmerged "$BEAD" "$WT" \
+        "$AHEAD commit(s) whose patches are not on $TARGET; subjects DO name $BEAD on $TARGET, but $ORIGIN_NOTE — no merge confirmed"
+      n_kept=$((n_kept + 1)); continue
+    fi
+    EVIDENCE="closed $CLOSED_AT; clean; $AHEAD patch(es) adjusted on the way in, every subject landed on $TARGET; $ORIGIN_NOTE"
   else
-    ORIGIN_NOTE="origin branch deleted"
+    EVIDENCE="closed $CLOSED_AT; clean; 0 patches ahead of $TARGET; $ORIGIN_NOTE"
   fi
-  EVIDENCE="closed $CLOSED_AT; clean; 0 patches ahead of $TARGET; $ORIGIN_NOTE"
 
   if [ "$DO_REAP" -eq 0 ]; then
     row reap "$BEAD" "$WT" "$EVIDENCE"
@@ -504,8 +656,8 @@ while IFS= read -r WT; do
   # The branch is disposable by the same argument as the tree: its patches are
   # on the target. It is only still here because the tree held it checked out.
   # Non-fatal — a branch checked out elsewhere must stay.
-  if git -C "$REPO" branch -D "polecat/$BEAD" >/dev/null 2>&1; then
-    REMOVED="$REMOVED; deleted local branch polecat/$BEAD"
+  if git -C "$REPO" branch -D "$MERGE_BRANCH" >/dev/null 2>&1; then
+    REMOVED="$REMOVED; deleted local branch $MERGE_BRANCH"
   fi
   row reaped "$BEAD" "$WT" "$REMOVED"
   n_reaped=$((n_reaped + 1))

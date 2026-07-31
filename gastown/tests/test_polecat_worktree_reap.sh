@@ -10,9 +10,17 @@ SCRIPT="$ROOT/gastown/assets/scripts/polecat-worktree-reap.sh"
 #   * a WRONG reap destroys a polecat's unpushed work permanently.
 # So most of what follows pins the refusal direction — an in-flight bead, a
 # dirty tree, an unmerged commit, a fuzzy-matched basename, and an agent
-# workspace must all survive. The one thing pinned in the permissive direction
-# is the patch-id check, because keying on ancestry instead is what would let
-# the leak survive the fix.
+# workspace must all survive. Two things are pinned in the permissive
+# direction, because each is a way the leak survives a fix:
+#   * the patch-id check (C6), because keying on ancestry instead leaks every
+#     rebased landing (gp-a7z);
+#   * the subject reconciliation (C6b), because patch-id itself is unstable
+#     whenever the patch is ADJUSTED on the way in — a conflict resolved by
+#     hand, or a reviewer's touch-up — which left three trees permanently
+#     unreapable on gascity-packs (gp-3kw).
+# C6b's own guards are then pinned in the refusal direction in turn: a subject
+# that does not name the bead, a subject landed fewer times than the tree holds
+# it, and a branch still on origin must each keep the tree.
 
 fail() {
     echo "FAIL: $*" >&2
@@ -159,6 +167,37 @@ land_rebased() {
     printf '%s' "$sha"
 }
 
+# land_adjusted <branch> <file> — what land_rebased cannot reproduce: the work
+# reaches the target, but the patch is EDITED on the way in. A conflict resolved
+# by hand, a reviewer's touch-up before the merge, a comment reflowed. The
+# subject survives verbatim (rebase rewrites diffs, never messages) while the
+# patch-id does not — so `git cherry` reports the tree's commit as missing
+# forever. Measured live on gascity-packs: gp-q6i's landed twin has an
+# IDENTICAL diffstat and differs by six bytes of reworded comment.
+land_adjusted() {
+    local branch="$1" file="$2" sha
+    git_c checkout --quiet -b "$branch" origin/main
+    printf 'content of %s\n# original wording\n' "$file" >"$REPO/$file"
+    commit_all "feat: $file ($branch)"
+    sha=$(git_c rev-parse HEAD)
+
+    git_c checkout --quiet main
+    echo "meanwhile" >>"$REPO/README.md"
+    commit_all "chore: unrelated main advance"
+
+    # Same subject, different body — the shape a touched-up landing has.
+    printf 'content of %s\n# reworded on the way in\n' "$file" >"$REPO/$file"
+    commit_all "feat: $file ($branch)"
+    git_c push --quiet origin main
+    git_c fetch --quiet origin main
+    printf '%s' "$sha"
+}
+
+# push_branch <branch> — publish a polecat branch to origin, i.e. the state
+# before the refinery merges and deletes it. Absent this, every fixture branch
+# is local-only, which is the same shape as "already deleted after merge".
+push_branch() { git_c push --quiet origin "$1"; }
+
 # add_tree <agent> <bead> [branch] — a per-bead worktree at the canonical path.
 # With no branch, the tree is detached at origin/main, which is the shape a
 # polecat leaves behind after submit-and-exit detaches and deletes its branch.
@@ -222,6 +261,156 @@ test_rebased_landing_is_reapable_though_not_an_ancestor() {
     [ "$(verdict_of gp-land)" = "reap" ] ||
         fail "a rebased landing must be reapable (patch-id, not ancestry); got '$(verdict_of gp-land)' / rows: $OUT"
     [ "$RC" -eq 1 ] || fail "findings must exit 1, got $RC"
+}
+
+# --- The second regression: patch-id is not stable under an ADJUSTED landing -
+# gp-3kw. Three trees on gascity-packs (gp-f4m, gp-apx, gp-q6i) were closed,
+# clean, branch-deleted, and demonstrably on main — and `git cherry` reported
+# `+` on every cycle, so `keep-unmerged` printed forever and the trees could
+# never be collected. Patch-id survives a clean rebase; it does not survive one
+# that edits the diff at all.
+test_adjusted_landing_is_reapable_though_patch_id_differs() {
+    make_world
+    land_adjusted polecat/gp-adj adjusted.txt >/dev/null
+
+    local wt
+    wt=$(add_tree agentA gp-adj polecat/gp-adj)
+
+    # Pin the premise: patch-id genuinely disagrees here, so this test cannot
+    # pass by accident through the C6 path it exists to compensate for.
+    [ -n "$(git -C "$wt" cherry origin/main HEAD | grep '^+' || true)" ] ||
+        fail "fixture is wrong: the adjusted patch must be missing upstream by patch-id"
+
+    bead gp-adj closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-adj)" = "reap" ] ||
+        fail "an adjusted landing must be reapable via the subject signal; got '$(verdict_of gp-adj)' / rows: $OUT"
+    grep -Fq 'adjusted on the way in' <<<"$OUT" ||
+        fail "the evidence must name the signal that cleared it, so the two reap paths stay distinguishable; got: $OUT"
+
+    run_reap --reap
+    [ ! -d "$wt" ] || fail "the tree was not actually removed"
+}
+
+test_adjusted_landing_with_branch_still_on_origin_is_kept() {
+    # The subject signal alone is not a merge. If the branch the refinery
+    # merges is still on origin, no merge has been confirmed — the matching
+    # subject could be a partial landing, or another bead's commit that happens
+    # to name this one. C6b requires the refinery's own after-merge signal too.
+    make_world
+    land_adjusted polecat/gp-live live.txt >/dev/null
+    push_branch polecat/gp-live
+
+    local wt
+    wt=$(add_tree agentA gp-live polecat/gp-live)
+    bead gp-live closed "$(long_ago)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-live)" = "keep-unmerged" ] ||
+        fail "a subject match with the branch still on origin must be kept; got '$(verdict_of gp-live)'"
+    [ -d "$wt" ] || fail "a tree was reaped without the merge ever being confirmed"
+    grep -Fq 'still present' <<<"$OUT" ||
+        fail "the row must say the branch is still on origin; got: $OUT"
+}
+
+test_subject_not_naming_the_bead_is_never_reaped() {
+    # Anti-collision. Without the bead-id requirement a subject common enough to
+    # recur is cleared by any unrelated commit that shares it. Here the target
+    # genuinely carries an identical subject, so an existence-only match WOULD
+    # have reaped this tree and destroyed the only copy of anon.txt.
+    make_world
+    git_c checkout --quiet -b polecat/gp-anon origin/main
+    echo "mine" >"$REPO/anon.txt"
+    commit_all "chore: shared cleanup"
+    git_c checkout --quiet main
+    echo "theirs" >"$REPO/other.txt"
+    commit_all "chore: shared cleanup"
+    git_c push --quiet origin main
+    git_c fetch --quiet origin main
+
+    local wt
+    wt=$(add_tree agentA gp-anon polecat/gp-anon)
+    bead gp-anon closed "$(long_ago)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-anon)" = "keep-unmerged" ] ||
+        fail "a subject that does not name the bead must not clear the tree; got '$(verdict_of gp-anon)'"
+    [ -d "$wt" ] || fail "a tree was reaped on a subject collision — this is unpublished work destroyed"
+    [ -f "$wt/anon.txt" ] || fail "the only copy of the unlanded file is gone"
+}
+
+test_duplicate_subjects_need_a_landing_each() {
+    # Two commits, one subject, one landing. Existence-checking the subject
+    # clears both and loses the second commit; counting per distinct subject
+    # refuses. The tree holds it twice, the target holds it once.
+    make_world
+    git_c checkout --quiet -b polecat/gp-dup origin/main
+    echo "one" >"$REPO/dup1.txt"
+    commit_all "feat: repeated step (gp-dup)"
+    echo "two" >"$REPO/dup2.txt"
+    commit_all "feat: repeated step (gp-dup)"
+    git_c checkout --quiet main
+    echo "meanwhile" >>"$REPO/README.md"
+    commit_all "chore: unrelated main advance"
+    echo "one (adjusted)" >"$REPO/dup1.txt"
+    commit_all "feat: repeated step (gp-dup)"
+    git_c push --quiet origin main
+    git_c fetch --quiet origin main
+
+    local wt
+    wt=$(add_tree agentA gp-dup polecat/gp-dup)
+    bead gp-dup closed "$(long_ago)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-dup)" = "keep-unmerged" ] ||
+        fail "two same-subject commits must not be cleared by one landing; got '$(verdict_of gp-dup)'"
+    [ -f "$wt/dup2.txt" ] || fail "the commit that never landed was destroyed"
+}
+
+test_unreadable_origin_branch_state_refuses_the_subject_path() {
+    # `ls-remote --exit-code` returns 2 for "no such ref" and something else for
+    # a transport failure. Collapsing the two would read an offline run as "every
+    # branch was deleted" — and since C6b REQUIRES that signal, that fail-open
+    # would reap adjusted-landing trees on no merge evidence at all.
+    make_world
+    land_adjusted polecat/gp-off offline.txt >/dev/null
+
+    local wt
+    wt=$(add_tree agentA gp-off polecat/gp-off)
+    bead gp-off closed "$(long_ago)"
+
+    # Reachable first: proves the world is otherwise reapable, so the refusal
+    # below is unambiguously the unreadable branch state.
+    run_reap
+    [ "$(verdict_of gp-off)" = "reap" ] ||
+        fail "precondition: this world must reap while origin is reachable; got '$(verdict_of gp-off)'"
+
+    rm -rf "$ORIGIN"
+    run_reap --reap
+
+    [ "$(verdict_of gp-off)" = "keep-unmerged" ] ||
+        fail "an unreadable origin must keep the tree, not read as 'branch deleted'; got '$(verdict_of gp-off)'"
+    [ -d "$wt" ] || fail "a tree was reaped while the merge signal was unmeasurable"
+}
+
+test_keep_unmerged_says_which_signal_declined() {
+    # Why the leak stayed invisible for three cycles: `keep-unmerged` is a
+    # refusal verdict and refusals are supposed to be common, so a genuinely
+    # unpublished tree and a tree the reaper simply could not recognise printed
+    # the identical row. They must now read differently.
+    make_world
+    git_c checkout --quiet -b polecat/gp-never origin/main
+    echo "unpushed" >"$REPO/never.txt"
+    commit_all "feat: never landed (gp-never)"
+    git_c checkout --quiet main
+
+    add_tree agentA gp-never polecat/gp-never >/dev/null
+    bead gp-never closed "$(long_ago)"
+    run_reap
+
+    grep -Fq 'genuinely unpublished' <<<"$OUT" ||
+        fail "a tree with no landing signal at all must say so; got: $OUT"
 }
 
 # --- Refusals: work that must survive --------------------------------------
@@ -553,6 +742,17 @@ test_help_is_self_documenting() {
     [ "$RC" -eq 0 ] || fail "--help must exit 0, got $RC"
     grep -Fq 'patch-id' <<<"$OUT" || fail "--help must explain the patch-id choice"
     grep -Fq 'Exit codes' <<<"$OUT" || fail "--help must document exit codes"
+    # The header is extracted by shape rather than a line range, so this also
+    # pins that the whole block still prints: 'C6b' is near the top and
+    # 'Usage' is the last section, and a truncating extractor drops one of them.
+    grep -Fq 'C6b' <<<"$OUT" || fail "--help must explain why patch-id alone is not enough"
+    grep -Fq 'Usage:' <<<"$OUT" || fail "--help must reach the end of the header block"
+    # One comment marker is stripped, so prose starts at column 0 (the `## `
+    # section headings keep theirs, which is what makes the output readable).
+    grep -q '^Exit codes:' <<<"$OUT" ||
+        fail "--help must strip the leading comment marker, not print raw source"
+    ! grep -Fq 'set -euo pipefail' <<<"$OUT" ||
+        fail "--help must stop at the end of the header, not spill code"
 }
 
 for t in $(declare -F | awk '{print $3}' | grep '^test_'); do

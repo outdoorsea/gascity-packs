@@ -403,7 +403,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Find parked sessions | `gc gastown parked-check` (never a path under `$GC_PACK_DIR` — unset in your shell) |
 | Recover a parked session | `gc session reset <session-id-or-alias>` (clean worktree first; never a warrant, never drain) |
 | List landed worktrees | `gc gastown worktree-reap` (report only; never a path under `$GC_PACK_DIR` — unset in your shell) |
-| Reap landed worktrees | `gc gastown worktree-reap --reap` (keys on the bead's closed state + patch-id, never on ancestry or agent liveness) |
+| Reap landed worktrees | `gc gastown worktree-reap --reap` (keys on the bead's closed state + patch-id, falling back to a same-subject landing when a rebase adjusted the patch; never on ancestry or agent liveness) |
 
 Rig: {{ .RigName }}
 Working directory: {{ .WorkDir }}
