@@ -21,10 +21,15 @@
 #   2. The refinery's reject sites route to the polecat pool specifically, and
 #      do it in the same `gc bd update` that reopens the bead (splitting the
 #      chain leaves a crash window where the bead is open but unroutable).
-#   3. EVERY `gc workflow reopen-source` call routes. It reopens and unassigns
-#      but does NOT route, so a bare call strands the very work it just
-#      rescued -- and because no `--assignee=""` appears, check 1 cannot see it.
-#      This is the second route into the bug and the one `ml-b2y.1` took.
+#   3. EVERY reopen leaves the bead routable. Raw `gc workflow reopen-source`
+#      reopens and unassigns but does NOT route, so a bare call strands the very
+#      work it just rescued -- and because no `--assignee=""` appears, check 1
+#      cannot see it. This is the second route into the bug and the one
+#      `ml-b2y.1` took. Since gp-8r1 the preferred form is `gc gastown
+#      reopen-source`, which routes itself in the same atomic update that parks
+#      the previous round's disposition, so it satisfies this check with no
+#      paired update -- the obligation is discharged by the command instead of
+#      policed on callers who demonstrably forget it.
 #      Scanned in prompt templates as well as formulas: a quick-reference table
 #      row is the form an agent actually copies, and the witness's "Recover
 #      orphaned bead" row shipped unrouted while the prose above it explained
@@ -125,35 +130,77 @@ test_every_pool_return_sets_routing() {
         fail "expected to scan at least 5 pool returns, found $found -- extraction is broken"
 }
 
-# 2. The refinery's two reject sites return work to the POLECAT pool, in one
-#    atomic update alongside the reopen.
+# 2. The refinery's reject paths get work back to the polecat pool. Since
+#    gp-8r1 there are two shapes, and the split is the whole point:
+#
+#      * A path that REOPENS for a new round (rebase conflict, test failure)
+#        goes through `gc gastown reopen-source`, which reopens, unassigns,
+#        parks the round it just ended under `round<N>.*`, and routes -- one
+#        atomic update. It must NOT route by hand afterwards: the command
+#        withholds pool routing from a validator-roster bead on purpose, and a
+#        manual re-route puts that bead back where the barred agent can claim
+#        it, which is the separation-of-duties vector gp-8r1 exists to close.
+#      * A path that hands the bead back WITHOUT reopening (block_pr_checks --
+#        the PR's required checks are red) crosses no round boundary, so it
+#        still routes to the polecat pool in the same update that unassigns.
 test_refinery_rejects_route_to_polecat_pool() {
-    local rejects=0
+    local reopens direct=0
+    reopens=$(python3 - "$REFINERY_FORMULA" <<'PY'
+import re
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+
+found = 0
+for step in data.get("steps", []):
+    text = re.sub(r"\\\n\s*", " ", step.get("description", ""))
+    if not re.search(r"gc gastown reopen-source\s+\S", text):
+        continue
+    found += 1
+    if re.search(r"--set-metadata\s+gc\.routed_to=", text):
+        sys.exit(
+            f"FAIL: step {step.get('id')} reopens via `gc gastown reopen-source` "
+            f"and then sets gc.routed_to by hand. The command already routes, "
+            f"and it withholds pool routing from a bead carrying a validator "
+            f"roster -- overriding that hands the barred agent the bead it is "
+            f"barred from validating (gp-8r1)."
+        )
+print(found)
+PY
+) || exit 1
+
+    [ "$reopens" -ge 2 ] ||
+        fail "expected >=2 refinery reject sites reopening via gc gastown reopen-source (rebase conflict, test failure), found $reopens"
+
+    # The direct hand-back path crosses no round boundary and still routes itself.
     while IFS= read -r cmd; do
         case "$cmd" in
             *'--status=open'*'--assignee=""'*rejection_reason*) ;;
             *) continue ;;
         esac
-        rejects=$((rejects + 1))
+        direct=$((direct + 1))
         case "$cmd" in
             *'gc.routed_to="${GC_RIG:+$GC_RIG/}'*polecat*) ;;
-            *) fail "refinery reject must route to the polecat pool: $cmd" ;;
+            *) fail "refinery direct pool return must route to the polecat pool: $cmd" ;;
         esac
     done < <(bd_update_commands "$REFINERY_FORMULA")
 
-    [ "$rejects" -ge 2 ] ||
-        fail "expected >=2 refinery reject sites (rebase conflict, test failure), found $rejects"
+    [ "$direct" -ge 1 ] ||
+        fail "expected >=1 direct refinery pool return (block_pr_checks), found $direct"
 
     # The prose the refinery agent actually reads must agree with the formula.
-    bd_update_commands "$ROOT/gastown/agents/refinery/prompt.template.md" |
-        grep -q 'assignee="".*--set-metadata gc\.routed_to=' ||
-        fail "refinery prompt Rejection Flow must document gc.routed_to in the same update"
+    grep -q 'gc gastown reopen-source \$WORK' "$ROOT/gastown/agents/refinery/prompt.template.md" ||
+        fail "refinery prompt Rejection Flow must reopen via 'gc gastown reopen-source', matching the formula"
 }
 
-# 3. `gc workflow reopen-source` reopens a bead and clears its assignee but does
-#    NOT route it, so every CALL of it must be accompanied by a routing update.
-#    This is the second way into the bug and the way `ml-b2y.1` actually took:
-#    no `--assignee=""` appears anywhere, so check 1 cannot see it.
+# 3. Every reopen call must leave the bead routable. Raw `gc workflow
+#    reopen-source` reopens a bead and clears its assignee but does NOT route
+#    it, so a raw CALL must be accompanied by a routing update; `gc gastown
+#    reopen-source` routes itself and needs none. This is the second way into
+#    the bug and the way `ml-b2y.1` actually took: no `--assignee=""` appears
+#    anywhere, so check 1 cannot see it.
 #
 #    Three shapes have to be judged differently, or the check is useless:
 #
@@ -214,21 +261,33 @@ else:
     units.append((section, "\n".join(buf)))
 
 # `reopen-source` followed by an operand -- i.e. an actual call, not a mention.
-call = re.compile(r"reopen-source\s+(?:[`'\"]*[\$<][\w.\-]|[\w.\-]*\$?\{?[A-Za-z_])")
+OPERAND = r"(?:[`'\"]*[\$<][\w.\-]|[\w.\-]*\$?\{?[A-Za-z_])"
+call = re.compile(r"reopen-source\s+" + OPERAND)
+# The self-routing form. It reopens, unassigns, parks the previous round under
+# `round<N>.*` and routes, in one atomic update -- so it discharges the
+# obligation on its own and needs no paired update (gp-8r1).
+self_routing = re.compile(r"gc gastown reopen-source\s+" + OPERAND)
 # Setting routing, not talking about it. See the note above.
 sets_routing = re.compile(r"--set-metadata\s+gc\.routed_to=")
 
 calls = 0
 for label, text in units:
     folded = re.sub(r"\\\n\s*", " ", text)
-    if not call.search(folded):
+    total = len(call.findall(folded))
+    if not total:
         continue
-    calls += 1
-    if not sets_routing.search(folded):
+    calls += total
+    # Anything that is not the self-routing form still carries the old
+    # obligation. Counting by subtraction rather than matching `gc workflow`
+    # explicitly means a third spelling invented later is treated as needing
+    # routing, which is the safe direction to be wrong in.
+    if total - len(self_routing.findall(folded)) and not sets_routing.search(folded):
         sys.exit(
             f"FAIL: reopen-source call in {label} of {path} returns a bead to "
-            f"the pool without setting gc.routed_to. `reopen-source` reopens "
-            f"and unassigns but never routes, so the bead is unclaimable."
+            f"the pool without setting gc.routed_to. Raw `gc workflow "
+            f"reopen-source` reopens and unassigns but never routes, so the "
+            f"bead is unclaimable. Either pair it with a routing update, or "
+            f"use `gc gastown reopen-source`, which routes itself."
         )
 print(calls)
 PY
@@ -237,9 +296,10 @@ PY
     done < <(scanned_files)
 
     # reopen-source is called in mol-refinery-patrol (x2), mol-witness-patrol,
-    # and the witness quick-reference. A drop here means extraction rotted.
-    [ "$found" -ge 4 ] ||
-        fail "expected to scan at least 4 reopen-source calls, found $found -- extraction is broken"
+    # the refinery Rejection Flow, and the witness quick-reference. A drop here
+    # means extraction rotted.
+    [ "$found" -ge 5 ] ||
+        fail "expected to scan at least 5 reopen-source calls, found $found -- extraction is broken"
 }
 
 # 4. The sweep exists and is reachable in the patrol's step chain -- a step that

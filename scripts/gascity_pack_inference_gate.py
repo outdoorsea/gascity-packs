@@ -214,7 +214,16 @@ GASTOWN_BUILD_WORKFLOW_CONTRACTS = {
         "LIVENESS_MAP=$(jq -n",
         "FAIL-SAFE: empty liveness map",
         "git push origin HEAD",
-        "gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>",
+        # Was "gc workflow delete-source <bead> --apply && gc workflow
+        # reopen-source <bead>" until gp-8r1. That pair reopens and unassigns
+        # and does nothing else: the dead round's merge disposition and claim
+        # identity survive into the new round as CURRENT state, and the bead
+        # lands unrouted unless the caller remembers a second command. The
+        # guarantee is now carried by `gc gastown reopen-source`, which closes
+        # the subtree, reopens, unassigns, parks the prior round under
+        # `round<N>.*`, and routes — in one atomic update. Pin the new
+        # mechanism so the recovery step cannot silently lose it.
+        "gc gastown reopen-source <bead>",
         "gc bd update <bead> --set-metadata recovered=true",
         "gc session nudge <rig>/{{binding_prefix}}refinery",
         "--label=warrant",

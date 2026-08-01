@@ -245,31 +245,49 @@ Never infer a branch name. If `metadata.branch` is missing, reject the bead.
 ## Rejection Flow
 
 On rebase conflict or test failure:
-1. Put work bead back in pool — status, assignee, reason, **and routing**:
+1. Reopen the bead for a NEW round:
    ```bash
-   gc bd update $WORK --status=open --assignee="" \
-     --set-metadata rejection_reason="..." \
-     --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+   gc gastown reopen-source $WORK
    ```
-2. Branch handling depends on failure type:
+2. Attach the reason for that round:
+   ```bash
+   gc bd update $WORK --set-metadata rejection_reason="..."
+   ```
+3. Branch handling depends on failure type:
    - Conflict: leave branch intact (polecat needs it for rebase)
    - Test failure: delete branch (polecat redoes work)
-3. Pour next wisp, burn current one
+4. Pour next wisp, burn current one
 
-**`gc.routed_to` is not optional, and it is the one field that has no
-visible symptom when you forget it.** Pool demand keys on `gc.routed_to`,
-never on open status or `gc bd ready` membership. A bead returned with
-status=open and an empty assignee but no `gc.routed_to` generates zero
-demand: no polecat is ever spawned for it and no polecat auto-claims it.
-It sits indefinitely while looking completely healthy in every listing —
-open, ready, unassigned, branch intact on origin, with a good actionable
-`rejection_reason`. Nothing surfaces it as stuck. That is exactly how
-two beads (`ml-b2y.1`, `ml-5qc.7`) were parked for a full day in
-meety-local while the refinery around them merged cleanly (gp-982).
+**Step 1 is one command because two things have to happen together, and
+each one is silent when it is missed.**
 
-Set all four fields in a **single** `gc bd update`. Splitting the chain
-leaves a window where the bead is open and unassigned but unroutable, and
-a crash inside that window strands it permanently.
+`gc.routed_to` has no visible symptom when you forget it. Pool demand keys
+on `gc.routed_to`, never on open status or `gc bd ready` membership. A bead
+returned with status=open and an empty assignee but no `gc.routed_to`
+generates zero demand: no polecat is ever spawned for it and no polecat
+auto-claims it. It sits indefinitely while looking completely healthy in
+every listing — open, ready, unassigned, branch intact on origin, with a
+good actionable `rejection_reason`. Nothing surfaces it as stuck. That is
+exactly how two beads (`ml-b2y.1`, `ml-5qc.7`) were parked for a full day
+in meety-local while the refinery around them merged cleanly (gp-982).
+
+The disposition you just wrote is equally silent. `merge_result`,
+`no_patch_verified` and `no_code_change` were accurate about the round you
+are ending and say nothing about the round you are starting. Left in the
+current-round keys they read as the NEW round's verdict, so the next reader
+concludes the bead is already dispositioned and its empty branch is correct
+— which is how a P0 criterion gets closed without ever being validated
+(gp-8r1). The command parks them under `round<N>.*`: nothing is deleted,
+the previous round stays auditable, and the current-round keys read ABSENT,
+which is the truthful answer before the round has run.
+
+**Do not set `gc.routed_to` yourself, and do not use the raw `gc workflow
+delete-source ... && gc workflow reopen-source ...` pair.** The command
+routes, and it withholds pool routing from a bead carrying
+`eligible_validators` / `validation_barred_agent` — a pool claim never
+consults that roster, so routing such a bead to the pool would let the
+barred agent claim the bead it is barred from validating. Overriding that
+with a manual route re-opens the hole.
 
 A new polecat picks up the bead, sees `metadata.branch` and
 `metadata.rejection_reason`, rebases or redoes work, reassigns to refinery.

@@ -148,20 +148,38 @@ map before asserting an absence:
 gc bd show "$BEAD" --json | jq '.[0].metadata'
 ```
 
-**"Reset to pool" always includes routing.** In every case above, after
-`gc workflow reopen-source` you must also set the pool target:
+**"Reset to pool" is one command.** In every case above, reset with:
 ```bash
-gc bd update <bead> \
-  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+gc gastown reopen-source <bead>
 ```
-`reopen-source` reopens the bead and clears the assignee; it does not
-route it. Pool demand keys on `gc.routed_to` alone — not on open status,
-not on `gc bd ready` membership — so a bead reset without it generates
-zero demand and no polecat will ever claim it. The failure is silent by
-construction: the bead reads as healthy everywhere (open, ready,
-unassigned, branch intact), so no scan flags it and it sits forever. If
-you salvaged a branch and then left the bead unroutable, you rescued the
-work and stranded it anyway (gp-982).
+It closes the orphaned workflow subtree, reopens, unassigns, parks the dead
+round's disposition and claim identity under `round<N>.*`, and sets
+`gc.routed_to` — one atomic update, nothing to remember afterwards.
+
+Do not use the raw `gc workflow delete-source ... && gc workflow
+reopen-source ...` pair, and do not add a routing update after the command.
+The raw pair reopens and unassigns and does nothing else, which fails two
+ways at once:
+
+* Pool demand keys on `gc.routed_to` alone — not on open status, not on
+  `gc bd ready` membership — so a bead reset without it generates zero
+  demand and no polecat will ever claim it. The failure is silent by
+  construction: the bead reads as healthy everywhere (open, ready,
+  unassigned, branch intact), so no scan flags it and it sits forever. If
+  you salvaged a branch and then left the bead unroutable, you rescued the
+  work and stranded it anyway (gp-982).
+* The dead session's `gc.session_id`, `gc.session_name` and `gc.work_dir`,
+  plus the previous round's `merge_result` / `no_patch_verified`, stay in
+  the current-round keys where they read as this round's answer. A
+  `gc.work_dir` resolved before the next claim points into another agent's
+  worktree — possibly one this bead's own `validation_barred_agent` bars
+  from validating it (gp-8r1).
+
+If the bead carries `eligible_validators` or `validation_barred_agent`, the
+command routes it to `human` instead of the pool and records
+`reopen_route_withheld`. A pool claim never consults the roster, so routing
+such a bead to the pool would let the barred agent claim it. Leave that
+verdict alone.
 
 **Notification is a judgment call.** Always log the recovery (event bead).
 Mail the mayor only when the recovery is unexpected or concerning:
@@ -395,7 +413,7 @@ gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 | Pour next wisp | `gc gastown wisp-reconcile ensure mol-witness-patrol --var binding_prefix='{{ .BindingPrefix }}'` (never a bare `gc bd mol wisp` — that pours a duplicate) |
 | Reconcile wisps to one | `gc gastown wisp-reconcile startup` |
 | Context exhaustion | `gc runtime request-restart` |
-| Recover orphaned bead | `gc workflow delete-source <id> --apply && gc workflow reopen-source <id> && gc bd update <id> --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"` (the routing update is part of the recovery, not a follow-up — `reopen-source` does not route, and an unrouted bead is never claimed) |
+| Recover orphaned bead | `gc gastown reopen-source <id>` (closes the workflow subtree, reopens, unassigns, parks the dead round under `round<N>.*`, and routes — one atomic update. Do NOT add a routing update after it: the command routes, and withholds pool routing from validator-roster beads on purpose) |
 | Salvage worktree work | `git add -A && git commit && git push origin HEAD` |
 | Delete worktree | `git worktree remove <path> --force` |
 | Set branch metadata | `gc bd update <id> --set-metadata branch=<name>` |

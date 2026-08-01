@@ -433,24 +433,37 @@ rm -rf <worktree-path> 2>/dev/null  # Fallback
 git worktree prune
 ```
 
-Close any orphaned workflow subtree, then return the bead to pool.
-`reopen-source` reopens the bead and clears the assignee, but it does NOT
-set routing — you must set `gc.routed_to` yourself or the bead is
-unroutable:
+Close any orphaned workflow subtree and return the bead to pool with one
+command:
 ```bash
-gc workflow delete-source <bead> --apply && gc workflow reopen-source <bead>
-gc bd update <bead> \
-  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+gc gastown reopen-source <bead>
 ```
 
-**Do not skip that second command.** Pool demand keys on `gc.routed_to`,
-not on open status and not on `gc bd ready` membership. A recovered bead
-left without it generates zero demand — no polecat is spawned for it and
-none auto-claims it — yet it looks entirely healthy in every listing:
-open, ready, unassigned, branch intact on origin. Nothing surfaces it as
-stuck, so it sits indefinitely. Salvaging the branch and then leaving the
-bead unroutable means the work you just rescued is still never picked up
-(gp-982: `ml-b2y.1` reached exactly this state by this path).
+That is the whole recovery. It closes the workflow subtree, reopens and
+unassigns, parks the dead round's disposition and claim identity under
+`round<N>.*`, and sets `gc.routed_to` — in a single atomic update.
+
+**Do not add a routing update after it, and do not fall back to the raw
+`gc workflow delete-source ... && gc workflow reopen-source ...` pair.**
+Two things go wrong when routing is a separate step you have to remember:
+
+* Pool demand keys on `gc.routed_to`, not on open status and not on
+  `gc bd ready` membership. A recovered bead left without it generates zero
+  demand — no polecat is spawned for it and none auto-claims it — yet it
+  looks entirely healthy in every listing: open, ready, unassigned, branch
+  intact on origin. Nothing surfaces it as stuck, so it sits indefinitely
+  (gp-982: `ml-b2y.1` reached exactly this state by this path).
+* The bead you are salvaging is carrying the dead session's `gc.session_id`,
+  `gc.session_name`, `gc.work_dir` and the previous round's `merge_result`.
+  Left in the current-round keys those read as this round's answer, and a
+  `gc.work_dir` resolved pre-claim points into another agent's worktree —
+  possibly the very agent barred from validating the bead (gp-8r1).
+
+If the bead carries `eligible_validators` or `validation_barred_agent`, the
+command routes it to `human` rather than the pool and records
+`reopen_route_withheld` saying why. That is deliberate: a pool claim never
+consults the roster, so pool-routing such a bead would let the barred agent
+claim it. Do not override that with a manual route.
 
 **Step 4: Assess and notify.**
 
