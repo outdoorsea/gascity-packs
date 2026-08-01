@@ -19,8 +19,18 @@ SCRIPT="$ROOT/gastown/assets/scripts/polecat-worktree-reap.sh"
 #     hand, or a reviewer's touch-up — which left three trees permanently
 #     unreapable on gascity-packs (gp-3kw).
 # C6b's own guards are then pinned in the refusal direction in turn: a subject
-# that does not name the bead, a subject landed fewer times than the tree holds
-# it, and a branch still on origin must each keep the tree.
+# carrying no work reference, a subject landed fewer times than the tree holds
+# it, and a merge no attestation confirms must each keep the tree.
+#
+# gp-psa added a third permissive pin, because C6b's two conjuncts were BOTH
+# secretly rig-specific and either one alone kept the leak open:
+#   * the anchor demanded the bead id in the subject, a convention only this rig
+#     follows — meety-local stamps `(crit:<hash>)`, so C6b was dead code there;
+#   * the merge attestation demanded a deleted origin branch, which is another
+#     component's cleanup step and measurably is not running (60 undeleted
+#     origin/polecat/* refs on meety-local, 53 on tallyup, 2026-07-31).
+# Both are now pinned in the permissive direction, and the refusal ROWS are
+# pinned too: a row that names the wrong clause is what kept gp-psa invisible.
 
 fail() {
     echo "FAIL: $*" >&2
@@ -104,6 +114,19 @@ bead() {
     mv "$tmpf" "$BEADS/all.json"
 }
 
+# set_meta <id> <key> <value> — stamp one extra metadata field onto an existing
+# bead. The refinery's merge attestation (`merged_sha`) is written long after
+# the bead is created, and only a handful of fixtures care about it, so it is
+# set separately rather than made an argument every other `bead` call ignores.
+set_meta() {
+    local id="$1" key="$2" val="$3" tmpf
+    tmpf=$(mktemp)
+    jq --arg id "$id" --arg k "$key" --arg v "$val" \
+        '[.[] | if .id == $id then .metadata += {($k): $v} else . end]' \
+        "$BEADS/all.json" >"$tmpf"
+    mv "$tmpf" "$BEADS/all.json"
+}
+
 git_c() { git -C "$REPO" "$@"; }
 
 commit_all() {
@@ -167,18 +190,22 @@ land_rebased() {
     printf '%s' "$sha"
 }
 
-# land_adjusted <branch> <file> — what land_rebased cannot reproduce: the work
-# reaches the target, but the patch is EDITED on the way in. A conflict resolved
-# by hand, a reviewer's touch-up before the merge, a comment reflowed. The
-# subject survives verbatim (rebase rewrites diffs, never messages) while the
-# patch-id does not — so `git cherry` reports the tree's commit as missing
+# land_adjusted <branch> <file> [subject] — what land_rebased cannot reproduce:
+# the work reaches the target, but the patch is EDITED on the way in. A conflict
+# resolved by hand, a reviewer's touch-up before the merge, a comment reflowed.
+# The subject survives verbatim (rebase rewrites diffs, never messages) while
+# the patch-id does not — so `git cherry` reports the tree's commit as missing
 # forever. Measured live on gascity-packs: gp-q6i's landed twin has an
 # IDENTICAL diffstat and differs by six bytes of reworded comment.
+#
+# The subject is overridable because C6b's anchor reads it: the default names
+# the branch (and so the bead), while gp-psa's cases turn on subjects that
+# deliberately do NOT — a criterion hash, a scope, a bare word.
 land_adjusted() {
-    local branch="$1" file="$2" sha
+    local branch="$1" file="$2" subject="${3:-feat: $2 ($1)}" sha
     git_c checkout --quiet -b "$branch" origin/main
     printf 'content of %s\n# original wording\n' "$file" >"$REPO/$file"
-    commit_all "feat: $file ($branch)"
+    commit_all "$subject"
     sha=$(git_c rev-parse HEAD)
 
     git_c checkout --quiet main
@@ -187,7 +214,7 @@ land_adjusted() {
 
     # Same subject, different body — the shape a touched-up landing has.
     printf 'content of %s\n# reworded on the way in\n' "$file" >"$REPO/$file"
-    commit_all "feat: $file ($branch)"
+    commit_all "$subject"
     git_c push --quiet origin main
     git_c fetch --quiet origin main
     printf '%s' "$sha"
@@ -314,11 +341,13 @@ test_adjusted_landing_with_branch_still_on_origin_is_kept() {
         fail "the row must say the branch is still on origin; got: $OUT"
 }
 
-test_subject_not_naming_the_bead_is_never_reaped() {
-    # Anti-collision. Without the bead-id requirement a subject common enough to
-    # recur is cleared by any unrelated commit that shares it. Here the target
-    # genuinely carries an identical subject, so an existence-only match WOULD
-    # have reaped this tree and destroyed the only copy of anon.txt.
+test_subject_with_no_work_reference_is_never_reaped() {
+    # Anti-collision, and the reason the anchor exists at all. `chore: shared
+    # cleanup` names no unit of work, so an identical subject on the target is
+    # evidence of nothing. Here the target genuinely carries one, so an
+    # existence-only match WOULD have reaped this tree and destroyed the only
+    # copy of anon.txt. Relaxing the anchor from "the bead id" to "any work
+    # reference" (gp-psa) must not relax it to "any subject".
     make_world
     git_c checkout --quiet -b polecat/gp-anon origin/main
     echo "mine" >"$REPO/anon.txt"
@@ -335,9 +364,188 @@ test_subject_not_naming_the_bead_is_never_reaped() {
     run_reap --reap
 
     [ "$(verdict_of gp-anon)" = "keep-unmerged" ] ||
-        fail "a subject that does not name the bead must not clear the tree; got '$(verdict_of gp-anon)'"
+        fail "a subject carrying no work reference must not clear the tree; got '$(verdict_of gp-anon)'"
     [ -d "$wt" ] || fail "a tree was reaped on a subject collision — this is unpublished work destroyed"
     [ -f "$wt/anon.txt" ] || fail "the only copy of the unlanded file is gone"
+}
+
+# --- gp-psa: C6b's two conjuncts were both rig-specific ----------------------
+# ml-uoa.3's tree was refused every cycle with its work byte-identically on
+# origin/main as 2c6abe5. BOTH conjuncts vetoed it, so each of the two tests
+# below fails on its own against the pre-gp-psa script — fixing either one
+# alone only moves the tree from the first refusal arm to the second.
+
+test_criterion_trailer_anchors_a_subject_match() {
+    # The anchor demanded the tree's BEAD ID in the subject, justified by the
+    # polecat formula mandating that spelling — which it does, for THIS rig.
+    # The script is a pack asset that runs in every rig, and meety-local stamps
+    # a criterion hash instead. Verified live: ml-uoa.3's subject is
+    # `feat(portal): ... (crit:c84a4764d9a1)`, so the anchor vetoed 100% of C6b
+    # there and the fallback was dead code in the rig it was needed in.
+    make_world
+    land_adjusted polecat/ml-uoa.3 portal.txt \
+        'feat(portal): the console reports whether the splash is serving (crit:c84a4764d9a1)' >/dev/null
+
+    local wt
+    wt=$(add_tree agentA ml-uoa.3 polecat/ml-uoa.3)
+
+    # Both premises, or this passes through a path it is not testing.
+    [ -n "$(git -C "$wt" cherry origin/main HEAD | grep '^+' || true)" ] ||
+        fail "fixture is wrong: the adjusted patch must be missing upstream by patch-id"
+    ! grep -Fq 'ml-uoa.3' <<<"$(git -C "$wt" log -1 --format=%s)" ||
+        fail "fixture is wrong: the subject must NOT contain the bead id, or this tests the old anchor"
+
+    bead ml-uoa.3 closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of ml-uoa.3)" = "reap" ] ||
+        fail "a criterion-hash trailer must anchor a subject match; got '$(verdict_of ml-uoa.3)' / rows: $OUT"
+}
+
+test_merged_sha_attests_a_merge_the_branch_state_cannot() {
+    # The deleted origin branch is a PROXY for the merge, and it belongs to
+    # another component: mol-refinery-patrol's Cleanup step, behind
+    # `delete_merged_branches` (default "true"). Measured 2026-07-31 it is not
+    # happening anyway — 60 undeleted origin/polecat/* refs on meety-local, 53
+    # on tallyup — so C6b could clear nothing in those rigs however well the
+    # subjects matched. merged_sha is the same fact recorded first-hand.
+    make_world
+    land_adjusted polecat/gp-sha shaland.txt >/dev/null
+    push_branch polecat/gp-sha           # never deleted: the proxy is unavailable
+    local landed
+    landed=$(git_c rev-parse origin/main)
+
+    local wt
+    wt=$(add_tree agentA gp-sha polecat/gp-sha)
+    bead gp-sha closed "$(long_ago)"
+
+    # Pin the precondition: with no attestation this is exactly
+    # test_adjusted_landing_with_branch_still_on_origin_is_kept, so the flip
+    # below is unambiguously the merged_sha and not some other relaxation.
+    run_reap
+    [ "$(verdict_of gp-sha)" = "keep-unmerged" ] ||
+        fail "precondition: with no attestation at all this tree must be kept; got '$(verdict_of gp-sha)'"
+
+    set_meta gp-sha merged_sha "$landed"
+    run_reap
+
+    [ "$(verdict_of gp-sha)" = "reap" ] ||
+        fail "a merged_sha on the target must attest the merge; got '$(verdict_of gp-sha)' / rows: $OUT"
+    grep -Fq 'merged_sha' <<<"$OUT" ||
+        fail "the evidence must name the attestation that cleared it, so the two are distinguishable; got: $OUT"
+}
+
+test_merged_sha_not_on_the_target_does_not_attest() {
+    # The field is CHECKED, not believed — which is the whole reason it can be
+    # trusted more than the proxy. A sha from a superseded attempt, or one
+    # force-pushed off the target, names a commit that is not there, and a
+    # merge that is not on the target is not a merge.
+    make_world
+    land_adjusted polecat/gp-stale stale.txt >/dev/null
+    push_branch polecat/gp-stale
+
+    local wt
+    wt=$(add_tree agentA gp-stale polecat/gp-stale)
+    bead gp-stale closed "$(long_ago)"
+    # A real, resolvable commit that is genuinely not on the target: the tree's
+    # own tip. A syntactically valid sha must not be enough.
+    set_meta gp-stale merged_sha "$(git -C "$wt" rev-parse HEAD)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-stale)" = "keep-unmerged" ] ||
+        fail "a merged_sha that is not on the target must not attest; got '$(verdict_of gp-stale)'"
+    [ -d "$wt" ] || fail "a tree was reaped on an unchecked merged_sha"
+    grep -Fq 'is not on origin/main' <<<"$OUT" ||
+        fail "the row must say the recorded sha is not on the target; got: $OUT"
+}
+
+test_unresolvable_merged_sha_does_not_attest() {
+    # mol-refinery-patrol writes `merged_sha="${AW_MERGE_SHA:-unknown}"` when a
+    # PR merge reports no commit. Present-but-meaningless must not read as an
+    # attestation. It is rejected on SHAPE, before anything resolves it, which
+    # is what also stops a ref-like value ("main", "HEAD") from being resolved
+    # into an attestation the refinery never made; a well-formed sha that
+    # simply is not here fails one arm further along.
+    make_world
+    land_adjusted polecat/gp-unk unknown.txt >/dev/null
+    push_branch polecat/gp-unk
+
+    local wt
+    wt=$(add_tree agentA gp-unk polecat/gp-unk)
+    bead gp-unk closed "$(long_ago)"
+    set_meta gp-unk merged_sha unknown
+    run_reap --reap
+
+    [ "$(verdict_of gp-unk)" = "keep-unmerged" ] ||
+        fail "merged_sha=unknown must not attest a merge; got '$(verdict_of gp-unk)'"
+    [ -d "$wt" ] || fail "a tree was reaped on a placeholder merged_sha"
+    grep -Fq 'is not a commit sha' <<<"$OUT" ||
+        fail "the row must say the recorded value is not a sha at all; got: $OUT"
+
+    # A well-formed sha that is simply absent here is the neighbouring arm, and
+    # must refuse just as firmly — otherwise the shape check above would be
+    # carrying a refusal that the resolution step is supposed to own.
+    set_meta gp-unk merged_sha deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    run_reap --reap
+    [ "$(verdict_of gp-unk)" = "keep-unmerged" ] ||
+        fail "an absent-but-well-formed merged_sha must not attest; got '$(verdict_of gp-unk)'"
+    [ -d "$wt" ] || fail "a tree was reaped on a merged_sha that resolves to nothing"
+    grep -Fq 'does not resolve' <<<"$OUT" ||
+        fail "the row must say the recorded sha does not resolve; got: $OUT"
+}
+
+test_conventional_commit_scope_is_not_a_work_reference() {
+    # `feat(router-portal): ...` carries a spaceless, hyphenated parenthesised
+    # group — but it is a SCOPE, not a trailer, and scopes are shared across
+    # every commit touching that area. Requiring the token to END the subject is
+    # the only thing separating the two, so it is pinned here: read a scope as
+    # an anchor and any two commits with the same scoped subject clear.
+    make_world
+    land_adjusted polecat/gp-scope scoped.txt 'feat(router-portal): tidy the console' >/dev/null
+
+    local wt
+    wt=$(add_tree agentA gp-scope polecat/gp-scope)
+    bead gp-scope closed "$(long_ago)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-scope)" = "keep-unmerged" ] ||
+        fail "a conventional-commit scope must not anchor a match; got '$(verdict_of gp-scope)'"
+    [ -d "$wt" ] || fail "a tree was reaped on a scope mistaken for a work reference"
+    grep -Fq 'no work reference' <<<"$OUT" ||
+        fail "the row must name the anchor as the clause that declined; got: $OUT"
+}
+
+test_anchor_refusal_never_claims_the_work_never_landed() {
+    # THE gp-psa defect, as distinct from the leak it caused. ml-uoa.3's row
+    # read "no same-subject landing there either" while origin/main demonstrably
+    # carried one — the anchor had vetoed before the target was ever consulted.
+    # A refusal that misreports its own reason reads as the reaper working
+    # correctly, which is how a leak survives patrol after patrol unnoticed.
+    #
+    # `(wip)` is parenthesised and ends the subject but has no internal
+    # structure, so it is not a work reference — bare words like it recur across
+    # unrelated commits, which is the collision the anchor exists to stop.
+    make_world
+    land_adjusted polecat/gp-why why.txt 'chore: tidy up (wip)' >/dev/null
+
+    local wt
+    wt=$(add_tree agentA gp-why polecat/gp-why)
+    bead gp-why closed "$(long_ago)"
+
+    # The premise that makes the misreport a misreport: the subject IS there.
+    local mb
+    mb=$(git -C "$wt" merge-base HEAD origin/main)
+    [ "$(git -C "$wt" log "$mb..origin/main" --no-merges --format=%s | grep -Fxc 'chore: tidy up (wip)')" -eq 1 ] ||
+        fail "fixture is wrong: the target must carry the identical subject"
+
+    run_reap
+
+    [ "$(verdict_of gp-why)" = "keep-unmerged" ] ||
+        fail "a bare-word trailer must not anchor a match; got '$(verdict_of gp-why)'"
+    grep -Fq 'no work reference' <<<"$OUT" ||
+        fail "the row must name the anchor as the clause that declined; got: $OUT"
+    ! grep -Fq 'genuinely unpublished' <<<"$OUT" ||
+        fail "the row claims the work never landed while the subject IS on the target — the gp-psa misreport"
 }
 
 test_duplicate_subjects_need_a_landing_each() {

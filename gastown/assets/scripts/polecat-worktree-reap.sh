@@ -77,24 +77,81 @@
 #
 #   * every commit C6 flagged has a same-subject twin in the window
 #     merge-base(HEAD, target)..target;
-#   * each of those subjects names THIS tree's bead;
-#   * the branch the refinery merges is absent from origin.
+#   * each of those subjects carries a WORK REFERENCE (see below);
+#   * the refinery independently attests that it merged this bead — either the
+#     branch it merges is absent from origin, or the bead records a
+#     `merged_sha` that is verifiably present on the target.
 #
 # Each clause carries weight. Subjects survive a rebase exactly when patch-ids
 # do not — rebase rewrites the diff, never the message — which is what makes
-# the two signals independent rather than two spellings of one. Requiring the
-# bead id inside the subject is what stops a generic subject ("fix: typo") from
-# matching an unrelated commit; the polecat formula mandates that spelling. The
-# window starts at the merge base because a landing can only be on the target
-# AFTER the tree branched, which also bounds the walk. Matches are counted per
+# the two signals independent rather than two spellings of one. The window
+# starts at the merge base because a landing can only be on the target AFTER
+# the tree branched, which also bounds the walk. Matches are counted per
 # distinct subject rather than merely existence-checked, so a tree holding two
-# same-subject commits cannot be cleared by a single landing. And the deleted
-# origin branch is the refinery's own after-merge signal — an independent
-# witness that a merge happened, not a restatement of the subject match.
+# same-subject commits cannot be cleared by a single landing.
+#
+# ### The anchor is a work reference, not a bead id (gp-psa)
+#
+# The anchor exists to stop a generic subject ("fix: typo") from being cleared
+# by an unrelated commit that happens to share it. Its first spelling got that
+# intent right and the mechanism wrong: it required the tree's own BEAD ID
+# inside the subject, on the grounds that "the polecat formula mandates that
+# spelling". The formula mandates it for THIS rig. This script is a pack asset
+# that runs in every rig, and meety-local stamps a criterion hash instead —
+# `feat(portal): ... (crit:c84a4764d9a1)`, never a bead id. There the anchor
+# vetoed 100% of C6b, so the fallback was dead code in the rig, and ml-uoa.3's
+# tree was refused every cycle with its work byte-identically on main.
+#
+# What actually carries the weight is an explicit work reference: a trailing
+# parenthesised token, spaceless and internally structured (a `-` or a `:`),
+# which is how every convention in use spells "this commit belongs to that unit
+# of work" — `(gp-psa)`, `(crit:c84a4764d9a1)`, `(ml-uoa.3)`. The trailer must
+# END the subject, so a conventional-commit SCOPE (`feat(router-portal): ...`)
+# is not mistaken for one. Prose in parentheses ("(see below)") and bare words
+# ("(wip)") are deliberately not references: they recur, which is the hazard.
+# The tree's own bead id still qualifies wherever it appears, so a subject that
+# names the bead outside a trailer clears exactly as it did before.
+#
+# ### Merge attestation: branch-absence is a proxy, merged_sha is the record
+#
+# The deleted origin branch is the refinery's own after-merge signal — an
+# independent witness that a merge happened, not a restatement of the subject
+# match. It is REQUIRED for C6b, which is why it is not enough to match a
+# subject. But it is a PROXY: it infers a merge from the absence of a ref, and
+# it silently stops being available wherever post-merge branch deletion is not
+# running. That deletion lives in mol-refinery-patrol's Cleanup step behind
+# `delete_merged_branches`, which defaults to "true" — and measured 2026-07-31
+# it is nonetheless not happening: meety-local carries 60 undeleted
+# `origin/polecat/*` refs and tallyup 53, including beads reaped days earlier.
+# In those rigs C6b could never clear anything even with a matching subject —
+# the reaper was coupled to a cleanup step in another component, so a lapse
+# there parked trees here, silently and forever.
+#
+# `metadata.merged_sha` is the same fact recorded first-hand by the agent that
+# did the merge, and unlike the proxy it can be CHECKED: the sha must resolve
+# and must be present on the target. A stale, bogus, or force-pushed-away sha
+# fails that check and keeps the tree. Ancestry is the right test HERE, though
+# it is the wrong test for C6 — merged_sha names the commit the refinery
+# created ON the target, so there is no rebase between it and the target for
+# ancestry to be confused by. Either attestation satisfies the clause; neither
+# is inferred, and the per-commit subject check above still runs regardless, so
+# broadening this conjunct never clears a commit whose content is unaccounted
+# for. Verified against both live trees: ml-uoa.3 (merged, reapable) records
+# merged_sha=2c6abe5, an ancestor of main, while ml-94dh (recalled by its owner,
+# must be kept) records none at all and so stays kept on this clause alone.
+#
+# Both conjuncts had to move. On ml-uoa.3 the anchor vetoed the subject clause
+# AND origin/polecat/ml-uoa.3 was still present, so relaxing either one alone
+# would only have shifted the tree from the first refusal arm to the second —
+# same leaked directory, a differently-worded row.
 #
 # The refusal direction is preserved throughout: any clause that cannot be
 # MEASURED — no merge base, an unreadable subject, an `ls-remote` that failed
-# for transport reasons rather than a missing ref — keeps the tree.
+# for transport reasons rather than a missing ref — keeps the tree. And every
+# refusal NAMES the clause that declined, because a `keep-unmerged` row that
+# asserts "no same-subject landing there either" when one demonstrably exists
+# reads as the reaper working correctly, which is how this leak survived three
+# patrol cycles unnoticed.
 #
 # ## Why agent liveness is never an input
 #
@@ -319,36 +376,89 @@ origin_branch_state() {
   esac
 }
 
+# has_work_reference — C6b's anchor. Does this subject explicitly name a unit of
+# work, so that an identical subject on the target is the SAME work rather than
+# a recurrence of a common phrase? See the anchor section in the header for why
+# this is no longer "does the subject contain the bead id".
+#
+# Two spellings qualify. The tree's own bead id ANYWHERE in the subject is the
+# original anchor, kept verbatim so nothing that cleared before stops clearing.
+# Otherwise: a parenthesised trailer that ENDS the subject, contains no
+# whitespace, and is internally structured (a `-` or a `:`) — `(gp-psa)`,
+# `(crit:c84a4764d9a1)`, `(polecat/ml-uoa.3)`.
+#
+# Every clause of that shape is doing work. Requiring the trailer to END the
+# subject is what keeps a conventional-commit SCOPE out: `feat(router-portal):
+# add a thing` has a spaceless, hyphenated parenthesised group, but it is not
+# the last thing on the line. Rejecting whitespace drops prose asides ("(see
+# below)"). Requiring a `-` or `:` drops bare words ("(wip)", "(hotfix)"), which
+# recur across unrelated commits and are therefore exactly the hazard the anchor
+# exists to catch. A PR-number trailer `(#1234)` deliberately does not qualify:
+# GitHub appends it during a squash merge, so the landed subject differs from
+# the tree's and the subject comparison could not have matched anyway.
+has_work_reference() {
+  local subj="$1" bead="$2" trailer
+
+  case "$subj" in *"$bead"*) return 0 ;; esac
+
+  # A trailer needs an opening paren somewhere and a closing one at the very
+  # end; without the `(` test, a subject merely ending in `)` would fall through
+  # to the strip below and be measured against its own whole text.
+  case "$subj" in *'('*')') ;; *) return 1 ;; esac
+  trailer="${subj##*\(}"
+  trailer="${trailer%\)}"
+
+  [ -n "$trailer" ] || return 1
+  case "$trailer" in *[[:space:]]*) return 1 ;; esac
+  case "$trailer" in *[-:]*) return 0 ;; esac
+  return 1
+}
+
 # landed_by_subject — C6b. Does every commit `git cherry` flagged as missing
 # have a same-subject twin already on the target? See the C6b section in the
 # header for why subject survives what patch-id does not, and why each guard
 # below is load-bearing. Returns 0 only when the answer is measured and yes;
 # any unmeasurable input returns non-zero, which keeps the tree.
+#
+# Sets SUBJ_WHY to the SPECIFIC reason it declined. Collapsing every refusal
+# into one message is the gp-psa defect itself: ml-uoa.3's row read "no
+# same-subject landing there either" while origin/main demonstrably carried one
+# — the anchor had vetoed before the target was ever consulted. A refusal that
+# misreports its own reason reads as the reaper working correctly, which is how
+# a leak survives patrol after patrol.
 landed_by_subject() {
   local wt="$1" target="$2" bead="$3" cherry="$4"
-  local mb mark sha subj
+  local mb mark sha subj short
+
+  SUBJ_WHY=''
 
   # A landing can only be on the target AFTER this tree branched, so the merge
   # base is both the correct lower bound and the thing that keeps this off a
   # full-history walk. No merge base (unrelated histories) means no window to
   # search, which is an abstention, not a clearance.
-  mb=$(git -C "$wt" merge-base HEAD "$target" 2>/dev/null) || return 1
-  [ -n "$mb" ] || return 1
+  mb=$(git -C "$wt" merge-base HEAD "$target" 2>/dev/null) || mb=''
+  if [ -z "$mb" ]; then
+    SUBJ_WHY="no merge base with $target, so there is no window to search for a landing"
+    return 1
+  fi
 
   : >"$SUBJ_LOCAL_FILE"
   while read -r mark sha; do
     [ "$mark" = "+" ] || continue
-    [ -n "$sha" ] || return 1
-    subj=$(git -C "$wt" log -1 --format=%s "$sha" 2>/dev/null) || return 1
-    [ -n "$subj" ] || return 1
-    # The subject must name this tree's own bead. Without it, a commit whose
-    # subject is common enough to recur ("fix: typo") could be cleared by an
-    # unrelated landing; with it, the match is anchored to the bead whose id
-    # C1 already proved is this directory's basename.
-    case "$subj" in
-      *"$bead"*) ;;
-      *) return 1 ;;
-    esac
+    if [ -z "$sha" ]; then
+      SUBJ_WHY="'git cherry' emitted a '+' with no sha; the commit list was NOT measured"
+      return 1
+    fi
+    short=$(printf '%s' "$sha" | cut -c1-7)
+    subj=$(git -C "$wt" log -1 --format=%s "$sha" 2>/dev/null) || subj=''
+    if [ -z "$subj" ]; then
+      SUBJ_WHY="the subject of $short is unreadable; the subject signal was NOT measured"
+      return 1
+    fi
+    if ! has_work_reference "$subj" "$bead"; then
+      SUBJ_WHY="$short's subject carries no work reference to anchor a match ('$subj'), so a same-subject landing would not prove it is the same work"
+      return 1
+    fi
     printf '%s\n' "$subj" >>"$SUBJ_LOCAL_FILE"
   done <<EOF
 $cherry
@@ -357,21 +467,94 @@ EOF
   # Empty means we measured nothing — and would also invert awk's NR==FNR
   # file-discrimination below, silently reading the target's subjects as the
   # tree's and clearing on a comparison with itself.
-  [ -s "$SUBJ_LOCAL_FILE" ] || return 1
+  if [ ! -s "$SUBJ_LOCAL_FILE" ]; then
+    SUBJ_WHY="no subject was collected from the flagged commits; NOT measured"
+    return 1
+  fi
 
-  git -C "$wt" log "$mb..$target" --no-merges --format=%s \
-    >"$SUBJ_TARGET_FILE" 2>/dev/null || return 1
+  if ! git -C "$wt" log "$mb..$target" --no-merges --format=%s \
+       >"$SUBJ_TARGET_FILE" 2>/dev/null; then
+    SUBJ_WHY="could not read $target's subjects over $(printf '%s' "$mb" | cut -c1-7)..; NOT measured"
+    return 1
+  fi
 
   # Count per distinct subject rather than existence-check: a tree holding two
   # commits with the same subject must not be cleared by one landing of it.
-  awk '
+  if ! awk '
     NR == FNR { want[$0]++; next }
     { have[$0]++ }
     END {
       for (s in want) if (have[s] < want[s]) exit 1
       exit 0
     }
-  ' "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE"
+  ' "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE"; then
+    SUBJ_WHY="no same-subject landing on $target for every flagged commit; work looks genuinely unpublished"
+    return 1
+  fi
+}
+
+# is_hex_sha — shape of a commit sha, checked BEFORE anything tries to resolve
+# it. `git rev-parse` would happily turn a ref-like value ("main", "HEAD", a
+# tag) into an attestation the refinery never made, and this is also the arm
+# that catches the literal `unknown` mol-refinery-patrol writes when a PR merge
+# reports no commit — a placeholder that never named a sha, not a sha that
+# failed to resolve. Length is left to `rev-parse`, which knows what is
+# ambiguous in this repo better than a constant here would.
+is_hex_sha() {
+  case "$1" in
+    ''|*[!0-9a-fA-F]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# merge_attested — C6b's second conjunct: did the refinery independently say it
+# merged THIS bead? Two attestations, either sufficient, neither inferred.
+#
+#   * the branch it merges is absent from origin — its own after-merge cleanup;
+#   * `metadata.merged_sha` resolves AND is an ancestor of the target — the
+#     merge commit it recorded first-hand.
+#
+# Ancestry is the right test for the second and the wrong test for C6, which is
+# not a contradiction: merged_sha names the commit the refinery created ON the
+# target, so no rebase sits between it and the target for ancestry to be
+# confused by. The checks are what make the field trustworthy rather than merely
+# present, and they are staged so each refusal names its own cause: a value that
+# is not a sha at all (the refinery writes the literal `unknown` when a PR merge
+# reports none), a sha that does not resolve here, and a sha that resolves but
+# is not on the target (a force-push can strand a once-valid one). Each keeps
+# the tree.
+#
+# Sets ATTEST_NOTE either way: on success naming the attestation that cleared
+# it, on failure naming what BOTH declined, so the row never implies the reaper
+# consulted only the proxy.
+merge_attested() {
+  local wt="$1" target="$2" branch="$3" branch_state="$4" merged_sha="$5"
+  local full sha_note
+
+  if [ "$branch_state" = "absent" ]; then
+    ATTEST_NOTE="origin branch $branch deleted after merge"
+    return 0
+  fi
+
+  if [ -z "$merged_sha" ]; then
+    sha_note="the bead records no merged_sha"
+  elif ! is_hex_sha "$merged_sha"; then
+    sha_note="merged_sha '$merged_sha' is not a commit sha"
+  elif ! full=$(git -C "$wt" rev-parse --verify --quiet "$merged_sha^{commit}" 2>/dev/null) \
+       || [ -z "$full" ]; then
+    sha_note="merged_sha '$merged_sha' does not resolve to a commit here"
+  elif ! git -C "$wt" merge-base --is-ancestor "$full" "$target" 2>/dev/null; then
+    sha_note="merged_sha '$merged_sha' is not on $target"
+  else
+    ATTEST_NOTE="refinery recorded merged_sha $(printf '%s' "$full" | cut -c1-7) on $target"
+    return 0
+  fi
+
+  case "$branch_state" in
+    present) ATTEST_NOTE="origin/$branch still present and $sha_note" ;;
+    *)       ATTEST_NOTE="origin/$branch state unknown (ls-remote failed) and $sha_note" ;;
+  esac
+  return 1
 }
 
 # Candidate shape, as one place both the filter and the rm -rf fallback consult.
@@ -399,6 +582,11 @@ LOCKED_FILE=$(mktemp)
 # allocating inside the per-candidate loop would leak one pair per tree.
 SUBJ_LOCAL_FILE=$(mktemp)
 SUBJ_TARGET_FILE=$(mktemp)
+# C6b's two refusal reasons, written by landed_by_subject and merge_attested and
+# read by the rows they explain. Seeded here so `set -u` cannot turn a future
+# early-return that forgets to set one into an abort mid-scan.
+SUBJ_WHY=''
+ATTEST_NOTE=''
 trap 'rm -f "$CLAIMED_FILE" "$RAW_CLAIMED_FILE" "$LIST_FILE" "$CANDIDATES_FILE" "$LOCKED_FILE" "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE"' EXIT
 
 # Every stored status that is not `closed`, taken from bd's own enum
@@ -532,6 +720,12 @@ while IFS= read -r WT; do
   # that predates the metadata contract.
   META_BRANCH=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.branch // empty' 2>/dev/null || true)
   MERGE_BRANCH="${META_BRANCH:-polecat/$BEAD}"
+  # The merge commit the refinery recorded on the target. Unlike the deleted
+  # branch it is a first-hand statement rather than an inference, and it is
+  # checked before it is believed — see merge_attested. No fallback: absent
+  # means the refinery never attested this merge, which is a refusal, not a
+  # spelling to guess at.
+  META_MERGED_SHA=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.merged_sha // empty' 2>/dev/null || true)
 
   # C2 terminal. Anything not closed is in flight — including a rejected bead
   # back in the pool, whose branch a later polecat will resume from this tree.
@@ -618,15 +812,15 @@ while IFS= read -r WT; do
     # this leak stayed invisible for three cycles.
     if ! landed_by_subject "$WT" "$TARGET" "$BEAD" "$CHERRY"; then
       row keep-unmerged "$BEAD" "$WT" \
-        "$AHEAD commit(s) whose patches are not on $TARGET, and no same-subject landing there either; work looks genuinely unpublished"
+        "$AHEAD commit(s) whose patches are not on $TARGET; subject check declined: $SUBJ_WHY"
       n_kept=$((n_kept + 1)); continue
     fi
-    if [ "$BRANCH_STATE" != "absent" ]; then
+    if ! merge_attested "$WT" "$TARGET" "$MERGE_BRANCH" "$BRANCH_STATE" "$META_MERGED_SHA"; then
       row keep-unmerged "$BEAD" "$WT" \
-        "$AHEAD commit(s) whose patches are not on $TARGET; subjects DO name $BEAD on $TARGET, but $ORIGIN_NOTE — no merge confirmed"
+        "$AHEAD commit(s) whose patches are not on $TARGET; every subject DID land on $TARGET, but no merge is attested: $ATTEST_NOTE"
       n_kept=$((n_kept + 1)); continue
     fi
-    EVIDENCE="closed $CLOSED_AT; clean; $AHEAD patch(es) adjusted on the way in, every subject landed on $TARGET; $ORIGIN_NOTE"
+    EVIDENCE="closed $CLOSED_AT; clean; $AHEAD patch(es) adjusted on the way in, every subject landed on $TARGET; $ATTEST_NOTE"
   else
     EVIDENCE="closed $CLOSED_AT; clean; 0 patches ahead of $TARGET; $ORIGIN_NOTE"
   fi
@@ -655,7 +849,10 @@ while IFS= read -r WT; do
   git -C "$REPO" worktree prune >/dev/null 2>&1 || true
   # The branch is disposable by the same argument as the tree: its patches are
   # on the target. It is only still here because the tree held it checked out.
-  # Non-fatal — a branch checked out elsewhere must stay.
+  # Non-fatal — a branch checked out elsewhere must stay. This is the LOCAL
+  # branch only, and since gp-psa a tree can reach here with its origin branch
+  # still published, which makes the deletion strictly safer than before rather
+  # than less: origin keeps a copy either way.
   if git -C "$REPO" branch -D "$MERGE_BRANCH" >/dev/null 2>&1; then
     REMOVED="$REMOVED; deleted local branch $MERGE_BRANCH"
   fi
