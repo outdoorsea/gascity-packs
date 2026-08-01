@@ -53,6 +53,13 @@ ERRFILE="$TMP/stderr"
 # flags — `--state=all` is load-bearing, and the session-bead probe is supposed
 # to be spent only on the path that would authorise a reset.
 #
+# The log line carries the `gc ` prefix the stub was invoked under, so an
+# assertion can name the whole command (`gc bd list`) rather than a bare
+# subcommand. Same reason test_refinery_address_agnostic_sweep.sh dispatches on
+# `case "gc $1 $2"`: a beads command is spelled `gc bd ...` everywhere in this
+# repo, and tests/test_no_bare_bd_commands.py enforces that on every tracked
+# file — including this one.
+#
 # GC_FAIL_MODE injects the failure shapes that matter:
 #   roster-envelope   the gp-b3x shape — {"ok":false} on STDOUT, exit 1
 #   roster-envelope-0 the same envelope but exit 0, so only a payload read sees it
@@ -65,7 +72,7 @@ write_gc_stub() {
     mkdir -p "$BIN"
     cat >"$BIN/gc" <<'SH'
 #!/usr/bin/env sh
-printf '%s\n' "$*" >>"$GC_CALLS"
+printf 'gc %s\n' "$*" >>"$GC_CALLS"
 case "$*" in
     *"session"*"list"*)
         case "${GC_FAIL_MODE:-}" in
@@ -327,11 +334,11 @@ test_session_beads_are_consulted_only_on_a_roster_miss() {
     # The cost argument for probing two sources: the second query is spent only
     # where its answer would authorise a destructive reset.
     run_check "$(roster_with_live_polecat)" "$NO_BEADS" gk-a9xk
-    ! grep -Fq 'bd list' "$CALLS" ||
+    ! grep -Fq 'gc bd list' "$CALLS" ||
         fail "a roster HIT must answer without the session-bead probe"
 
     run_check "$(roster_without_polecat)" "$NO_BEADS" gk-nowhere
-    grep -Fq 'bd list' "$CALLS" ||
+    grep -Fq 'gc bd list' "$CALLS" ||
         fail "a roster MISS must consult session beads before authorising a reset"
 }
 
@@ -379,7 +386,7 @@ test_the_second_probe_can_be_skipped_but_never_unsafely() {
         "$(beads_with_named_identity meety-local/gastown.capable)" \
         meety-local/gastown.capable GASTOWN_RECHECK_SKIP_SESSION_BEADS=1
     [[ "$RC" -eq 0 ]] || fail "the opt-out must let a roster miss resolve absent, got $RC"
-    ! grep -Fq 'bd list' "$CALLS" ||
+    ! grep -Fq 'gc bd list' "$CALLS" ||
         fail "the opt-out must actually skip the session-bead probe"
 
     run_check "$(roster_with_live_polecat)" "$NO_BEADS" gk-a9xk \
