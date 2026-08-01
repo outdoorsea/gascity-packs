@@ -474,6 +474,74 @@ PY
         fail "check-polecat-health must rule out the parked verdict before reading a failed peek as a stall"
 }
 
+test_orphan_recovery_reconfirms_liveness_before_acting() {
+    # gp-8m6: `recover-orphaned-beads` builds its assignee->state map ONCE per
+    # cycle, before the per-bead loop, then lists beads. A session created
+    # between those two reads is missing from the map, resolves to `absent`, and
+    # `absent` is definitive — so step 3b resets a live agent's bead, discarding
+    # whatever it had not yet committed. The map's freshness is load-bearing for
+    # a destructive action, so the re-check must stay reachable from the step
+    # that does the destroying.
+    local formula check cmd block
+    formula="$GASTOWN/formulas/mol-witness-patrol.toml"
+    check="$GASTOWN/assets/scripts/orphan-liveness-recheck.sh"
+    cmd="$GASTOWN/commands/liveness-recheck/run.sh"
+
+    [[ -x "$check" ]] || fail "missing or non-executable assets/scripts/orphan-liveness-recheck.sh"
+    [[ -x "$cmd" ]] || fail "missing or non-executable commands/liveness-recheck/run.sh"
+    [[ -f "$GASTOWN/commands/liveness-recheck/help.md" ]] ||
+        fail "missing commands/liveness-recheck/help.md"
+    parse_toml "$formula"
+
+    # Same wrapper argument as parked-check: gc sets GC_PACK_DIR for pack
+    # COMMANDS and never in an agent's shell, so the path form would resolve to
+    # "/assets/scripts/..." and report "could not run" forever. For this check
+    # that is worse than usual — the caller must treat "could not run" as a
+    # refusal to reset, so the path form would disable orphan recovery outright.
+    ! grep -F 'GC_PACK_DIR' "$formula" | grep -F 'liveness-recheck' >/dev/null ||
+        fail "the liveness re-check must not be resolved via \$GC_PACK_DIR; it is unset in an agent shell"
+    grep -F 'GC_PACK_DIR' "$cmd" >/dev/null ||
+        fail "commands/liveness-recheck/run.sh must resolve the check through GC_PACK_DIR"
+
+    block=$(step_description "$formula" recover-orphaned-beads)
+
+    # In THIS step, not merely somewhere in the file. A patrol that mentions the
+    # re-check under `check-polecat-health` would satisfy a whole-file grep while
+    # leaving the destructive path exactly as it was.
+    grep -F 'gc gastown liveness-recheck' <<<"$block" >/dev/null ||
+        fail "recover-orphaned-beads must re-confirm liveness via 'gc gastown liveness-recheck'"
+
+    # The gate has to be the `if`, because that is what makes exit 2 — nothing
+    # measured — refuse alongside exit 1. A recipe that tested for exit 1
+    # explicitly would resume resetting beads the moment the roster went
+    # unreadable, which is the same class of silent failure as the original bug.
+    grep -E '^[[:space:]]*if gc gastown liveness-recheck' <<<"$block" >/dev/null ||
+        fail "the re-check must gate recovery as 'if gc gastown liveness-recheck ...' so only exit 0 proceeds"
+
+    # The classification table is what defines `absent`, so the re-check belongs
+    # to it — and the destructive end must name it as a precondition, for a
+    # reader who arrives at step 3b directly.
+    grep -F 'Re-confirm every orphan against a FRESH lookup' <<<"$block" >/dev/null ||
+        fail "the re-check must be stated as a classification step, not buried as an aside"
+    grep -F 'liveness-recheck` re-confirmed gone' <<<"$block" >/dev/null ||
+        fail "step 3b must name the re-check as its precondition (gp-8m6)"
+
+    # "NOT a second full map build" is the reporting witness's own constraint. A
+    # rebuild per bead re-runs both listings for every assignee and is still a
+    # snapshot by the time it is used; the fix is a late read of the ONE
+    # assignee. One map build in the step is the whole recipe's budget.
+    local builds
+    builds=$(grep -c 'LIVENESS_MAP=$(jq -n' <<<"$block" || true)
+    [[ "$builds" -eq 1 ]] ||
+        fail "the step must build the liveness map exactly once; found $builds (a per-bead rebuild is not the fix)"
+
+    # The empty-map fail-safe stays. It covers a different case — the map being
+    # EMPTY — and the re-check does not subsume it: a partial map passes the
+    # fail-safe cleanly, which is precisely why this bug existed.
+    grep -F 'FAIL-SAFE: empty liveness map' <<<"$block" >/dev/null ||
+        fail "the empty-map fail-safe must survive; the re-check covers partial staleness, not an empty map"
+}
+
 test_worktree_reaper_is_wired_into_the_patrol() {
     # gp-a7z: no component owned a polecat worktree's death. The refinery
     # deletes the BRANCH after merge, orphan recovery keys on a
@@ -875,6 +943,7 @@ test_polecat_health_check_is_measured_not_improvised
 test_no_formula_step_executes_through_ambient_gc_pack_dir
 test_polecat_stall_requires_proof_of_life_not_just_a_timestamp
 test_parked_session_detector_is_wired_into_the_patrol
+test_orphan_recovery_reconfirms_liveness_before_acting
 test_parked_remedy_is_documented_for_the_witness
 test_wisp_reconcile_is_the_only_implementation
 test_shutdown_dance_contracts_are_executable

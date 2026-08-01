@@ -282,6 +282,56 @@ a NEW session with a different ID — the old one never comes back.
      bead** for pool/ephemeral work — the owning session is gone and will never
      come back, regardless of whether the pool template still exists
 
+4. **Re-confirm every orphan against a FRESH lookup before acting on it.**
+
+   The map above was built once, before the bead list was taken. A session
+   created between those two reads is missing from it, resolves to `absent`,
+   and `absent` is treated as DEFINITIVE — so a live polecat's bead is reset out
+   from under it. The FAIL-SAFE covers only the map being EMPTY; a map that is
+   non-empty but merely missing recently-spawned sessions passes it cleanly and
+   every unknown assignee still resolves to `absent`. That is the partial
+   staleness case, and it makes snapshot freshness load-bearing for a
+   destructive action (gp-8m6).
+
+   Measured, meety-local patrol 2026-07-31T23:29-23:34Z: the cycle map held 18
+   sessions / 54 keys and did NOT contain `gastown__polecat-gk-a9xk`. Minutes
+   later `gc gastown parked-check` found that session present and active, and
+   `gc gastown progress-check` found it holding bead `ml-0txz.4` in_progress,
+   heartbeat age 1s, with UNCOMMITTED work on disk. That bead escaped only
+   because it was not yet in_progress when the bead list was taken. Reverse the
+   ordering by seconds and this step resets an actively-worked bead.
+
+   So for each bead classified orphaned above — and only those, which is why
+   this costs nothing in the common case of zero orphans — re-resolve its single
+   assignee against a fresh read, BEFORE Step 2 salvage and before Step 3b:
+
+   ```bash
+   if gc gastown liveness-recheck "$ASSIGNEE"; then
+       : # re-confirmed gone (absent or terminal) — continue to Step 2
+   else
+       # exit 1 = still live, exit 2 = nothing measured. Neither one authorises
+       # a reset. Leave the bead untouched and move to the next.
+       echo "STALE-MAP SKIP: $BEAD — $ASSIGNEE was absent from the cycle map but is not re-confirmed gone."
+       continue
+   fi
+   ```
+
+   **Only exit 0 authorises recovery**, so the plain `if` above is the whole
+   contract. This inverts the polarity of `gc gastown delivery-check`, where a
+   check that could not run means "build as normal": there the unsafe direction
+   is halting a polecat on an unmeasured guess, here it is proceeding, because
+   Step 2 commits into a running agent's worktree and Step 3b takes its bead
+   away. An unreadable roster is not a confirmation of absence.
+
+   Re-resolve the ONE assignee — do not rebuild the whole map per bead. A
+   rebuild re-runs both listings for every assignee and is still a snapshot by
+   the time it is used; what matters is the answer for the assignee about to be
+   acted on, read as late as possible.
+
+   Log a `present` verdict even though it produced no action. It is the race
+   confirmed empirically, and how often it fires is the only evidence of how
+   stale this city's snapshot actually runs.
+
 **Important**: Beads assigned to the refinery, witness, or other
 infrastructure agents (not pool instances) should be skipped — those
 agents have persistent identity and the controller manages their
@@ -423,6 +473,11 @@ gc mail send mayor/ -s "ORPHAN_CLOSED: <bead> already merged" \
 If the work is NOT on main, proceed with reset:
 
 **Step 3b: Clean up worktree and return bead to pool.**
+
+This is the destructive end of the recipe, so it inherits Step 1 item 4 as a
+precondition: reach it only for a bead whose assignee `gc gastown
+liveness-recheck` re-confirmed gone. Resetting on the cycle map alone hands a
+running agent's bead back to the pool (gp-8m6).
 
 Once the branch is canonical (on origin), the worktree is disposable:
 ```bash
