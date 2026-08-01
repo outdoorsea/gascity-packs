@@ -58,6 +58,27 @@ jobs:
           # the loop until the waivers are gone -- it would wedge CI on known bugs.
           GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py tests/test_gastown_lint_baseline.py -q
 
+      - name: Install shells used by the cross-shell formula tests
+        # test_digest_window.sh runs the digest formula's own step text under
+        # every shell an agent might paste it into, because gp-74p was a date
+        # comparison that answered correctly in bash, sh and dash and silently
+        # answered the OPPOSITE in zsh. That suite fails rather than skips when
+        # zsh is absent -- skipping would go green against the broken formula --
+        # so zsh has to be present here. dash is the strictest POSIX check and
+        # is what rules out `[[ ]]` as a fix.
+        run: |
+          missing=""
+          for s in zsh dash; do
+            command -v "$s" >/dev/null 2>&1 || missing="$missing $s"
+          done
+          if [ -n "$missing" ]; then
+            sudo apt-get update
+            sudo apt-get install -y $missing
+          fi
+          for s in bash sh zsh dash; do
+            printf '%-5s %s\n' "$s" "$(command -v "$s" || echo MISSING)"
+          done
+
       - name: Run Gastown shell tests
         run: |
           for test_script in gastown/tests/test_*.sh; do

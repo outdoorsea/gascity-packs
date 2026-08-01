@@ -263,7 +263,18 @@ if [ -n "$NEWEST" ]; then
   if [ "{{period}}" = "weekly" ]; then GAP_STEP=7; else GAP_STEP=1; fi
   EXPECTED=$(date -u -d "$NEWEST +$GAP_STEP day" +%Y-%m-%d 2>/dev/null ||
              date -u -j -v+"$GAP_STEP"d -f '%Y-%m-%d' "$NEWEST" +%Y-%m-%d)
-  if [ "$DATE" \\> "$EXPECTED" ]; then
+  # Compare ISO-8601 dates by sort order, never with an inequality operator
+  # inside `[ ]`. zsh's `[` builtin has no string-comparison operator for
+  # "greater than" at all: both the escaped and the quoted spellings raise
+  # "condition expected" and silently take the else path, so a real gap reports
+  # no gap (gp-74p). Leaving the operator unescaped is worse -- zsh parses it as
+  # a REDIRECTION, the test degrades to a non-empty check that is always true,
+  # and each run litters a file named after $EXPECTED. A `[[ ]]` test fixes zsh
+  # but is not POSIX and answers wrongly under dash. The form below is the only
+  # one verified correct in zsh, sh, bash AND dash; ISO-8601 sorts lexically ==
+  # chronologically, so it is exact. LC_ALL=C keeps collation out of it.
+  if [ "$DATE" != "$EXPECTED" ] &&
+     [ "$(printf '%s\\n%s\\n' "$DATE" "$EXPECTED" | LC_ALL=C sort | tail -1)" = "$DATE" ]; then
     GAP_NOTE="never digested: $EXPECTED through the period before $DATE (newest on record was $NEWEST)"
     echo "GAP $GAP_NOTE" >&2
   fi

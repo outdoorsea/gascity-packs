@@ -10,6 +10,13 @@ set -euo pipefail
 # These tests execute the formula's own bash, extracted from the TOML, so they
 # gate the shipped step text rather than a copy of it. `gc` is stubbed, so the
 # suite is hermetic and needs no city.
+#
+# The gap-detection tests additionally vary the INTERPRETER. Agents paste these
+# snippets into whatever shell their session runs, and gp-74p was a comparison
+# that worked in bash, sh and dash while silently reporting the opposite answer
+# in zsh -- so a suite that fixes the shell to bash cannot see it. Anything
+# touching the ledger comparison must be asserted across $GAP_SHELLS, not
+# against one interpreter.
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 GASTOWN="$ROOT/gastown"
@@ -78,24 +85,66 @@ PY
 }
 
 # Run the extracted steps. Echoes the step output; returns their exit status.
+# $3 selects the interpreter: the step text is POSIX shell, and which shell runs
+# it is itself under test (see the gap-comparison tests). Defaults to bash so
+# the window tests above keep exercising one fixed, known-good interpreter.
 run_steps() {
-    local period="${1:-daily}" period_date="${2:-}"
+    local period="${1:-daily}" period_date="${2:-}" shell="${3:-bash}"
     rm -f "$WORK/steps.sh"
     extract_steps "$period" "$period_date" "$WORK/steps.sh" ||
         fail "could not extract the formula's bash (period=$period)"
     [[ -s "$WORK/steps.sh" ]] ||
         fail "extraction produced no bash for period=$period"
     : >"$STUB_LOG"
+    mkdir -p "$WORK/run"
     set +e
-    PATH="$WORK/bin:$PATH" GC_CITY="$WORK/city" GC_BEAD_ID="gk-stub" \
+    # Run from a scratch cwd. A comparison that is secretly a REDIRECTION writes
+    # a file instead of answering, and that evidence is only observable if we
+    # know what the working directory held beforehand.
+    ( cd "$WORK/run" &&
+      PATH="$WORK/bin:$PATH" GC_CITY="$WORK/city" GC_BEAD_ID="gk-stub" \
         STUB_POUR="$STUB_POUR" STUB_LEDGER="$STUB_LEDGER" STUB_LOG="$STUB_LOG" \
         STUB_POUR_MISSING="${STUB_POUR_MISSING:-0}" \
         STUB_LEDGER_FAILS="${STUB_LEDGER_FAILS:-0}" \
-        bash "$WORK/steps.sh" 2>&1
+        "$shell" "$WORK/steps.sh" 2>&1 )
     local code=$?
     set -e
     return $code
 }
+
+# The shells the gap comparison must survive.
+#
+# zsh is REQUIRED, never skipped. gp-74p reproduces ONLY under zsh -- bash, sh
+# and dash all answered that one correctly -- so a suite that quietly omits zsh
+# passes on the broken formula, which is precisely how the defect shipped and
+# survived. A missing zsh is a failure of this suite, not a reason to run less
+# of it.
+#
+# dash is optional because it is not standard on macOS, but include it wherever
+# it exists: it is the strictest POSIX interpreter available and the only one
+# that rules out `[[ ]]` as the fix here.
+#
+# Resolved ONCE, at top level, into GAP_SHELLS -- deliberately not a function
+# the tests call inside `for shell in $(...)`. `fail` runs `exit 1`, and inside
+# a command substitution that only kills the substitution subshell: the caller
+# would carry on with an empty list, iterate zero times, assert nothing, and
+# report success. A guard whose failure path silently reduces coverage is the
+# same shape of defect as the one this file is testing for.
+GAP_SHELLS=""
+for _s in bash sh zsh dash; do
+    command -v "$_s" >/dev/null 2>&1 && GAP_SHELLS="$GAP_SHELLS $_s"
+done
+GAP_SHELLS="${GAP_SHELLS# }"
+unset _s
+
+case " $GAP_SHELLS " in
+    *" zsh "*) ;;
+    *) fail "zsh is not installed.
+      The gap-detection regression (gp-74p) reproduces ONLY under zsh; bash, sh
+      and dash all report it correctly. Running this suite without zsh would go
+      green against the broken formula, so it fails instead of skipping.
+      Install zsh to run these tests." ;;
+esac
 
 STUB_LOG="$WORK/mutations.log"
 : >"$STUB_LOG"
@@ -321,6 +370,94 @@ PY
         fail "the wisp must be closed by \$GC_BEAD_ID, not a placeholder"
 }
 
+test_gap_detection_survives_every_shell() {
+    # gp-74p. The shipped comparison was an escaped greater-than inside `[ ]`.
+    # zsh's `[` builtin has no such operator: it raised "condition expected" on
+    # stderr, took the else path, and reported no gap for a genuine six-day hole.
+    # A confident wrong answer, not an error -- the step carried on and the
+    # digest header simply omitted the gap block.
+    #
+    # Every other shell answers this correctly, which is why the bash-only
+    # test_gap_is_reported_and_not_backfilled above stayed green for the entire
+    # life of the bug. The shell is the variable under test here.
+    STUB_POUR="2026-08-03T06:30:00Z"    # covers 08-02; newest on record is 07-26
+    STUB_LEDGER="$LEDGER_THROUGH_26"
+    local shell out
+    for shell in $GAP_SHELLS; do
+        out=$(run_steps daily "" "$shell") ||
+            fail "[$shell] gap path should not halt: $out"
+        grep -E '^GAP ' <<<"$out" >/dev/null ||
+            fail "[$shell] a real six-day gap reported no gap; the comparison is inert under this shell: $out"
+        grep -F '2026-07-27' <<<"$out" >/dev/null ||
+            fail "[$shell] gap should name the first missing period: $out"
+    done
+}
+
+test_contiguous_reports_no_gap_in_every_shell() {
+    # The mirror image, and the guard against "fixing" the test above by simply
+    # dropping the backslash. Unescaped, zsh parses the operator as a REDIRECTION:
+    # the condition degrades to a non-empty-string check that is always true, so
+    # every window -- contiguous or not -- reports a gap. That form passes the
+    # test above while being just as wrong.
+    STUB_POUR="2026-07-28T06:34:19Z"    # covers 07-27, right after 07-26
+    STUB_LEDGER="$LEDGER_THROUGH_26"
+    local shell out
+    for shell in $GAP_SHELLS; do
+        out=$(run_steps daily "" "$shell")
+        ! grep -E '^GAP ' <<<"$out" >/dev/null ||
+            fail "[$shell] contiguous window reported a gap; the comparison is always-true under this shell: $out"
+    done
+}
+
+test_gap_comparison_never_redirects() {
+    # The other half of the redirection trap. As well as answering wrongly, the
+    # unescaped form writes the step's stdout into a file named after $EXPECTED,
+    # littering one file per run into whatever directory the dog was sitting in.
+    # Behavioural check: run in a pristine cwd, require it to stay pristine.
+    STUB_POUR="2026-08-03T06:30:00Z"
+    STUB_LEDGER="$LEDGER_THROUGH_26"
+    local shell strays
+    for shell in $GAP_SHELLS; do
+        rm -rf "$WORK/run"; mkdir -p "$WORK/run"
+        run_steps daily "" "$shell" >/dev/null
+        strays=$(ls -1A "$WORK/run")
+        [[ -z "$strays" ]] ||
+            fail "[$shell] the gap step created file(s) rather than comparing; the operator is being parsed as a redirection: $strays"
+    done
+}
+
+test_gap_comparison_is_not_an_inequality_test() {
+    # Static backstop for the three tests above, so the contract still holds on a
+    # host that lacks a shell to demonstrate it with.
+    #
+    # `[ ]` has no portable greater-than: zsh rejects the escaped and the quoted
+    # spellings outright and silently redirects the bare one. `[[ ]]` fixes zsh
+    # but is not POSIX and answers wrongly under dash. Compare ISO-8601 dates by
+    # sort order instead -- they sort lexically == chronologically.
+    local offenders
+    offenders=$(python3 - "$FORMULA" <<'PY'
+import re, sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    doc = tomllib.load(fh)
+step = [s for s in doc["steps"] if s["id"] == "check-digest-ledger"][0]
+bad = []
+for block in re.findall(r"```bash\n(.*?)```", step["description"], re.S):
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "$EXPECTED" not in stripped:
+            continue
+        if stripped.startswith("EXPECTED="):   # the assignment, not a comparison
+            continue
+        probe = stripped.replace(">&2", "")    # the stderr redirect is legitimate
+        if "[[" in stripped or ">" in probe:
+            bad.append(stripped)
+print("\n".join(bad))
+PY
+)
+    [[ -z "$offenders" ]] ||
+        fail "gap comparison must not test \$EXPECTED with an inequality operator:"$'\n'"$offenders"
+}
+
 test_formula_no_longer_derives_the_window_from_wall_clock() {
     local body
     body=$(python3 - "$FORMULA" <<'PY'
@@ -346,6 +483,10 @@ test_duplicate_period_closes_without_mailing
 test_ledger_match_is_exact_not_by_label
 test_gap_is_reported_and_not_backfilled
 test_contiguous_window_reports_no_gap
+test_gap_detection_survives_every_shell
+test_contiguous_reports_no_gap_in_every_shell
+test_gap_comparison_never_redirects
+test_gap_comparison_is_not_an_inequality_test
 test_empty_ledger_is_reported_not_asserted
 test_unreadable_pour_time_halts
 test_ledger_query_failure_halts
