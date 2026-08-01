@@ -419,7 +419,8 @@ test_gap_comparison_never_redirects() {
     local shell strays
     for shell in $GAP_SHELLS; do
         rm -rf "$WORK/run"; mkdir -p "$WORK/run"
-        run_steps daily "" "$shell" >/dev/null
+        run_steps daily "" "$shell" >/dev/null ||
+            fail "[$shell] gap path halted; cannot judge whether it redirected"
         strays=$(ls -1A "$WORK/run")
         [[ -z "$strays" ]] ||
             fail "[$shell] the gap step created file(s) rather than comparing; the operator is being parsed as a redirection: $strays"
