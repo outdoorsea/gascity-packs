@@ -70,11 +70,23 @@ if [ -z "${GC_CITY:-}" ] || [ ! -f "$GC_CITY/city.toml" ]; then
   exit 2
 fi
 
-# Default window: the gastown witness does NOT self-schedule a ~60s wakeup — it
-# ends its turn with `IDLE:` and the controller's session_sleep policy restarts
-# it, bounded by the witness agent's idle_timeout of 1h. 1h is therefore the
-# longest legitimate silence for a healthy witness, so the window sits at 1.5x
-# that. Well clear of legitimate idle, and still an order of magnitude under the
+# Default window: the gastown witness does NOT self-schedule a ~60s wakeup. It
+# ends each cycle in mol-witness-patrol's `next-iteration`, which READS the
+# resolved session_sleep policy off its own session bead and picks one of two
+# endings: under a configured policy it emits `IDLE:` and that policy restarts
+# it; with no policy (`off`/`legacy_off`, the default) it calls
+# `gc runtime request-restart` itself. Either way a healthy witness comes back
+# well inside the witness agent's idle_timeout of 1h, so 1h remains the longest
+# legitimate silence and the window sits at 1.5x that.
+#
+# Do NOT re-derive this window from "session_sleep will restart it". That was
+# the old premise here and it was false on any city that never configured the
+# policy: nothing restarted the witness, and this 90m window became the de facto
+# patrol cadence rather than the backstop it is meant to be (gp-5bg). The
+# restart is now the formula's own responsibility, which is what makes 1h the
+# real bound again.
+#
+# Well clear of legitimate idle, and still an order of magnitude under the
 # 14h floor of the stalls this check exists to catch. Lower it only if your
 # city's witness idle_timeout is lower.
 STALE_MIN="${GASTOWN_WITNESS_STALE_MIN:-90}"

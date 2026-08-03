@@ -55,12 +55,21 @@ Environment:
   GC_CITY                    city root; defaults to the city `gc` resolved
 
 Why the window defaults to 90m: the gastown witness does not self-schedule a
-~60s wakeup. It ends its turn with `IDLE:` and the controller's session_sleep
-policy restarts it, bounded by the witness agent's `idle_timeout` of 1h. 1h is
-therefore the longest legitimate silence for a healthy witness, so the window
-sits at 1.5x that — well clear of legitimate idle, and still an order of
-magnitude under the 14h floor of the stalls this check exists to catch. Lower it
-only if your city's witness `idle_timeout` is lower.
+~60s wakeup. It ends each cycle in `mol-witness-patrol`'s `next-iteration`,
+which reads the resolved session_sleep policy off its own session bead and picks
+one of two endings — under a configured policy it emits `IDLE:` and that policy
+restarts it; with no policy configured (`off`/`legacy_off`, the default) it calls
+`gc runtime request-restart` itself. Either way a healthy witness returns well
+inside the witness agent's `idle_timeout` of 1h, so 1h is the longest legitimate
+silence and the window sits at 1.5x that — well clear of legitimate idle, and
+still an order of magnitude under the 14h floor of the stalls this check exists
+to catch. Lower it only if your city's witness `idle_timeout` is lower.
+
+This window is a backstop, not the patrol cadence. It formerly rested on
+"session_sleep will restart it", which is false on any city that never
+configured the policy: nothing restarted the witness and this 90m nag became the
+cadence, letting witness context grow across cycles into compaction (gp-5bg).
+The formula now owns the restart, which is what keeps 1h the real bound.
 
 Why this is a `gc` command rather than a path: `GC_PACK_DIR` is set by `gc` when
 `gc` invokes a pack command, and is absent from a plain agent session. A formula
