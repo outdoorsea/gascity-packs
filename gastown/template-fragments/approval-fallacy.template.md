@@ -24,38 +24,67 @@ handoff — branch-shape gate, push + push-verify, metadata, refinery
 reassignment, wake/nudge, and drain. **Run that step.**
 
 **Do NOT run submit-and-exit twice** — running the done sequence twice is a bug.
-Do not trust memory for this; check mechanically. Derive the work bead from your
-convoy exactly as the formula's workspace-setup step does — never pass a bare or
-guessed id to `bd`, which fuzzy-matches and can reassign the wrong bead.
-`$GC_BEAD_ID` is the convoy the molecule was poured on. If a clean read shows
-the work bead is no longer `in_progress` for this session, submit-and-exit
-already reassigned it — drain and exit. Otherwise run it:
+Do not trust memory for this; check mechanically. Derive the work bead exactly
+as the formula's workspace-setup step does — never pass a bare or guessed id to
+`bd`, which fuzzy-matches and can reassign the wrong bead. When a molecule was
+poured, `$GC_BEAD_ID` is the convoy; **on a pool claim it can be empty** (gp-wqu),
+in which case the branch name carries the id instead. If a clean read shows the
+work bead is no longer `in_progress` for this session, submit-and-exit already
+reassigned it — drain and exit. Otherwise run it:
 
 ```bash
 EXPECTED_ASSIGNEE="${BEADS_ACTOR:-${GC_SESSION_NAME:-${GC_SESSION_ID:-${GC_AGENT:-}}}}"
-# Read the convoy + work bead with retry — same unreadable-is-not-terminal
-# discipline as the claim block. An unreadable state (empty JSON, a convoy blip,
-# or 0/>=2 children so WORK_BEAD_ID is empty) is NOT proof that submit-and-exit
-# already ran. Only a SUCCESSFUL read showing the bead genuinely moved off this
-# session (closed, or reassigned to refinery) means it is done.
+# Resolve the bead ONCE, then retry only the read. An empty $GC_BEAD_ID is not a
+# convoy blip — retrying it just re-asks a question that has no answer.
+# Classify on issue_type: `gc convoy status` exits 1 both for "not a convoy"
+# (an answer) and for an unreachable Dolt (a fault).
 WORK_BEAD_ID=""
+if [ -n "${GC_BEAD_ID:-}" ]; then
+  POURED_JSON=$(gc bd show "$GC_BEAD_ID" --json 2>/dev/null)
+  POURED_KIND=$(printf '%s' "$POURED_JSON" | jq -r '.[0].issue_type // empty')
+  if [ "$POURED_KIND" = "convoy" ]; then
+    CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json 2>/dev/null)
+    WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
+  elif [ -n "$POURED_KIND" ]; then
+    WORK_BEAD_ID="$GC_BEAD_ID"
+  fi
+fi
+if [ -z "$WORK_BEAD_ID" ]; then
+  # No convoy. submit-and-exit's gate guarantees `polecat/<bead-id>`, so the
+  # branch names the bead. CONFIRM it — `gc bd show` fuzzy-matches ("wqu"
+  # resolves to "gp-wqu"), so only an exact id echo is proof. Do NOT reach for
+  # `gc hook --claim` here: if submit-and-exit already ran, the hook would hand
+  # you a DIFFERENT bead and this check would evaluate the wrong one.
+  BRANCH_NOW=$(git branch --show-current 2>/dev/null)
+  case "$BRANCH_NOW" in
+    polecat/*)
+      CANDIDATE="${BRANCH_NOW#polecat/}"
+      CANDIDATE_JSON=$(gc bd show "$CANDIDATE" --json 2>/dev/null)
+      CANDIDATE_ID=$(printf '%s' "$CANDIDATE_JSON" | jq -r '.[0].id // empty')
+      if [ "$CANDIDATE_ID" = "$CANDIDATE" ]; then
+        WORK_BEAD_ID="$CANDIDATE"
+      fi
+      ;;
+  esac
+fi
+# Read the work bead with retry — same unreadable-is-not-terminal discipline as
+# the claim block. An unreadable state (empty JSON, a Dolt blip) is NOT proof
+# that submit-and-exit already ran. Only a SUCCESSFUL read showing the bead
+# genuinely moved off this session (closed, or reassigned to refinery) means it
+# is done. An UNRESOLVABLE bead is likewise not proof — it falls through below.
 WORK_STATUS=""
 WORK_ASSIGNEE=""
 READ_OK=0
 READ_TRY=0
-while [ "$READ_TRY" -lt 3 ]; do
+while [ -n "$WORK_BEAD_ID" ] && [ "$READ_TRY" -lt 3 ]; do
   READ_TRY=$((READ_TRY + 1))
-  CONVOY_STATUS=$(gc convoy status "$GC_BEAD_ID" --json 2>/dev/null)
-  WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end' 2>/dev/null)
-  if [ -n "$WORK_BEAD_ID" ]; then
-    WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
-    SHOW_CODE=$?
-    WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
-    WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
-    if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
-      READ_OK=1
-      break
-    fi
+  WORK_JSON=$(gc bd show "$WORK_BEAD_ID" --json 2>/dev/null)
+  SHOW_CODE=$?
+  WORK_STATUS=$(printf '%s' "$WORK_JSON" | jq -r '.[0].status // empty' 2>/dev/null)
+  WORK_ASSIGNEE=$(printf '%s' "$WORK_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null)
+  if [ "$SHOW_CODE" -eq 0 ] && [ -n "$WORK_STATUS" ]; then
+    READ_OK=1
+    break
   fi
   sleep 1
 done

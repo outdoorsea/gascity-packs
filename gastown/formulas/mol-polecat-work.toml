@@ -109,12 +109,46 @@ Every check is idempotent — safe to re-run after crash/restart.
 3. the rig repo's default branch
 
 **1. Fetch latest and derive your work bead:**
+
+Three topologies reach this step and **only the first has a convoy**:
+
+| | poured id | work bead |
+|---|---|---|
+| A | a convoy | its single tracked child |
+| B | the work bead itself | the poured id |
+| C | *empty* — pool-routed, no molecule | not derivable from a convoy at all |
+
+Topology C is the one that used to strand a polecat (gp-wqu): with no convoy,
+every convoy-derived answer is empty, and an empty `WORK_BEAD_ID` does not stop
+the run — it silently poisons `polecat/$WORK_BEAD_ID` in the branch-shape gate
+three steps later, which then reports a branch mismatch and sends you back here
+to fail the same way. Resolve it here, once, and fail loudly if you cannot.
+
 ```bash
 git fetch --prune origin
-CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
-WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+
+# Classify on issue_type, NOT on `gc convoy status` exit codes: a non-convoy
+# and an unreachable Dolt both exit 1, and only one of those is an answer.
+POURED_ID="{{convoy_id}}"
+WORK_BEAD_ID=""
+if [ -n "$POURED_ID" ]; then
+  POURED_KIND=$(gc bd show "$POURED_ID" --json 2>/dev/null | jq -r '.[0].issue_type // empty')
+  if [ "$POURED_KIND" = "convoy" ]; then
+    CONVOY_STATUS=$(gc convoy status "$POURED_ID" --json)
+    WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+  elif [ -n "$POURED_KIND" ]; then
+    WORK_BEAD_ID="$POURED_ID"
+  fi
+fi
 if [ -z "$WORK_BEAD_ID" ]; then
-  echo "mol-polecat-work requires an input convoy with exactly one tracked member" >&2
+  # Topology C. `gc hook --claim` is idempotent for an assignment you already
+  # hold (it answers reason=existing_assignment), so this re-reads YOUR claim —
+  # it is not a second claim and cannot take another polecat's bead.
+  WORK_BEAD_ID=$(gc hook --claim --json 2>/dev/null \
+    | jq -r 'select(.action == "work") | .bead_id // empty')
+fi
+if [ -z "$WORK_BEAD_ID" ]; then
+  echo "cannot resolve a work bead: convoy has no single tracked member, no bead was poured, and the hook reports no claim" >&2
   gc runtime drain-ack
   exit 1
 fi
@@ -425,8 +459,24 @@ If uncommitted changes exist, commit them with a body explaining what
 slipped through the `implement` step (typically a self-review touch-up,
 test addition, or formatter run):
 ```bash
-CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
-WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+# You are already on `polecat/<bead-id>`, so the branch is the shortest correct
+# read — and the only one that still works when no molecule was poured and there
+# is no convoy to ask (gp-wqu). Confirm it rather than trusting it: `gc bd show`
+# fuzzy-matches, so only an exact id echo proves the branch names a real bead.
+BRANCH_NOW=$(git branch --show-current 2>/dev/null)
+WORK_BEAD_ID=""
+case "$BRANCH_NOW" in
+  polecat/*)
+    CANDIDATE="${BRANCH_NOW#polecat/}"
+    if [ "$(gc bd show "$CANDIDATE" --json 2>/dev/null | jq -r '.[0].id // empty')" = "$CANDIDATE" ]; then
+      WORK_BEAD_ID="$CANDIDATE"
+    fi
+    ;;
+esac
+if [ -z "$WORK_BEAD_ID" ]; then
+  echo "not on a polecat/<bead-id> branch — re-run workspace-setup before committing" >&2
+  exit 1
+fi
 git add -A
 git commit -m "<type>: <imperative subject> ($WORK_BEAD_ID)" -m "$(cat <<'BODY'
 <Explain what these residual changes are: a self-review fix,
@@ -456,9 +506,45 @@ branch (your agent home branch, a stray local checkout, etc.), the
 handoff contract is broken and the bead is permanently stranded as
 "assigned to refinery, no merge target". See gastownhall/gascity#2082.
 
+Resolve the work bead the same way `workspace-setup` did. Do **not** let this
+resolve to empty: `EXPECTED_BRANCH` would become the literal `polecat/`, the
+gate below would report a branch mismatch that has nothing to do with your
+branch, and its recovery advice would send you back to a step that fails
+identically (gp-wqu).
+
 ```bash
-CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
-WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+POURED_ID="{{convoy_id}}"
+WORK_BEAD_ID=""
+if [ -n "$POURED_ID" ]; then
+  POURED_KIND=$(gc bd show "$POURED_ID" --json 2>/dev/null | jq -r '.[0].issue_type // empty')
+  if [ "$POURED_KIND" = "convoy" ]; then
+    CONVOY_STATUS=$(gc convoy status "$POURED_ID" --json)
+    WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
+  elif [ -n "$POURED_KIND" ]; then
+    WORK_BEAD_ID="$POURED_ID"
+  fi
+fi
+if [ -z "$WORK_BEAD_ID" ]; then
+  # No convoy — pool-routed with no molecule. workspace-setup named the branch
+  # `polecat/<bead-id>`, so recover the id from it, then CONFIRM it: `gc bd show`
+  # fuzzy-matches ("wqu" resolves to "gp-wqu"), so only an exact id echo is
+  # proof. A branch name is a hypothesis, not an authority.
+  BRANCH_NOW=$(git branch --show-current 2>/dev/null)
+  case "$BRANCH_NOW" in
+    polecat/*)
+      CANDIDATE="${BRANCH_NOW#polecat/}"
+      if [ "$(gc bd show "$CANDIDATE" --json 2>/dev/null | jq -r '.[0].id // empty')" = "$CANDIDATE" ]; then
+        WORK_BEAD_ID="$CANDIDATE"
+      fi
+      ;;
+  esac
+fi
+if [ -z "$WORK_BEAD_ID" ]; then
+  echo "HALT: cannot resolve the work bead — no convoy child, no poured bead, and the branch does not name a bead that exists." >&2
+  echo "Do NOT guess an id: 'gc bd' fuzzy-matches and would reassign the wrong bead." >&2
+  gc runtime drain-ack
+  exit 1
+fi
 CURRENT_BRANCH=$(git branch --show-current)
 EXPECTED_BRANCH="polecat/$WORK_BEAD_ID"
 if [ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" ]; then
