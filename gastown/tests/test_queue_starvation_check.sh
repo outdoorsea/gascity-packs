@@ -42,20 +42,78 @@ fail() {
     exit 1
 }
 
-# The `gc` the check talks to. Everything it needs is served from two fixture
-# files, so a test declares a city as data rather than by standing one up.
+# The `gc` the check talks to. Everything it needs is served from fixture files,
+# so a test declares a city as data rather than by standing one up.
+#
+# The stub is deliberately rig-aware, because the thing under test is which
+# LEDGER each query reads. Gas Town shards beads per rig, so `gc bd list` answers
+# for exactly one rig — the one named by `-C <path>` — and a stub that served the
+# same beads to every call would report the fix working while the check still
+# read a single database (gp-1ug).
+#
+#   GC_BEADS_DIR unset  single-ledger city: every `gc bd list` serves
+#                       $GC_BEADS_JSON. This is what the pre-existing tests
+#                       assume, and it keeps them measuring what they measured.
+#   GC_BEADS_DIR set    sharded city: `gc bd list -C <path>` serves
+#                       $GC_BEADS_DIR/<basename path>.json, or an empty queue if
+#                       that rig has no ledger file — exactly what an
+#                       initialized-but-empty rig returns.
 #
 # GC_FAIL_MODE injects the failure shapes that matter:
-#   roster-unknown-command  the gp-b3x shape — {"ok":false} on STDOUT, exit 1
-#   roster-exit             a plain non-zero exit with no payload
-#   roster-drift            a well-formed object with no `sessions` key
-#   bdlist-exit             the queue query failing
+#   roster-unknown-command   the gp-b3x shape — {"ok":false} on STDOUT, exit 1
+#   roster-exit              a plain non-zero exit with no payload
+#   roster-drift             a well-formed object with no `sessions` key
+#   bdlist-exit              the queue query failing
+#   riglist-unknown-command  the same {"ok":false}-on-STDOUT shape, one call over
+#   riglist-exit             the rig roster failing outright
+#   riglist-drift            a well-formed object with no `rigs` key
+#   ledger-exit:<rig>        ONE rig's ledger unreadable; the others answer
 write_gc_stub() {
     local bin="$1"
     mkdir -p "$bin"
     cat >"$bin/gc" <<'SH'
 #!/usr/bin/env sh
+# The queue arm is matched before the rig-roster arm on purpose: a `-C` path may
+# itself contain "rig", and the queue query must never be answered by the roster.
 case "$*" in
+    *"bd"*"list"*)
+        # Which ledger is this call scoped to? `-C <path>` is the only scoping
+        # the check uses, and reading it here is what lets a test prove the
+        # check asked each rig separately.
+        cpath=''
+        prev=''
+        for a in "$@"; do
+            [ "$prev" = "-C" ] && cpath="$a"
+            prev="$a"
+        done
+        rig=${cpath##*/}
+        case "${GC_FAIL_MODE:-}" in
+            bdlist-exit) exit 1 ;;
+            ledger-exit:*)
+                [ "$rig" = "${GC_FAIL_MODE#ledger-exit:}" ] && exit 1
+                ;;
+        esac
+        if [ -n "${GC_BEADS_DIR:-}" ]; then
+            if [ -f "$GC_BEADS_DIR/$rig.json" ]; then
+                cat "$GC_BEADS_DIR/$rig.json"
+            else
+                printf '[]'
+            fi
+        else
+            cat "$GC_BEADS_JSON"
+        fi
+        ;;
+    *"rig"*"list"*)
+        case "${GC_FAIL_MODE:-}" in
+            riglist-unknown-command)
+                printf '{"schema_version":"1","ok":false,"error":{"code":"json_command_not_found","message":"command \\"rig list\\" was not found","exit_code":1}}'
+                exit 1
+                ;;
+            riglist-exit) exit 1 ;;
+            riglist-drift) printf '{"schema_version":"1","ok":true,"racks":[]}' ;;
+            *) cat "$GC_RIGS_JSON" ;;
+        esac
+        ;;
     *"session"*"list"*)
         case "${GC_FAIL_MODE:-}" in
             roster-unknown-command)
@@ -69,28 +127,80 @@ case "$*" in
             *) cat "$GC_SESSIONS_JSON" ;;
         esac
         ;;
-    *"bd"*"list"*)
-        case "${GC_FAIL_MODE:-}" in
-            bdlist-exit) exit 1 ;;
-            *) cat "$GC_BEADS_JSON" ;;
-        esac
-        ;;
     *) printf '{}' ;;
 esac
 SH
     chmod +x "$bin/gc"
 }
 
+# rig_entry <name> [beads-state] — one entry of a `gc rig list --json` roster.
+# The path is $LEDGERS/<name> so the stub can recover the rig from `-C` by
+# basename, the same way the real command recovers it from the directory.
+rig_entry() {
+    printf '{"name":"%s","path":"%s/%s","hq":false,"suspended":false,"beads":"%s"}' \
+        "$1" "$LEDGERS" "$1" "${2:-initialized}"
+}
+
+# rigs_of <entry>... — assemble entries into a roster payload.
+rigs_of() {
+    local out='{"schema_version":"1","ok":true,"rigs":[' first=1 e
+    for e in "$@"; do
+        [ "$first" -eq 1 ] || out="$out,"
+        first=0
+        out="$out$e"
+    done
+    printf '%s]}' "$out"
+}
+
+# set_ledger <rig> <beads-json> — give one rig its own bead ledger.
+set_ledger() {
+    mkdir -p "$LEDGERS"
+    printf '%s' "$2" >"$LEDGERS/$1.json"
+}
+
+# clear_ledgers — drop every per-rig ledger so tests cannot leak into each other.
+clear_ledgers() {
+    rm -rf "$LEDGERS"
+    mkdir -p "$LEDGERS"
+}
+
 # run_check <sessions-json> <beads-json> [env assignments...]
+#
+# A single-rig city whose one ledger holds <beads-json>. The check still has to
+# discover that rig and scope its query to it, so these exercise the per-rig
+# gather too — they just cannot tell one ledger from two. run_multirig does that.
 run_check() {
     local sessions="$1" beads="$2"
     shift 2
     printf '%s' "$sessions" >"$SESSIONS"
     printf '%s' "$beads" >"$BEADS"
+    printf '%s' "$(rigs_of "$(rig_entry alpha)")" >"$RIGS"
     set +e
     # ${1+"$@"} rather than "$@": bash 3.2 under `set -u` treats an empty "$@"
     # as an unbound variable.
-    OUT=$(env GC_CITY="$CITY" GC_SESSIONS_JSON="$SESSIONS" GC_BEADS_JSON="$BEADS" \
+    OUT=$(env -u GC_BEADS_DIR GC_CITY="$CITY" GC_SESSIONS_JSON="$SESSIONS" \
+        GC_BEADS_JSON="$BEADS" GC_RIGS_JSON="$RIGS" \
+        PATH="$BIN:$PATH" ${1+"$@"} bash "$SCRIPT" 2>"$ERRFILE")
+    RC=$?
+    set -e
+    ERR=$(cat "$ERRFILE")
+}
+
+# run_multirig <rigs-json> <sessions-json> [env assignments...]
+#
+# A city whose beads are sharded across rigs, which is what every real city is.
+# Each rig serves whatever `set_ledger <rig> <beads>` wrote for it, so a test can
+# put work in one rig and nothing in another and assert the check found it. There
+# is no city-wide bead payload here on purpose: the bug under repair was reading
+# one as if it existed.
+run_multirig() {
+    local rigs="$1" sessions="$2"
+    shift 2
+    printf '%s' "$rigs" >"$RIGS"
+    printf '%s' "$sessions" >"$SESSIONS"
+    set +e
+    OUT=$(env GC_CITY="$CITY" GC_SESSIONS_JSON="$SESSIONS" GC_RIGS_JSON="$RIGS" \
+        GC_BEADS_DIR="$LEDGERS" \
         PATH="$BIN:$PATH" ${1+"$@"} bash "$SCRIPT" 2>"$ERRFILE")
     RC=$?
     set -e
@@ -110,10 +220,11 @@ run_wrapper() {
     shift 2
     printf '%s' "$sessions" >"$SESSIONS"
     printf '%s' "$beads" >"$BEADS"
+    printf '%s' "$(rigs_of "$(rig_entry alpha)")" >"$RIGS"
     set +e
-    OUT=$(cd "$NOCITY" && env -u GC_CITY \
+    OUT=$(cd "$NOCITY" && env -u GC_CITY -u GC_BEADS_DIR \
         GC_CITY_PATH="${WRAP_CITY-$CITY}" GC_PACK_DIR="${WRAP_PACK-$ROOT/gastown}" \
-        GC_SESSIONS_JSON="$SESSIONS" GC_BEADS_JSON="$BEADS" \
+        GC_SESSIONS_JSON="$SESSIONS" GC_BEADS_JSON="$BEADS" GC_RIGS_JSON="$RIGS" \
         PATH="$BIN:$PATH" ${1+"$@"} sh "$WRAPPER" 2>"$ERRFILE")
     RC=$?
     set -e
@@ -141,9 +252,11 @@ CITY="$tmp/city"
 BIN="$tmp/bin"
 SESSIONS="$tmp/sessions.json"
 BEADS="$tmp/beads.json"
+RIGS="$tmp/rigs.json"
+LEDGERS="$tmp/ledgers"
 ERRFILE="$tmp/stderr.txt"
 NOCITY="$tmp/nocity"
-mkdir -p "$CITY" "$NOCITY"
+mkdir -p "$CITY" "$NOCITY" "$LEDGERS"
 : >"$CITY/city.toml"
 write_gc_stub "$BIN"
 
@@ -374,6 +487,205 @@ test_queued_beads_with_no_timestamp_are_drift_not_working() {
     return 0
 }
 
+# --- gp-1ug: the queue is sharded per rig, and ALL of it must be gathered ------
+#
+# The check gathered its queue with one unscoped `gc bd list`. Gas Town shards
+# the bead ledger per rig, so that call resolves to exactly one database — picked
+# ambiently from $GC_RIG or the cwd — and every bead in every other rig was
+# invisible. Polecat and refinery work lives in the per-rig ledgers, so the
+# gathered queue contained none of it and every session in the city scored 0 and
+# reported idle. Exit 0, "0 starved", forever.
+#
+# These tests are the reason the stub is rig-aware. A stub that served the same
+# beads to every `gc bd list` would pass whether or not the check ever scoped a
+# query, which is precisely the property under test.
+
+# A polecat in a NON-HQ rig — where polecat work actually lives, and where the
+# unscoped query could not see it.
+RIG_POLECAT_SESSION='{"sessions":[{"id":"gk-7","name":"beta/gastown.nux","rig":"beta","template":"beta/gastown.polecat","state":"active","session_name":"gastown__polecat-gk-7","agent_name":"beta/gastown.nux","alias":"beta/gastown.nux","closed":false}]}'
+
+# depth_of — the queued column of the first emitted row. Field-exact, because a
+# bare `grep '<TAB>1<TAB>'` also matches the age column and would pass on the
+# wrong number.
+depth_of() { printf '%s' "$OUT" | awk -F'\t' 'NR==1 {print $5}'; }
+
+test_rig_scoped_work_is_counted() {
+    # THE regression test for gp-1ug. The HQ ledger is empty; the polecat's work
+    # sits in its own rig's ledger. Ground truth when this was found: 7 polecats
+    # held in_progress beads across two rigs and the check reported all 19
+    # sessions idle, because it only ever read one database.
+    clear_ledgers
+    set_ledger hq '[]'
+    set_ledger beta "[$(bead ml-1 'gastown__polecat-gk-7' "$DEAD")]"
+
+    run_multirig "$(rigs_of "$(rig_entry hq)" "$(rig_entry beta)")" \
+        "$RIG_POLECAT_SESSION" GASTOWN_STARVATION_POLECAT_MIN=30
+
+    [ "$RC" -eq 1 ] ||
+        fail "work living in a RIG ledger must be seen — the unscoped query scored it 0 and reported idle, got $RC ($OUT / $ERR)"
+    printf '%s' "$OUT" | grep -q '^starved	beta	beta/gastown.nux	' ||
+        fail "the polecat holding rig-scoped work should starve, got: $OUT"
+    [ "$(depth_of)" = "1" ] ||
+        fail "the row should carry the rig-scoped queue depth of 1, got: $OUT"
+}
+
+test_hq_ledger_is_still_gathered() {
+    # The mirror of the test above. Scoping every query per rig must not lose the
+    # HQ ledger, which holds the city's own coordination work. It is reachable
+    # only by path: `gc bd list --rig=<hq-name>` exits 1 with `rig not found`,
+    # which is why the gather scopes with `-C <path>` for every rig uniformly.
+    clear_ledgers
+    set_ledger hq "[$(bead gk-1 'alpha/gastown.refinery' "$DEAD")]"
+    set_ledger beta '[]'
+
+    run_multirig "$(rigs_of "$(rig_entry hq)" "$(rig_entry beta)")" "$REFINERY_SESSION"
+
+    [ "$RC" -eq 1 ] || fail "HQ-ledger work must still be gathered, got $RC ($OUT / $ERR)"
+    printf '%s' "$OUT" | grep -q '^starved	alpha	alpha/gastown.refinery	' ||
+        fail "expected the HQ-held queue to starve, got: $OUT"
+}
+
+test_every_rig_ledger_is_queried() {
+    # Not just the first rig, and not just two. Work parked in the LAST rig of
+    # five must be found — a gather that stopped early would look identical to
+    # the original bug for every rig it never reached.
+    clear_ledgers
+    set_ledger r1 '[]'
+    set_ledger r2 '[]'
+    set_ledger r3 '[]'
+    set_ledger r4 '[]'
+    set_ledger r5 "[$(bead z-1 'alpha/gastown.refinery' "$DEAD")]"
+
+    run_multirig "$(rigs_of "$(rig_entry r1)" "$(rig_entry r2)" "$(rig_entry r3)" \
+        "$(rig_entry r4)" "$(rig_entry r5)")" "$REFINERY_SESSION"
+
+    [ "$RC" -eq 1 ] ||
+        fail "work in the last of five rigs must be gathered, got $RC ($OUT / $ERR)"
+    [ "$(depth_of)" = "1" ] || fail "expected depth 1 from the last rig, got: $OUT"
+}
+
+test_work_across_rigs_unions_for_one_session() {
+    # One agent address can hold beads in more than one rig — the refinery merge
+    # queue is exactly this shape. The per-rig gather must sum them, not report
+    # whichever rig it happened to read last.
+    clear_ledgers
+    set_ledger hq "[$(bead gk-1 'alpha/gastown.refinery' "$DEAD")]"
+    set_ledger beta "[$(bead ml-1 'alpha/gastown.refinery' "$DEAD")]"
+
+    run_multirig "$(rigs_of "$(rig_entry hq)" "$(rig_entry beta)")" "$REFINERY_SESSION"
+
+    [ "$RC" -eq 1 ] || fail "cross-rig work must starve, got $RC ($OUT / $ERR)"
+    [ "$(depth_of)" = "2" ] ||
+        fail "two beads in two rigs should union to a depth of 2, got: $OUT"
+}
+
+test_same_bead_in_two_rigs_is_not_double_counted() {
+    # Two rig entries can resolve to the same ledger — a duplicate registration,
+    # or two paths that are one directory through a symlink. Counting a bead
+    # twice inflates the depth and can starve a session on work that does not
+    # exist, so the merge deduplicates by id.
+    clear_ledgers
+    set_ledger hq "[$(bead dup-1 'alpha/gastown.refinery' "$DEAD")]"
+    set_ledger beta "[$(bead dup-1 'alpha/gastown.refinery' "$DEAD")]"
+
+    run_multirig "$(rigs_of "$(rig_entry hq)" "$(rig_entry beta)")" "$REFINERY_SESSION"
+
+    [ "$(depth_of)" = "1" ] ||
+        fail "one bead served by two rigs must count once, got: $OUT"
+}
+
+test_unreadable_rig_ledger_fails_loud() {
+    # A rig that declares an initialized ledger and then will not produce it is
+    # an unread queue. Continuing would report the sessions holding that rig's
+    # work as idle — the original bug, restored one rig at a time.
+    clear_ledgers
+    set_ledger hq '[]'
+    set_ledger beta "[$(bead ml-1 'alpha/gastown.refinery' "$DEAD")]"
+
+    run_multirig "$(rigs_of "$(rig_entry hq)" "$(rig_entry beta)")" \
+        "$REFINERY_SESSION" GC_FAIL_MODE=ledger-exit:beta
+
+    [ "$RC" -eq 2 ] ||
+        fail "an unreadable rig ledger must exit 2, never a partial measurement, got $RC ($OUT)"
+    printf '%s' "$ERR" | grep -q 'NOT measured' ||
+        fail "the failure must say starvation was not measured, got: $ERR"
+    printf '%s' "$ERR" | grep -q "beta" ||
+        fail "the failure should name the rig whose ledger could not be read, got: $ERR"
+    printf '%s' "$OUT" | grep -q 'idle' &&
+        fail "a rig whose ledger failed must not yield health rows for anyone"
+    return 0
+}
+
+test_rig_without_a_ledger_is_skipped_not_fatal() {
+    # A rig that never initialized beads has nothing to contribute and its query
+    # is expected to fail. That is a skip, not a finding — but it is announced,
+    # because a silently skipped rig is indistinguishable from an empty one.
+    clear_ledgers
+    set_ledger hq "[$(bead gk-1 'alpha/gastown.refinery' "$FRESH")]"
+
+    run_multirig "$(rigs_of "$(rig_entry hq)" "$(rig_entry beta absent)")" \
+        "$REFINERY_SESSION" GC_FAIL_MODE=ledger-exit:beta
+
+    [ "$RC" -eq 0 ] ||
+        fail "a rig with no ledger must not fail the whole check, got $RC ($OUT / $ERR)"
+    printf '%s' "$ERR" | grep -q "rig 'beta' has no initialized ledger" ||
+        fail "the skipped rig should be named on stderr, got: $ERR"
+    printf '%s' "$OUT" | grep -q '^working	alpha	alpha/gastown.refinery	' ||
+        fail "the readable rig's queue should still be measured, got: $OUT"
+}
+
+test_rig_roster_failure_fails_loud() {
+    run_check "$REFINERY_SESSION" '[]' GC_FAIL_MODE=riglist-exit
+    [ "$RC" -eq 2 ] || fail "a failing 'gc rig list' must exit 2, got $RC ($OUT)"
+    printf '%s' "$ERR" | grep -q 'NOT measured' ||
+        fail "a failed rig roster read should say starvation was not measured, got: $ERR"
+}
+
+test_unknown_rig_roster_command_fails_loud() {
+    # The gp-b3x shape one call over: {"ok":false} on STDOUT with a non-zero
+    # exit. It parses as valid JSON, yields zero rigs, and would gather a queue
+    # from nowhere — every session idle, exit 0.
+    run_check "$REFINERY_SESSION" '[]' GC_FAIL_MODE=riglist-unknown-command
+    [ "$RC" -eq 2 ] ||
+        fail "an {\"ok\":false} rig roster must exit 2, not read as a city with no rigs, got $RC"
+    printf '%s' "$ERR" | grep -q 'NOT measured' ||
+        fail "the failure must say starvation was not measured, got: $ERR"
+    printf '%s' "$OUT" | grep -q 'idle' &&
+        fail "a failed rig roster read must not emit health rows"
+    return 0
+}
+
+test_rig_roster_drift_fails_loud() {
+    # A well-formed object with no `rigs` key. Without an explicit check this
+    # yields zero rigs, an empty queue, and a clean patrol.
+    run_check "$REFINERY_SESSION" '[]' GC_FAIL_MODE=riglist-drift
+    [ "$RC" -eq 2 ] || fail "a rig roster with no rigs array must exit 2, got $RC ($OUT)"
+    printf '%s' "$ERR" | grep -q 'schema drifted' ||
+        fail "the drift message should name the drift, got: $ERR"
+}
+
+test_queue_gather_is_rig_scoped() {
+    # The source-level pin. Every `gc bd list` the check issues must name the
+    # ledger it reads; an unscoped one resolves ambiently from $GC_RIG or the cwd
+    # and silently measures a single rig, which is gp-1ug exactly.
+    # Match the construct — a line that RUNS the query — not the bare string, for
+    # the same reason test_formula_invokes_the_command_not_the_path does: the
+    # failure message quotes the command it could not run so an operator can see
+    # it, and a string match would forbid saying which command failed.
+    local unscoped
+    unscoped=$(grep -nE '^[^#]*gc bd list' "$SCRIPT" \
+        | grep -vE '(echo|printf)' \
+        | grep -v -- '-C "\$rig_path"' || true)
+    [ -z "$unscoped" ] ||
+        fail "every 'gc bd list' must be scoped with -C \"\$rig_path\"; unscoped: $unscoped"
+
+    # ...and specifically NOT with --rig=<name>, which cannot address the HQ rig
+    # at all: `gc bd list --rig=<hq-name>` exits 1 with `rig "<name>" not found`,
+    # so a --rig-based gather would silently drop the city's own ledger.
+    ! grep -qE '^[^#]*gc bd list .*--rig=' "$SCRIPT" ||
+        fail "--rig= cannot reach the HQ ledger; scope with -C <path> instead"
+}
+
 # --- windows and scope --------------------------------------------------------
 
 test_polecat_window_is_more_lenient() {
@@ -597,6 +909,17 @@ test_empty_city_is_not_drift
 test_bead_query_failure_fails_loud
 test_non_array_queue_payload_fails_loud
 test_queue_is_read_in_one_query
+test_rig_scoped_work_is_counted
+test_hq_ledger_is_still_gathered
+test_every_rig_ledger_is_queried
+test_work_across_rigs_unions_for_one_session
+test_same_bead_in_two_rigs_is_not_double_counted
+test_unreadable_rig_ledger_fails_loud
+test_rig_without_a_ledger_is_skipped_not_fatal
+test_rig_roster_failure_fails_loud
+test_unknown_rig_roster_command_fails_loud
+test_rig_roster_drift_fails_loud
+test_queue_gather_is_rig_scoped
 test_session_with_no_identity_is_drift_not_idle
 test_queued_beads_with_no_timestamp_are_drift_not_working
 test_polecat_window_is_more_lenient

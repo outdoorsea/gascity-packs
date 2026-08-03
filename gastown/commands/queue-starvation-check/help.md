@@ -31,6 +31,19 @@ Scope:
   Queued means `open,in_progress`. A claimed bead flips to in_progress, so an
   `open`-only query cannot see the work a session is actually sitting on.
 
+  Every rig's ledger is read, one query per rig. Gas Town shards beads per rig,
+  so there is no such thing as a city-wide bead query: an unscoped `gc bd list`
+  resolves to exactly one database, picked from `$GC_RIG` or the cwd. Gathering
+  the queue that way meant polecat and refinery work — which lives in the
+  per-rig ledgers — was invisible, and every session in the city scored 0 and
+  reported idle (gp-1ug). Each query is now scoped by path, so the result does
+  not depend on where the caller was standing.
+
+  A rig that declares a ledger and then cannot produce it is an unread queue,
+  not an empty one: the check exits 2 rather than reporting the sessions holding
+  that rig's work as idle. A rig that never initialized beads is skipped, and
+  said so on stderr.
+
 Output — one TSV row per checked session on stdout, header on stderr:
 
   verdict <TAB> rig <TAB> session <TAB> role <TAB> queued <TAB> age_seconds <TAB> identity
@@ -70,3 +83,9 @@ Exit codes:
   produced zero rows, and zero rows read as a clean queue — so the detector had
   the same defect class as the incident it existed to catch. Every path here
   that fails to measure exits 2 and says so.
+
+  That rewrite fixed three of the four silent-zero paths and the symptom did not
+  change, because the fourth — gathering the queue from a single unscoped
+  database — was still there (gp-1ug). Worth remembering in both directions: a
+  check that is still reporting zero has not necessarily been fixed, and the
+  surviving fault was the one introduced as an optimization.

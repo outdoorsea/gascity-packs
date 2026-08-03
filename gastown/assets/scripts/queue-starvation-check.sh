@@ -40,6 +40,23 @@
 # not measure exits 2 and says so, and the only exit 0 is a measurement that
 # actually happened.
 #
+# ## And then it happened again, one call lower down (gp-1ug)
+#
+# The rewrite above fixed the roster call and the identity probe, and the symptom
+# survived unchanged: queued=0 for every session in the city, forever, exit 0.
+# The queue gather was still a single UNSCOPED `gc bd list`, and Gas Town shards
+# the bead ledger per rig, so that call only ever saw one rig's database — chosen
+# ambiently from $GC_RIG or the cwd — while polecat and refinery work lives in
+# the per-rig ledgers it never looked at.
+#
+# Two things are worth keeping from that. First, fixing three of a check's four
+# silent-zero paths leaves a check that is still silently zero; the symptom is
+# the contract, not the individual bug. Second, the surviving path was the one
+# introduced as an OPTIMIZATION — batching the queue into a single query traded
+# away the per-rig scoping that the O(sessions) shape had for free. Both are why
+# the gather below scopes every read explicitly and refuses to proceed on a
+# ledger it could not open.
+#
 # Output: one TSV row per checked session on stdout, column header on stderr.
 #
 #   verdict <TAB> rig <TAB> session <TAB> role <TAB> queued <TAB> age_seconds <TAB> identity
@@ -200,20 +217,136 @@ ROWS=$(printf '%s' "$ROSTER" | jq -r "
   | @tsv
 " 2>/dev/null) || ROWS=''
 
-# --- the queue, gathered once ------------------------------------------------
+# --- the queue, gathered per rig ---------------------------------------------
 #
-# Two queries total, regardless of how many sessions the city runs. The obvious
-# shape — one `gc bd list --assignee=X` per session per identity — is O(sessions)
-# round trips against Dolt, which measured ~2s each and pushed a single patrol
-# pass past two minutes on an 18-session city.
+# One query per RIG. That keeps the batching intent of the shape this replaces —
+# O(rigs), not the O(sessions) round trips that pushed a patrol pass past two
+# minutes on an 18-session city — while fixing what that shape got wrong.
 #
-if ! QUEUED=$(gc bd list --status="$STATUSES" --json --limit=0 2>/dev/null </dev/null); then
-  echo "queue-starvation-check: 'gc bd list --status=$STATUSES' failed — starvation NOT measured" >&2
+# What it got wrong (gp-1ug): it gathered the whole city in ONE unscoped call,
+#
+#     gc bd list --status="$STATUSES" --json --limit=0
+#
+# and there is no such thing as a city-wide bead query. Gas Town shards the
+# ledger per rig — each rig owns its own .beads/ database — so an unscoped call
+# resolves to exactly ONE of them, chosen ambiently from $GC_RIG or the cwd.
+# Every bead in every other rig was invisible, the per-identity lookups below all
+# missed, and every session in the city reported queued=0 -> idle. Measured on
+# gc-kittyhawk: the unscoped query returned 55 rows and ZERO polecat-assigned
+# beads, while the same query issued per rig found 8 polecats holding work across
+# three rigs. The check reported all 19 sessions idle.
+#
+# That is this check's own defect class — a detector whose failure mode is
+# silence — reintroduced one call below the identity fix that removed it
+# (gp-b3x). So the scoping here is explicit rather than ambient: `-C <path>`
+# names the ledger to read and overrides both $GC_RIG and the cwd, and the
+# result no longer depends on where the caller happened to be standing.
+#
+# `-C <path>` and NOT `--rig=<name>`, because `--rig` cannot address the HQ rig
+# at all: `gc bd list --rig=<hq-name>` exits 1 with `rig "<name>" not found`,
+# while `-C <hq-path>` reads it correctly. One uniform mechanism for every rig
+# beats a special case for the one ledger that holds the city's own work.
+#
+if ! RIGS=$(gc rig list --json 2>/dev/null </dev/null); then
+  echo "queue-starvation-check: 'gc rig list --json' failed — starvation NOT measured" >&2
   exit 2
 fi
 
-if ! printf '%s' "$QUEUED" | jq -e 'type == "array"' >/dev/null 2>&1; then
-  echo "queue-starvation-check: the queue query returned no array — starvation NOT measured" >&2
+# Same payload-not-status guard as the session roster above, and for the same
+# reason: `gc` reports an unknown command by printing an {"ok":false} envelope to
+# STDOUT, which parses fine and yields zero rigs — a queue gathered from nowhere,
+# read as a city where nobody holds anything.
+if printf '%s' "$RIGS" | jq -e '(type == "object") and (.ok == false)' >/dev/null 2>&1; then
+  RIGS_ERR=$(printf '%s' "$RIGS" | jq -r '.error.message // "unknown error"' 2>/dev/null)
+  echo "queue-starvation-check: the rig roster command failed (${RIGS_ERR}) — starvation NOT measured" >&2
+  exit 2
+fi
+
+if ! printf '%s' "$RIGS" | jq -e '(type == "object") and has("rigs")' >/dev/null 2>&1; then
+  echo "queue-starvation-check: rig roster exposes no 'rigs' array — gc rig list schema drifted; starvation NOT measured" >&2
+  exit 2
+fi
+
+if ! RIG_ROWS=$(printf '%s' "$RIGS" | jq -r '
+    (.rigs // [])
+    | .[]
+    | [ (.name // "?"), (.path // ""), (.beads // "") ]
+    | @tsv
+  ' 2>/dev/null); then
+  echo "queue-starvation-check: could not parse the rig roster — starvation NOT measured" >&2
+  exit 2
+fi
+
+QUEUE_RAW=''
+RIG_COUNT=0
+RIG_QUERIED=0
+
+while IFS=$'\t' read -r rig_name rig_path rig_beads; do
+  [ -n "${rig_name:-}" ] || continue
+  RIG_COUNT=$((RIG_COUNT + 1))
+
+  # A rig we cannot address is a ledger we cannot read, and continuing past it
+  # undercounts exactly the way the unscoped query did.
+  if [ -z "${rig_path:-}" ]; then
+    echo "queue-starvation-check: rig '$rig_name' exposes no path — its ledger could not be read; starvation NOT measured" >&2
+    exit 2
+  fi
+
+  # `</dev/null` is load-bearing. This loop is fed by a here-doc on stdin and
+  # `gc` reads stdin, so an unredirected call eats the rig lines the loop has not
+  # consumed yet — the measured 18-sessions-in/17-rows-out defect described at
+  # the session loop below. There the fix was to hoist the queries out of the
+  # loop; here there is one query per rig by construction, so the redirect is the
+  # fix and it is not optional.
+  if RIG_QUEUE=$(gc bd list -C "$rig_path" --status="$STATUSES" --json --limit=0 2>/dev/null </dev/null); then
+    if ! printf '%s' "$RIG_QUEUE" | jq -e 'type == "array"' >/dev/null 2>&1; then
+      echo "queue-starvation-check: rig '$rig_name' returned no array for its queue — starvation NOT measured" >&2
+      exit 2
+    fi
+    QUEUE_RAW="$QUEUE_RAW$RIG_QUEUE"
+    RIG_QUERIED=$((RIG_QUERIED + 1))
+  elif [ "${rig_beads:-}" = "initialized" ]; then
+    # It said it has a ledger and then would not produce it — a moved repo, a
+    # wedged Dolt, a path that is no longer a beads project. `gc bd list -C` fails
+    # loudly for every one of those rather than answering with an empty array, so
+    # reaching here really does mean the queue went unread, and continuing would
+    # be a silent undercount: the entire defect under repair.
+    echo "queue-starvation-check: 'gc bd list -C $rig_path' failed for rig '$rig_name' — starvation NOT measured" >&2
+    exit 2
+  else
+    # A rig that never initialized a ledger has nothing to contribute and its
+    # query is expected to fail. Skipping is correct, but say so on stderr:
+    # a skipped rig that nobody mentions is indistinguishable from an empty one.
+    echo "queue-starvation-check: rig '$rig_name' has no initialized ledger (beads=${rig_beads:-unknown}) — skipped" >&2
+  fi
+done <<EOF
+$RIG_ROWS
+EOF
+
+# Zero rigs means the gather had no source at all, so every session below would
+# score 0 and read idle. A real city always carries at least its HQ rig, so this
+# is drift, not a quiet town.
+if [ "$RIG_COUNT" -eq 0 ]; then
+  echo "queue-starvation-check: rig roster lists no rigs — starvation NOT measured" >&2
+  exit 2
+fi
+
+if [ "$RIG_QUERIED" -eq 0 ]; then
+  echo "queue-starvation-check: no ledger could be read from any of $RIG_COUNT rig(s) — starvation NOT measured" >&2
+  exit 2
+fi
+
+# `unique_by(.id)` because two rig entries can resolve to the same ledger — a
+# duplicate registration, or two paths that are one directory through a symlink —
+# and a bead counted twice inflates a session's depth, which can starve a session
+# on work that does not exist. Beads carrying no id cannot be deduplicated, so
+# they are passed through rather than collapsed into a single row.
+if ! QUEUED=$(printf '%s' "$QUEUE_RAW" | jq -s '
+    map(.[])
+    | (map(select(((.id // "") | tostring) != "")) | unique_by(.id))
+      + map(select(((.id // "") | tostring) == ""))
+  ' 2>/dev/null); then
+  echo "queue-starvation-check: could not merge the per-rig queues — starvation NOT measured" >&2
   exit 2
 fi
 
