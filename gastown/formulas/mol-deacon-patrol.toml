@@ -287,9 +287,99 @@ never exempts a verdict from corroboration. Looking is the only thing that
 separates the two, which is why it is mandatory here rather than advisory —
 the next wrong signal will not announce itself either.
 
-Once the pane corroborates that the session is genuinely not progressing, it
-takes the same escalation route as everything else in this step — nudge first,
-so a witness that is merely wedged mid-turn gets to recover on its own:
+**Before either rung: is it waiting on a HUMAN rather than hung? (gp-ha5)**
+
+Run this on every `stalled` session before you nudge and before you warrant. It
+is not an optional refinement of the ladder — it decides whether the ladder
+applies at all.
+
+```bash
+gc gastown prompt-block-check "$STALLED_SESSION"
+echo "prompt-block-check exit: $?"
+```
+
+| verdict | meaning | action |
+|---------|---------|--------|
+| `prompt-blocked` | the pane renders live interactive-prompt chrome | **Do NOT nudge. Do NOT warrant.** File the human-gate bead below and leave the session running |
+| `clear` | no prompt chrome in the pane tail | the ladder below applies |
+| `unreadable` | the pane could not be captured | treat exactly as `prompt-blocked` — you did not rule out a menu, so you have not earned a nudge |
+
+Exit 2 means the check itself could not run. That is "not measured", not
+`clear` — treat it as `unreadable` and take the no-nudge path. A missing
+verdict must never be the thing that authorises a keystroke.
+
+**Why nudging this shape is dangerous, specifically.** A session parked on a
+selection menu is not idle-prompt residue with a stray `❯` left on screen. The
+menu is LIVE: it has a cursor sitting on an option, and it is reading the
+keyboard. `gc session nudge` types into that keyboard. The injected text lands on
+whichever option the cursor is on and can submit it. On the menu observed on
+2026-08-03, option 1 ran `gc bd close ta-2e1p --force`. Nudging a prompt-blocked
+agent can therefore execute a destructive action nobody authorised, chosen by
+where the cursor happened to rest. This is the one place in this step where the
+"nudge first, it is cheap" instinct is not merely unhelpful but actively unsafe.
+
+**Why warranting it is also wrong.** The agent is alive and behaving correctly —
+it reached a decision it genuinely should not make alone and stopped. A shutdown
+dance discards the pending question and the reasoning that produced it, and the
+respawned session has to rediscover the same decision from scratch, reach the
+same prompt, and block again. The ladder's two rungs are built for an agent that
+has stopped working; this one stopped ON PURPOSE.
+
+**Why you cannot fall back on the two-peek rule here.** Peeking a
+prompt-blocked pane twice returns byte-identical output, because a menu is a
+still image. That is the same signature the corroboration rule above treats as
+evidence of a hang, so following it mechanically walks a healthy, correctly-
+reasoning agent straight toward a warrant. The chrome is what separates the two
+cases, and `prompt-block-check` is what reads it.
+
+**The third rung: make the invisible gate visible, then leave.** The pending
+question is real and a human has to answer it. It is invisible today because
+`notify-on-human-gate-creation` and `renudge-stale-human-gates` watch BEADS, and
+this gate exists only as pixels in a tmux pane. Converting it into a bead is the
+whole remedy — it puts the decision where the humans already look, and it
+survives the session being restarted for any unrelated reason.
+
+Deduped against re-filing on every patrol cycle, the same way warrants are:
+
+```bash
+TARGET_SESSION="<session>"
+GATE_REASON="prompt-blocked: <the evidence column from the check>"
+EXISTING_GATE=$(gc bd list --label=human-gate --json --limit=0 | jq -r --arg t "$TARGET_SESSION" '[.[] | select((.status == "open" or .status == "in_progress") and (.metadata.target == $t))] | length')
+if [ "${EXISTING_GATE:-0}" -gt 0 ]; then
+  echo "Skipping human-gate bead for $TARGET_SESSION — one is already open."
+else
+  GATE_META=$(jq -nc --arg t "$TARGET_SESSION" --arg r "$GATE_REASON" '{target:$t,reason:$r,requester:"deacon","gc.routed_to":"human"}')
+  gc bd create --type=task --label=human-gate -p 1 --title="Human decision pending: $TARGET_SESSION parked on an interactive prompt" --metadata "$GATE_META" --notes "Session $TARGET_SESSION has been parked on an interactive prompt for <age>, so its duties are not running. Pane evidence: <evidence column>. Decision it is waiting on: <what the menu asks, if the pane shows it>.
+
+NOT nudged and NOT warranted, deliberately: a nudge types into the live menu and
+can submit whichever option the cursor is on; a warrant discards a pending
+question the agent was right to raise. Answer it in the pane, or resolve the
+underlying decision here and let the operator dismiss the prompt."
+fi
+```
+
+`gc.routed_to=human` keeps it out of every pool — a pool cannot answer a
+question — and P1 reflects that a coordination agent's duties are dark while it
+waits, which is how tallyup went 103 minutes with an unwatched polecat.
+
+Build the metadata with `jq`, and put the REAL session in `target` rather than
+leaving the `<session>` placeholder in the JSON. The dedup query above matches on
+`metadata.target`, so a literal placeholder makes it match nothing and this step
+files a fresh bead every patrol cycle — the duplicate-filing the dedup exists to
+prevent, arriving by a quieter route than a duplicate warrant. `jq -n --arg` also
+avoids hand-escaping quotes, which cannot work inside a step description anyway:
+this file holds them in TOML multi-line basic strings, and an escaped quote is
+consumed by the TOML parser before the shell ever sees it.
+
+Then **leave the session alone.** Do not nudge it, do not warrant it, and do not
+"just check" by sending it anything. It is doing the right thing and the only
+missing piece is a human. Report it in the patrol summary as blocked-on-human
+rather than stalled, so the next cycle does not re-derive it as a stall.
+
+Only when `prompt-block-check` returns `clear` does the rest of this ladder
+apply. Once the pane corroborates that the session is genuinely not progressing,
+it takes the same escalation route as everything else in this step — nudge
+first, so a witness that is merely wedged mid-turn gets to recover on its own:
 
 ```bash
 gc session nudge "$STALLED_SESSION" "Heartbeat silent for <age>. Run gc hook and resume your patrol."
@@ -443,6 +533,24 @@ Weigh each starved row:
 `$STUCK_SESSION` is the `session` column of the starved row and `$QUEUED` its
 `queued` column — take them from the row, not from a count you recomputed by
 hand.
+
+**The prompt-block gate applies here too (gp-ha5).** This is the second nudge
+site in this formula and it carries the identical hazard: a session parked on a
+live selection menu has a stalled queue for exactly the reason it has a stalled
+heartbeat, so it lands in this step as `starved` just as readily as it lands in
+`health-scan` as `stalled`. Nudging it types into the menu. Screen it the same
+way, with the same reading of the verdicts — `prompt-blocked` and `unreadable`
+both mean do NOT nudge and do NOT warrant:
+
+```bash
+gc gastown prompt-block-check "$STUCK_SESSION"
+echo "prompt-block-check exit: $?"
+```
+
+On `prompt-blocked`, file the human-gate bead from `health-scan` — the remedy is
+the same one, and the dedup query keys on `metadata.target`, so a session already
+reported by that step will not be filed twice here. Then leave it alone. Only a
+`clear` verdict earns the nudge below.
 
 ```bash
 gc session nudge "$STUCK_SESSION" "Queue has $QUEUED beads (open+in_progress), no bead activity for <duration>. Run gc hook."
