@@ -25,6 +25,11 @@
 #   6. A close is never broken: a failed stamp still yields its reason suffix.
 #   7. The headline regression — a deployed and an undeployed close no longer
 #      produce the same close reason.
+#   8. Recorded commit ids are the resolved 40-char object name, never the
+#      abbreviation handed in. A 7-char short SHA of the shape ^[0-9]+e[0-9]+$
+#      is valid scientific notation, so a metadata writer stores it as a float
+#      and the id is destroyed — 1 in 53 short SHAs (gp-prt). An id that will
+#      not resolve is not recorded as a commit at all.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -146,6 +151,17 @@ assert_status() {
         fail "$3: expected exit $1, got $STATUS (out: $OUT | err: $ERR)"
     [ "$(evidence deploy_status)" = "$2" ] ||
         fail "$3: expected deploy_status=$2, got '$(evidence deploy_status)'"
+}
+
+# The shape that destroys a SHA: simultaneously valid hex and valid scientific
+# notation, so a type-inferring metadata writer stores it as a float.
+coerces_to_a_number() {
+    [[ "$1" =~ ^[0-9]+[eE][0-9]+$ ]]
+}
+
+# Read the value stamped for a metadata key out of the gc stub's call log.
+stamped() {
+    sed -n "s/.*--set-metadata $1=\([^ ]*\).*/\1/p" "$GC_LOG" | head -1
 }
 
 test_both_conjuncts_present_is_deployed() {
@@ -379,6 +395,124 @@ test_repo_defaults_to_rig_root_over_cwd() {
         fail "GC_RIG_ROOT should resolve the repo when --repo is absent, got exit $status: $out"
 }
 
+test_abbreviated_sha_is_recorded_in_full() {
+    # gp-prt: `gc gastown deploy-check 6001e55 --stamp <bead>` stamped the
+    # abbreviation verbatim, `6001e55` is valid scientific notation, and the
+    # record became 6.001e+58 — the commit id unrecoverable from the bead.
+    # Abbreviations are a SUPPORTED input (--help demonstrates them), so the fix
+    # is at the boundary that records the value: resolve, then stamp.
+    new_sandbox
+    install_pack_at "$AHEAD_SHA"
+    declare_pin "$AHEAD_SHA"
+
+    local short
+    short=$(git -C "$REPO" rev-parse --short "$FIX_SHA")
+    # Non-vacuity: this has to actually be an abbreviation for the test to mean
+    # anything — otherwise it passes against the unfixed script.
+    [ -n "$short" ] && [ "${#short}" -lt 40 ] ||
+        fail "fixture is wrong: --short returned '$short', not an abbreviation"
+
+    run_check "$short" --stamp bd-1
+    assert_status 0 deployed "an abbreviated sha must still reach a verdict"
+
+    local recorded
+    recorded=$(stamped deploy_commit)
+    [ "$recorded" = "$FIX_SHA" ] ||
+        fail "an abbreviated sha must be stamped in full: got '$recorded', want '$FIX_SHA'"
+    [ "${#recorded}" = 40 ] ||
+        fail "the stamped commit must be a 40-char object name, got ${#recorded} chars"
+    ! coerces_to_a_number "$recorded" ||
+        fail "the stamped commit still parses as a number: '$recorded'"
+
+    # The evidence stream is normalized identically. A caller grepping stdout
+    # must not see a different id than the one the bead records.
+    run_check "$short"
+    [ "$(evidence deploy_commit)" = "$FIX_SHA" ] ||
+        fail "evidence output must carry the full sha, got '$(evidence deploy_commit)'"
+}
+
+test_unresolvable_ids_are_never_recorded_as_commits() {
+    # The other half of gp-prt. An id that does not resolve is not a commit;
+    # stamping it would assert something unverified AND reintroduce the
+    # coercion. It goes in deploy_reason instead — prose has no numeric reading
+    # — so nothing about the request is lost.
+    new_sandbox
+    install_pack_at "$AHEAD_SHA"
+    declare_pin "$AHEAD_SHA"
+
+    # The literal value from the incident. Non-vacuity: confirm it really does
+    # have the destroying shape, so this exercises the live case and not a
+    # harmless lookalike.
+    coerces_to_a_number 6001e55 ||
+        fail "fixture is wrong: 6001e55 must have the shape that coerces"
+
+    run_check 6001e55 --stamp bd-1
+    assert_status 2 undetermined "unresolvable sha"
+    [ -z "$(stamped deploy_commit)" ] ||
+        fail "an unresolved id must not be stamped as a commit, log: $(cat "$GC_LOG")"
+    [ -z "$(evidence deploy_commit)" ] ||
+        fail "an unresolved id must not appear as deploy_commit evidence"
+    case "$(evidence deploy_reason)" in
+        *6001e55*) : ;;
+        *) fail "the requested id must survive in the reason, got: $(evidence deploy_reason)" ;;
+    esac
+
+    # Same rule when there is no repo to resolve against at all. run_check
+    # appends its own --repo, so this path is invoked directly.
+    mkdir -p "$SANDBOX/not-a-repo"
+    local out
+    out=$(PATH="$BIN:$PATH" GC_PACK_DIR="$GC_PACK_DIR" \
+        bash "$CHECK" 6001e55 --repo "$SANDBOX/not-a-repo" 2>&1)
+    case "$out" in
+        *deploy_commit=*) fail "with no repo there is nothing to resolve, got: $out" ;;
+    esac
+    case "$out" in
+        *6001e55*) : ;;
+        *) fail "the requested id must survive in the reason, got: $out" ;;
+    esac
+}
+
+test_abbreviated_pin_resolves_and_is_recorded_in_full() {
+    # deploy_pin is stamped by the same emit(), from a value read out of the
+    # city's imports rather than generated here, so it carries the identical
+    # exposure. Resolving it also removes a latent WRONG VERDICT: artifact
+    # resolution compares the pin against a 40-char `rev-parse HEAD`, so an
+    # abbreviated pin could never match and a genuinely deployed fix was
+    # reported as install skew.
+    new_sandbox
+    install_pack_at "$AHEAD_SHA"
+
+    local short_pin
+    short_pin=$(git -C "$REPO" rev-parse --short "$AHEAD_SHA")
+    [ "${#short_pin}" -lt 40 ] ||
+        fail "fixture is wrong: --short returned a full object name"
+    declare_pin "$short_pin"
+
+    run_check "$FIX_SHA" --stamp bd-1
+    assert_status 0 deployed "an abbreviated pin must still prove artifact resolution"
+
+    local recorded
+    recorded=$(stamped deploy_pin)
+    [ "$recorded" = "$AHEAD_SHA" ] ||
+        fail "an abbreviated pin must be recorded in full: got '$recorded', want '$AHEAD_SHA'"
+    ! coerces_to_a_number "$recorded" ||
+        fail "the stamped pin still parses as a number: '$recorded'"
+
+    # And a pin that does not resolve is not recorded as one either — the reason
+    # names it in full, because that is the only record the operator gets.
+    new_sandbox
+    install_pack_at "$AHEAD_SHA"
+    declare_pin 0000000000000000000000000000000000000000
+    run_check "$FIX_SHA" --stamp bd-1
+    assert_status 2 undetermined "unresolvable pin"
+    [ -z "$(stamped deploy_pin)" ] ||
+        fail "an unresolved pin must not be stamped, log: $(cat "$GC_LOG")"
+    case "$(evidence deploy_reason)" in
+        *0000000000000000000000000000000000000000*) : ;;
+        *) fail "an unresolved pin must be named in full, got: $(evidence deploy_reason)" ;;
+    esac
+}
+
 test_both_conjuncts_present_is_deployed
 test_fix_ahead_of_pin_is_authored_not_deployed
 test_pin_contains_fix_but_artifact_is_stale
@@ -388,5 +522,8 @@ test_source_url_shapes_all_match_the_same_repo
 test_stamp_writes_the_verdict_and_never_breaks_a_close
 test_deployed_and_undeployed_closes_are_distinguishable
 test_repo_defaults_to_rig_root_over_cwd
+test_abbreviated_sha_is_recorded_in_full
+test_unresolvable_ids_are_never_recorded_as_commits
+test_abbreviated_pin_resolves_and_is_recorded_in_full
 
 echo "PASS: $(basename "${BASH_SOURCE[0]}")"

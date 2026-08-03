@@ -28,11 +28,23 @@ Because the check runs from inside the installed artifact (`GC_PACK_DIR`), a
 `deployed` verdict means the code that just answered you is the code that
 contains the fix — the assertion is self-witnessing rather than inferred.
 
+`<commit-sha>` may be abbreviated — the examples below are. Every commit id this
+command RECORDS is first resolved to its full 40-char form, because a 7-char
+short SHA matching `^[0-9]+e[0-9]+$` is valid scientific notation and metadata
+writers store it as a float: `6001e55` becomes `6.001e+58` and the id is gone.
+1 in 53 short SHAs has that shape. An id that cannot be resolved to a commit is
+reported in `deploy_reason` — which is prose, and so cannot coerce — and its
+SHA field is omitted rather than written unverified (gp-prt).
+
 Modes:
   <sha>
       Print `key=value` evidence on stdout: deploy_status, deploy_reason,
       deploy_pin, deploy_installed_sha, deploy_pack_dir, deploy_city,
       deploy_commit, deploy_checked_at.
+
+      deploy_commit and deploy_pin appear only when that id resolved to a
+      commit in the repo under test; deploy_status, deploy_reason and
+      deploy_checked_at are always present.
 
   <sha> --stamp <bead-id>
       Write the verdict to that bead's metadata and print ONLY a close-reason

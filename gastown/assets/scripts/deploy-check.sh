@@ -49,6 +49,32 @@
 # field. That verdict is decided on evidence — no import in this city resolves
 # to this repo — never on a missing tool.
 #
+# SHA NORMALIZATION (gp-prt). Every commit id this script RECORDS is the resolved
+# 40-char object name, never the abbreviation it was handed. `--set-metadata`
+# infers a type from the value, and a 7-char short SHA matching ^[0-9]+e[0-9]+$
+# is valid scientific notation, so it is stored as a float and the id is gone:
+#
+#   gc gastown deploy-check 6001e55 --stamp ml-gjrk.4
+#   metadata.deploy_commit -> 6.001e+58        (unrecoverable from the record)
+#
+# 5,000,000 of the 268,435,456 possible 7-char hex strings match — 1 in 53. This
+# script is handed abbreviations BY DESIGN: `--help` demonstrates it, and agents
+# read short SHAs straight out of git output. So the boundary that RECORDS the
+# value is the one that has to normalize it; the callers cannot be relied on, and
+# the pack's own formulas passing full SHAs today is not a property of the input.
+#
+# Widening to 40 chars does not make coercion impossible, it makes it ~1 in 39
+# million: a 40-char hex string matches that shape only when 39 of its characters
+# are digits and the single `e` is interior. Do not read this as a fix for the
+# underlying type inference — that is gc-core's (gastownhall/gascity) and is
+# tracked separately. It is the strongest guarantee available from this side.
+#
+# The corollary is that a SHA field is stamped ONLY once resolved. An id this
+# script could not resolve is not a commit, and recording it as one would assert
+# something unverified while reintroducing the very coercion. The raw input is
+# not lost: it survives verbatim in deploy_reason, which is prose and so has no
+# numeric reading to be coerced into.
+#
 # Usage:
 #   deploy-check.sh <commit-sha> [--repo <dir>] [--stamp <bead-id>]
 #
@@ -81,6 +107,11 @@
 
 set -uo pipefail
 
+# REQUESTED_SHA is exactly what the caller typed, kept for diagnostics. SHA is
+# the resolved 40-char object name and stays EMPTY until git proves it is one —
+# every consumer below reads SHA, so nothing can accidentally record the
+# unverified spelling.
+REQUESTED_SHA=""
 SHA=""
 REPO=""
 STAMP_BEAD=""
@@ -104,17 +135,17 @@ while [ "$#" -gt 0 ]; do
             exit 2
             ;;
         *)
-            [ -n "$SHA" ] && {
+            [ -n "$REQUESTED_SHA" ] && {
                 echo "deploy-check: unexpected extra argument '$1'" >&2
                 exit 2
             }
-            SHA="$1"
+            REQUESTED_SHA="$1"
             shift
             ;;
     esac
 done
 
-if [ -z "$SHA" ]; then
+if [ -z "$REQUESTED_SHA" ]; then
     echo "deploy-check: a commit sha is required" >&2
     exit 2
 fi
@@ -155,7 +186,12 @@ emit() {
         [ -n "$INSTALLED" ] && printf 'deploy_installed_sha=%s\n' "$INSTALLED"
         [ -n "${GC_PACK_DIR:-}" ] && printf 'deploy_pack_dir=%s\n' "$GC_PACK_DIR"
         [ -n "${GC_CITY:-}" ] && printf 'deploy_city=%s\n' "$GC_CITY"
-        printf 'deploy_commit=%s\n' "$SHA"
+        # Conditional for the same reason deploy_pin is: SHA is empty until git
+        # resolved it, and an unresolved id is not a commit to report.
+        [ -n "$SHA" ] && printf 'deploy_commit=%s\n' "$SHA"
+        # Every line above is now conditional, so the substitution would other-
+        # wise take its exit status from whichever test happened to be last.
+        true
     )
 
     if [ -n "$STAMP_BEAD" ]; then
@@ -165,12 +201,16 @@ emit() {
         # Stamp, but never let a stamp failure break the caller's close. A bead
         # closed without the deployment field is the status quo; a close that
         # aborted because a metadata write failed would strand merged work.
+        # deploy_status/reason/checked_at are prose or a timestamp and always
+        # safe to write. The SHA-valued fields are added only when resolved —
+        # see SHA NORMALIZATION above; an abbreviation written here is what
+        # coerces to a float and destroys the record.
         local args=(
             --set-metadata "deploy_status=$STATUS"
             --set-metadata "deploy_reason=$REASON"
             --set-metadata "deploy_checked_at=$CHECKED_AT"
-            --set-metadata "deploy_commit=$SHA"
         )
+        [ -n "$SHA" ] && args+=(--set-metadata "deploy_commit=$SHA")
         [ -n "$PIN" ] && args+=(--set-metadata "deploy_pin=$PIN")
         [ -n "$INSTALLED" ] && args+=(--set-metadata "deploy_installed_sha=$INSTALLED")
         if ! gc bd update "$STAMP_BEAD" "${args[@]}" >/dev/null 2>&1; then
@@ -239,13 +279,21 @@ normalize_repo() {
 # ---------------------------------------------------------------------------
 if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
     STATUS=undetermined
-    REASON="$REPO is not a git repository"
+    # Name the requested commit in the reason: with no repo there is nothing to
+    # resolve it against, so deploy_commit is not stamped and this prose line is
+    # the only surviving record of what the caller asked about.
+    REASON="commit $REQUESTED_SHA not resolvable: $REPO is not a git repository"
     emit
 fi
 
-if ! git -C "$REPO" cat-file -e "${SHA}^{commit}" 2>/dev/null; then
+# Validate and normalize in one step. `--verify --quiet` prints the full 40-char
+# object name and exits non-zero (silently) on anything that is not a commit, so
+# this both replaces the old cat-file existence check and produces the only
+# spelling of the id that is safe to record.
+SHA=$(git -C "$REPO" rev-parse --verify --quiet "${REQUESTED_SHA}^{commit}" 2>/dev/null)
+if [ -z "$SHA" ]; then
     STATUS=undetermined
-    REASON="commit $SHA is not present in $REPO"
+    REASON="commit $REQUESTED_SHA is not present in $REPO"
     emit
 fi
 
@@ -370,11 +418,19 @@ while IFS=$'\t' read -r m_name m_commit; do
 
     # The pin must exist in THIS repo for containment to mean anything. A pin
     # from an unfetched fork or a pruned branch is unmeasurable, not contained.
-    if ! git -C "$REPO" cat-file -e "${m_commit}^{commit}" 2>/dev/null; then
+    # Resolving rather than merely testing existence also normalizes a pin that
+    # packs.lock recorded abbreviated, before it can reach deploy_pin — that
+    # field is stamped by the same emit() and coerces the same way.
+    m_resolved=$(git -C "$REPO" rev-parse --verify --quiet "${m_commit}^{commit}" 2>/dev/null)
+    if [ -z "$m_resolved" ]; then
+        # Spell the pin out in full rather than truncating to 8: this is the one
+        # miss that records no deploy_pin, so the reason is all the operator
+        # gets, and the raw value is what they need in order to go find it.
         note_miss unresolvable \
-            "pin ${m_commit:0:8} ($m_name) is not present in this repo" "$m_commit"
+            "pin $m_commit ($m_name) is not present in this repo" ""
         continue
     fi
+    m_commit="$m_resolved"
 
     if ! git -C "$REPO" merge-base --is-ancestor "$SHA" "$m_commit" 2>/dev/null; then
         behind=$(git -C "$REPO" rev-list --count "${m_commit}..${SHA}" 2>/dev/null)
