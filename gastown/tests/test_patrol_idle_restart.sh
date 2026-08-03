@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Guards mol-witness-patrol's closing contract: the witness must VERIFY the
-# idle-restart mechanism, never assert it.
+# Guards the closing contract shared by EVERY patrol formula: a patrol must
+# VERIFY the idle-restart mechanism, never assert it.
 #
 # `session_sleep` is a real gc mechanism, but it is OFF unless a city or rig
 # configures one: with nothing set, ResolveSessionSleepPolicy returns `off` with
-# source `legacy_off`. The formula used to end its turn on the flat claim that
+# source `legacy_off`. The formulas used to end their turn on the flat claim that
 # "the session_sleep policy will restart this session after the configured idle
 # interval", which is simply false on such a city -- and false in the most
 # expensive way available, because every health signal keeps reading fine. The
@@ -14,19 +14,29 @@
 #
 #   1. Patrol cadence collapsed onto the 90m heartbeat nag (~92-105m observed),
 #      which is a backstop, not a schedule.
-#   2. The witness NEVER shed context. A session nagged awake resumes with all
+#   2. The agent NEVER shed context. A session nagged awake resumes with all
 #      prior context, so it grows every cycle -- ~68% after three -- and rides
 #      into compaction instead of starting clean. This is the harmful one: a
 #      compacted witness loses exactly the state its recovery job depends on.
 #
-# What is nailed down here:
+# gp-5bg fixed mol-witness-patrol only; its title was scoped to that formula, so
+# the fix was correct but partial. gp-7ts ported the same treatment to the deacon
+# and the refinery, which had carried the identical false promise the whole time
+# (the deacon measured at ~105m between turns against a 300s patrol cap). This
+# file is the generalized guard: it runs one battery over every patrol that owns
+# an idle exit, so the next patrol formula added to PATROLS below inherits the
+# whole contract instead of quietly re-shipping the bug.
+#
+# What is nailed down, for each patrol:
 #
 #   1. The step READS the resolved policy off its own session bead instead of
 #      assuming one, and the old bare assertion is gone.
 #   2. It calls `gc runtime request-restart` itself when no policy is configured.
 #   3. The decision logic is exercised as EXTRACTED FROM THE FORMULA -- never a
 #      copy -- so an edit that inverts or loosens it fails CI rather than
-#      silently restoring the stall.
+#      silently restoring the stall. Each patrol's copy is extracted and run
+#      separately: three formulas drift apart, and a table-driven test that
+#      checked only one of them would be exactly as partial as gp-5bg was.
 #   4. That logic is fail-SAFE: only a duration-shaped value takes the quiet
 #      IDLE path. `off`, empty, unreadable and unparseable all restart. The
 #      inverted spelling ("restart only when the value is off or empty") passes
@@ -36,7 +46,7 @@
 #      branch -- test_parked_session_check.sh uses that exact pane shape to
 #      represent a healthy idle witness.
 #
-# One discipline runs through all of it: assertions about what the step DOES are
+# One discipline runs through all of it: assertions about what a step DOES are
 # made against its FENCED CODE BLOCKS, never against the description. A formula
 # step is prose interleaved with shell, and the prose necessarily names the same
 # commands and variables the code uses. A description-wide grep is therefore
@@ -46,33 +56,49 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-FORMULA="$ROOT/gastown/formulas/mol-witness-patrol.toml"
+
+# label | formula basename | step id owning the idle exit
+#
+# The step differs by role and that is not incidental. The witness and the deacon
+# idle out of `next-iteration`, after pouring a successor and burning the current
+# wisp. The refinery idles out of `find-work`, which deliberately does NOT burn
+# -- the still-open wisp is its wake signal -- and whose `next-iteration` never
+# idles at all, because it burns and re-reads within the same session. Pin the
+# step per patrol rather than guessing a common name.
+PATROLS=(
+    "witness|mol-witness-patrol|next-iteration"
+    "deacon|mol-deacon-patrol|next-iteration"
+    "refinery|mol-refinery-patrol|find-work"
+)
 
 fail() {
     echo "FAIL: $*" >&2
     exit 1
 }
 
-command -v python3 >/dev/null 2>&1 || fail "python3 is required to parse the formula"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required to parse the formulas"
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# Render the next-iteration step description through a real TOML parse, so the
-# assertions below see what an agent sees -- not the raw file bytes. The
-# distinction is load-bearing: these are """ basic strings, where a trailing
-# backslash silently eats its newline and the following indentation, so a
-# snippet can read fine in the file and arrive at the agent joined together.
-python3 - "$FORMULA" "$WORK" <<'PY'
+# Render the step description through a real TOML parse, so the assertions below
+# see what an agent sees -- not the raw file bytes. The distinction is
+# load-bearing: these are """ basic strings, where a trailing backslash silently
+# eats its newline and the following indentation, so a snippet can read fine in
+# the file and arrive at the agent joined together.
+extract() {
+    local formula="$1" step_id="$2" out="$3"
+    python3 - "$formula" "$step_id" "$out" <<'PY'
 import sys, tomllib, pathlib
 
-formula, work = sys.argv[1], pathlib.Path(sys.argv[2])
+formula, step_id, work = sys.argv[1], sys.argv[2], pathlib.Path(sys.argv[3])
+work.mkdir(parents=True, exist_ok=True)
 with open(formula, "rb") as fh:
     doc = tomllib.load(fh)
 
-steps = [s for s in doc.get("steps", []) if s.get("id") == "next-iteration"]
+steps = [s for s in doc.get("steps", []) if s.get("id") == step_id]
 if len(steps) != 1:
-    sys.exit(f"expected exactly one next-iteration step, found {len(steps)}")
+    sys.exit(f"{formula}: expected exactly one {step_id} step, found {len(steps)}")
 desc = steps[0]["description"]
 (work / "step.txt").write_text(desc)
 
@@ -105,25 +131,25 @@ decision = [b for b in blocks
             if any("SLEEP_POLICY" in ln for ln in b)
             and any("NEEDS_RESTART" in ln for ln in b)]
 if len(decision) != 1:
-    sys.exit(f"expected exactly one SLEEP_POLICY/NEEDS_RESTART decision block, found {len(decision)}")
+    sys.exit(f"{formula}: expected exactly one SLEEP_POLICY/NEEDS_RESTART decision block, found {len(decision)}")
 
-# Keep only the classifier. The two SLEEP_POLICY assignments source the value
-# from the live session bead -- that is the step's job, not the classifier's,
-# and leaving them in would both clobber the value each case injects and make
-# the result depend on whatever policy the machine running CI happens to have.
+# Keep only the classifier. The SLEEP_POLICY assignments source the value from
+# the live session bead -- that is the step's job, not the classifier's, and
+# leaving them in would both clobber the value each case injects and make the
+# result depend on whatever policy the machine running CI happens to have.
 # Drop the echo too: diagnostics, and it would pollute harness stdout.
 keep = [ln for ln in decision[0]
         if not ln.strip().startswith("SLEEP_POLICY=")
         and "gc bd show" not in ln
         and not ln.strip().startswith("echo ")]
 if not any("NEEDS_RESTART" in ln for ln in keep):
-    sys.exit("decision block has no NEEDS_RESTART logic left after dropping the policy read")
+    sys.exit(f"{formula}: decision block has no NEEDS_RESTART logic left after dropping the policy read")
 
 # Fail loudly if the classifier ever grows a side effect. Sourcing this file is
 # only safe while it is pure computation over SLEEP_POLICY.
 for ln in keep:
     if ln.strip().startswith(("gc ", "git ")) or " gc runtime " in ln:
-        sys.exit(f"classifier would execute a live command, refusing to source it: {ln.strip()!r}")
+        sys.exit(f"{formula}: classifier would execute a live command, refusing to source it: {ln.strip()!r}")
 
 (work / "decide.sh").write_text("\n".join(keep) + "\n")
 
@@ -134,10 +160,7 @@ for ln in keep:
 # and deleting the real one still passes.
 (work / "code.txt").write_text("\n".join("\n".join(b) for b in blocks) + "\n")
 PY
-
-STEP="$WORK/step.txt"
-DECIDE="$WORK/decide.sh"
-CODE="$WORK/code.txt"
+}
 
 test_step_reads_the_policy_instead_of_asserting_it() {
     # Target the READ -- the jq path against the session bead -- not the bare
@@ -145,14 +168,24 @@ test_step_reads_the_policy_instead_of_asserting_it() {
     # echo, so a token grep survives swapping the jq path to a different key
     # and would report a step that reads the wrong field as healthy.
     grep -q 'metadata\.effective_sleep_after_idle' "$CODE" \
-        || fail "no fenced block reads metadata.effective_sleep_after_idle; the step is assuming a policy again, or reading the wrong key"
+        || fail "[$LABEL] no fenced block reads metadata.effective_sleep_after_idle; the step is assuming a policy again, or reading the wrong key"
     grep -q 'gc bd show "\$GC_SESSION_ID"' "$CODE" \
-        || fail "the policy is not read off this session's own bead; a policy resolved for some other session says nothing about this one"
+        || fail "[$LABEL] the policy is not read off this session's own bead; a policy resolved for some other session says nothing about this one"
 
     # The exact sentence the bug shipped as. Its return means the step went back
     # to promising a restart it cannot verify.
     if grep -q "The session_sleep policy will restart this session after the configured idle interval" "$STEP"; then
-        fail "next-iteration still carries the bare session_sleep assertion (gp-5bg)"
+        fail "[$LABEL] step still carries the bare session_sleep assertion (gp-5bg/gp-7ts)"
+    fi
+
+    # The deacon shipped a SECOND, differently-worded copy of the same promise,
+    # in prose forwarding to its own idle exit ("falls through to the idle exit,
+    # where the session_sleep policy restarts the patrol on its normal
+    # interval"). Same defect, and the exact-sentence grep above does not see it,
+    # so match the CLAIM SHAPE rather than one spelling of it. Anything asserting
+    # that the policy restarts something is a promise; only the read is allowed.
+    if grep -Eq 'session_sleep policy (will )?restarts?' "$STEP"; then
+        fail "[$LABEL] step asserts that the session_sleep policy restarts it; the policy must be READ, not promised (gp-7ts)"
     fi
 }
 
@@ -163,21 +196,33 @@ test_step_restarts_itself_when_unconfigured() {
     #   grep "gc runtime request-restart" "$STEP" -- the step's own prose names
     #     the command while explaining it ("an explicit `gc runtime
     #     request-restart` without one"), so deleting the real call still passes.
-    #   grep "gc runtime request-restart" "$CODE" -- narrower, but this step
-    #     ALREADY carried a bare `gc runtime request-restart` on origin/main, in
-    #     the context-exhaustion snippet near the top. That pre-existing line
-    #     satisfies the grep on its own, so it guards nothing this change added.
+    #   grep "gc runtime request-restart" "$CODE" -- narrower, but the witness
+    #     step ALREADY carried a bare `gc runtime request-restart` on
+    #     origin/main, in the context-exhaustion snippet near the top. That
+    #     pre-existing line satisfies the grep on its own, so it guards nothing
+    #     this change added.
     #
     # The gated form is what is actually new, and it is also the only correct
     # shape: an ungated restart fires under a configured policy too, trading the
     # silent stall for a session that can never stay up.
     grep -q 'NEEDS_RESTART.*request-restart' "$CODE" \
-        || fail "no fenced block calls 'gc runtime request-restart' gated on NEEDS_RESTART; either nothing sheds witness context, or the restart is unconditional"
+        || fail "[$LABEL] no fenced block calls 'gc runtime request-restart' gated on NEEDS_RESTART; either nothing sheds context, or the restart is unconditional"
+}
+
+test_restart_is_not_drain_ack() {
+    # `drain-ack` and `request-restart` both end the session, and only one asks
+    # for a successor -- so substituting it here is a silent downgrade from
+    # "come back" to "stay down". For the deacon that is the town's heartbeat;
+    # for the refinery it is the merge queue. Neither has a pool check that
+    # would bring it back the way one restarts a polecat.
+    if grep -q 'NEEDS_RESTART.*drain-ack' "$CODE"; then
+        fail "[$LABEL] the idle-restart branch calls 'gc runtime drain-ack'; that ends the session WITHOUT asking for a successor"
+    fi
 }
 
 test_idle_literal_survives_for_the_configured_branch() {
     grep -qF "IDLE: no work, exiting turn." "$STEP" \
-        || fail "the 'IDLE: no work, exiting turn.' literal is gone; the configured branch and the parked-session fixture both depend on it"
+        || fail "[$LABEL] the 'IDLE: no work, exiting turn.' literal is gone; the configured branch and the parked-session fixture both depend on it"
 }
 
 # Run the EXTRACTED decision logic over a table of policy values.
@@ -214,12 +259,12 @@ test_decision_is_failsafe() {
     for v in "${restart_cases[@]}"; do
         got=$(decide "$v")
         [ "$got" = "1" ] \
-            || fail "policy '${v:-<empty>}' selected the quiet IDLE path (needs_restart=$got); it must fail toward the restart"
+            || fail "[$LABEL] policy '${v:-<empty>}' selected the quiet IDLE path (needs_restart=$got); it must fail toward the restart"
     done
     for v in "${idle_cases[@]}"; do
         got=$(decide "$v")
         [ "$got" = "0" ] \
-            || fail "configured policy '$v' selected a forced restart (needs_restart=$got); a real policy must be left to do its job"
+            || fail "[$LABEL] configured policy '$v' selected a forced restart (needs_restart=$got); a real policy must be left to do its job"
     done
 }
 
@@ -230,7 +275,7 @@ test_decision_is_not_the_inverted_spelling() {
     # spelling directly makes the failure legible instead of arriving as a
     # confusing single-case mismatch.
     if grep -q 'SLEEP_POLICY" = "off"' "$DECIDE"; then
-        fail "decision logic tests for equality with 'off'; it must positively match a duration shape so unparseable values restart"
+        fail "[$LABEL] decision logic tests for equality with 'off'; it must positively match a duration shape so unparseable values restart"
     fi
 }
 
@@ -238,14 +283,39 @@ test_read_is_guarded_on_session_id() {
     # An unset GC_SESSION_ID under `set -u` would abort the step mid-cycle,
     # after the successor wisp was poured and this one burned.
     grep -q 'GC_SESSION_ID:-' "$STEP" \
-        || fail "the session-bead read does not guard on \${GC_SESSION_ID:-}; an unset id would abort the step"
+        || fail "[$LABEL] the session-bead read does not guard on \${GC_SESSION_ID:-}; an unset id would abort the step"
 }
 
-test_step_reads_the_policy_instead_of_asserting_it
-test_step_restarts_itself_when_unconfigured
-test_idle_literal_survives_for_the_configured_branch
-test_decision_is_failsafe
-test_decision_is_not_the_inverted_spelling
-test_read_is_guarded_on_session_id
+# Every patrol that owns an idle exit gets the identical battery. A formula
+# listed here without one fails at extraction, which is the correct outcome:
+# the table is the claim that this patrol has an idle exit to guard.
+for entry in "${PATROLS[@]}"; do
+    IFS='|' read -r LABEL FORMULA STEP_ID <<<"$entry"
+    FORMULA_PATH="$ROOT/gastown/formulas/$FORMULA.toml"
+    [ -f "$FORMULA_PATH" ] || fail "[$LABEL] formula not found: $FORMULA_PATH"
+
+    TARGET_DIR="$WORK/$LABEL"
+    # Route extraction failure through fail() so it reads like every other
+    # failure in the suite. Under `set -e` a bare call would abort with only
+    # python's stderr, which is legible but does not carry the FAIL: prefix CI
+    # greps for -- and the message matters here: "no SLEEP_POLICY/NEEDS_RESTART
+    # decision block" IS the regression, not a harness problem.
+    extract "$FORMULA_PATH" "$STEP_ID" "$TARGET_DIR" \
+        || fail "[$LABEL] could not extract an idle exit from $FORMULA:$STEP_ID (see the parse error above); either the step lost its policy check, or this table row names the wrong step"
+
+    STEP="$TARGET_DIR/step.txt"
+    DECIDE="$TARGET_DIR/decide.sh"
+    CODE="$TARGET_DIR/code.txt"
+
+    test_step_reads_the_policy_instead_of_asserting_it
+    test_step_restarts_itself_when_unconfigured
+    test_restart_is_not_drain_ack
+    test_idle_literal_survives_for_the_configured_branch
+    test_decision_is_failsafe
+    test_decision_is_not_the_inverted_spelling
+    test_read_is_guarded_on_session_id
+
+    echo "  ok: $LABEL ($FORMULA:$STEP_ID)"
+done
 
 echo "PASS: $(basename "${BASH_SOURCE[0]}")"

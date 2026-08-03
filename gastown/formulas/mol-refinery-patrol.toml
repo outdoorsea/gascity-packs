@@ -696,14 +696,85 @@ The bead MUST have `metadata.branch`. If `metadata.target` is missing,
 use {{target_branch}} as default. Note the work bead ID and close this step.
 
 If NO work found — meaning step 3 selected nothing AND the sweep adopted
-nothing:
-Write exactly:
+nothing — end the turn here, and verify the restart mechanism instead of
+assuming it.
+
+Do NOT sleep, call ScheduleWakeup, or use Monitor. How the turn ends depends on
+whether an idle-sleep policy is actually configured for this session, and you
+must READ that rather than assume it.
+
+`session_sleep` is a real gc mechanism, but it is OFF unless a city or rig
+configures it: with nothing set the resolver returns `off` with source
+`legacy_off`, and NOTHING restarts you. Every health signal still looks fine —
+the controller is healthy, the session stays `active`, `last_active` keeps
+updating, and the `IDLE:` line below is exactly what a healthy idle refinery
+prints — so no check anywhere reports the stall. The merge queue just stops
+draining until the heartbeat nag wakes it, and a polecat that pushed a branch
+and handed it off waits the whole time on a queue nothing is servicing.
+
+The measurements are from the other patrols, not this one: ~92-105m between
+witness cycles on two rigs (gp-5bg), and a ~105m deacon gap against a 300s cap
+(gp-7ts). That is the correct evidence to reason from anyway — the stall is a
+property of the resolver returning `off`, not of any one role, and all three
+patrols ended their turn on the identical false promise. Do not wait for a
+refinery-specific number before believing it; the whole point of this defect is
+that it produces no signal anyone would go looking for.
+
+The reconciler mirrors the resolved policy onto your own session bead, so the
+answer is readable. Take it from there, not from this file:
+
+```bash
+SLEEP_POLICY=""
+if [ -n "${GC_SESSION_ID:-}" ]; then SLEEP_POLICY=$(gc bd show "$GC_SESSION_ID" --json 2>/dev/null | jq -r '.[0].metadata.effective_sleep_after_idle // empty'); fi
+NEEDS_RESTART=1
+case "$SLEEP_POLICY" in [0-9]*[nusmh]) NEEDS_RESTART=0 ;; esac
+echo "effective_sleep_after_idle=${SLEEP_POLICY:-<unreadable>} needs_restart=$NEEDS_RESTART"
+```
+
+The test is POSITIVE — restart unless the value is duration-SHAPED (starts with
+a digit, ends in a duration unit). Do not invert it into "restart only when the
+value is `off` or empty". The two differ exactly on a malformed or unrecognized
+value, and that is the case that must select the restart: a policy string this
+step cannot parse is a policy it cannot rely on, and treating it as configured
+resurrects the silent stall in a form no measurement would attribute to it.
+
+**Policy configured** — `NEEDS_RESTART=0`. The promise holds. Write exactly:
 ```
 IDLE: no work, exiting turn.
 ```
-Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
-The session_sleep policy will restart this session after the configured idle interval.
-When restarted, re-read formula steps — this step stays open until a work bead is found.
+Then stop immediately. The configured interval restarts this session, and the
+restarted session re-reads formula steps and lands back here.
+
+**Policy `off`, empty, unreadable, or unparseable** — `NEEDS_RESTART=1`. Nothing
+will restart you, so restart yourself. This is the branch a city with no
+`[session_sleep]` config is on:
+```bash
+if [ "$NEEDS_RESTART" = "1" ]; then gc runtime request-restart || echo "IDLE: no work, exiting turn."; fi
+```
+`request-restart` blocks until the controller kills this session and starts a
+fresh one, which is the only way the refinery sheds context between patrols.
+Nothing is lost by restarting from here: this idle path deliberately does NOT
+burn the current wisp, so that still-open wisp remains assigned and is exactly
+the wake signal the new session resumes from. Pouring or burning on an empty
+queue is the `next-iteration` step's job, and this is not that step.
+
+`request-restart` is NOT `gc runtime drain-ack`. Both end the session; only one
+asks for a successor. `drain-ack` tells the controller this agent is DONE and
+should stay down, which on an empty queue would take the merge queue offline
+until something else revives it — a queue that is empty right now is not a queue
+that is finished.
+
+Fail toward the restart, never toward the wait. An unreadable policy costs one
+unnecessary restart — cheap, visible, and self-correcting. Assuming a policy
+that is not there costs a silent stall in the merge queue, which nothing
+reports, while completed polecat branches accumulate unmerged behind it. If
+`request-restart` exits non-zero the controller did not act within its bounded
+timeout: emit the IDLE line so the heartbeat nag is still the backstop, and
+treat that non-zero exit as a controller-health signal worth raising next patrol.
+
+Whichever branch you take, this step stays OPEN — it is not satisfied until a
+work bead with branch metadata is found, and the session that comes back re-reads
+formula steps and resumes at it.
 
 **Do not close this step until you have a work bead with branch metadata.**"""
 

@@ -722,9 +722,12 @@ A non-zero exit means "do not pour and do not burn", never "nothing found".
 Leaving this wisp open is recoverable and visible; burning it without a
 successor stops the patrol loop silently.
 
-**These guards end the TURN, not the SESSION.** `exit 1` aborts this snippet
-and falls through to the idle exit, where the session_sleep policy restarts the
-patrol on its normal interval. Do not reach for `gc runtime drain-ack` here:
+**These guards end the TURN, not the SESSION.** `exit 1` aborts this snippet and
+falls through to the idle exit in step 5, which READS the restart policy and
+ends the turn on whichever branch that policy selects — so the patrol comes back
+either way, on the configured interval where one exists and on an explicit
+`gc runtime request-restart` where none does. Do not assume the restart from
+here, and do not reach for `gc runtime drain-ack` here:
 despite the passive-sounding name it is an imperative that tells the controller
 to stop this session, so putting it on a read-side failure path converts a
 failed *lookup* into a stopped *heartbeat*. It belongs only on an actual drain
@@ -758,13 +761,84 @@ Do not sleep with the current wisp still open. The backoff belongs to the
 already-assigned successor wisp; if the session restarts during the sleep, the
 successor remains the single resumable patrol item.
 
-**5. Exit this turn:**
-Write exactly:
+**5. Exit this turn — verify the restart mechanism instead of assuming it:**
+
+Do NOT sleep, call ScheduleWakeup, or use Monitor. How the turn ends depends on
+whether an idle-sleep policy is actually configured for this session, and you
+must READ that rather than assume it.
+
+`session_sleep` is a real gc mechanism, but it is OFF unless a city or rig
+configures it: with nothing set the resolver returns `off` with source
+`legacy_off`, and NOTHING restarts you. Every health signal still looks fine —
+the controller is healthy, the session stays `active`, `last_active` keeps
+updating, and the `IDLE:` line below is exactly what a healthy idle deacon
+prints — so no check anywhere reports the stall. The town's heartbeat just stops
+until the heartbeat nag wakes it. Measured on this town: a deacon wisp poured at
+10:44:45Z did not take its next turn until ~12:29Z — a ~105m gap against a 300s
+patrol cap, with a clean-looking IDLE pane the whole time, which matches the
+heartbeat window and not any configured interval (gp-7ts).
+
+The reconciler mirrors the resolved policy onto your own session bead, so the
+answer is readable. Take it from there, not from this file:
+
+```bash
+SLEEP_POLICY=""
+if [ -n "${GC_SESSION_ID:-}" ]; then SLEEP_POLICY=$(gc bd show "$GC_SESSION_ID" --json 2>/dev/null | jq -r '.[0].metadata.effective_sleep_after_idle // empty'); fi
+NEEDS_RESTART=1
+case "$SLEEP_POLICY" in [0-9]*[nusmh]) NEEDS_RESTART=0 ;; esac
+echo "effective_sleep_after_idle=${SLEEP_POLICY:-<unreadable>} needs_restart=$NEEDS_RESTART"
+```
+
+The test is POSITIVE — restart unless the value is duration-SHAPED (starts with
+a digit, ends in a duration unit). Do not invert it into "restart only when the
+value is `off` or empty". The two differ exactly on a malformed or unrecognized
+value, and that is the case that must select the restart: a policy string this
+step cannot parse is a policy it cannot rely on, and treating it as configured
+resurrects the silent stall in a form no measurement would attribute to it.
+
+**Policy configured** — `NEEDS_RESTART=0`. The promise holds. Write exactly:
 ```
 IDLE: no work, exiting turn.
 ```
-Then stop immediately. Do NOT sleep, call ScheduleWakeup, or use Monitor.
-The session_sleep policy will restart this session after the configured idle interval;
-the next wisp is already assigned and the restarted session resumes from it.
+Then stop immediately. The configured interval restarts this session, and the
+patrol item it resumes from is already assigned — the successor `ensure` poured
+in step 3, or this wisp if step 4 correctly declined to burn one it could not
+name.
 
-**Exit criteria:** Next wisp poured and assigned, this wisp burned, turn ended with IDLE signal."""
+**Policy `off`, empty, unreadable, or unparseable** — `NEEDS_RESTART=1`. Nothing
+will restart you, so restart yourself. This is the branch a city with no
+`[session_sleep]` config is on:
+```bash
+if [ "$NEEDS_RESTART" = "1" ]; then gc runtime request-restart || echo "IDLE: no work, exiting turn."; fi
+```
+`request-restart` blocks until the controller kills this session and starts a
+fresh one, which is the only way the deacon sheds context between cycles. Steps
+3 and 4 already settled the wisp ledger, so the new session picks up the
+assigned patrol item and loses nothing.
+
+`request-restart` is NOT `gc runtime drain-ack`, and the difference matters more
+here than anywhere else in this formula. Both end the session; only one asks for
+a successor. `drain-ack` tells the controller this agent is DONE and should stay
+down — for the town's heartbeat that is a shutdown, and there is no pool check
+that would bring the deacon back the way one restarts a polecat. That is the
+same distinction step 3's guards turn on: never reach for `drain-ack` to end a
+turn.
+
+Fail toward the restart, never toward the wait. An unreadable policy costs one
+unnecessary restart — cheap, visible, and self-correcting. Assuming a policy
+that is not there costs a silent stall in the town's heartbeat, which nothing
+reports, and every patrol this step gates goes unrun for the duration. If
+`request-restart` exits non-zero the controller did not act within its bounded
+timeout: emit the IDLE line so the heartbeat nag is still the backstop, and
+treat that non-zero exit as a controller-health signal worth raising next cycle.
+
+Restarting every cycle raises patrol cadence, and that is the intended trade —
+an unconfigured town is currently paying a ~95-100m floor set by nothing but the
+heartbeat window. Once a city configures `session_sleep`, this branch stops
+firing on its own and cadence returns to the configured interval: the check
+reads the policy, so no edit here is needed to hand control back to config.
+
+**Exit criteria:** Next wisp poured and assigned, this wisp burned, and the turn
+ended on the branch the READ policy selects — the IDLE signal under a configured
+policy, an explicit `gc runtime request-restart` without one. Never a bare
+assertion that some policy will restart you."""
