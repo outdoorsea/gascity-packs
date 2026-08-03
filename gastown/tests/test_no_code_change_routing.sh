@@ -135,7 +135,7 @@ extract_step_block "$REFINERY_FORMULA" find-work NO_PATCH_TRIAGE >"$TRIAGE"
 REAL_CHANGE_FN="$TMP/real_change.sh"
 extract_step_block "$REFINERY_FORMULA" merge-push 'branch_has_real_change() {' >"$REAL_CHANGE_FN"
 SELECTOR="$TMP/selector.sh"
-extract_step_block "$REFINERY_FORMULA" find-work 'WORK=$(gc bd list' >"$SELECTOR"
+extract_step_block "$REFINERY_FORMULA" find-work 'WORK_JSON_RAW=$(gc bd list' >"$SELECTOR"
 POLECAT_GATE="$TMP/polecat_gate.sh"
 extract_step_block "$POLECAT_FORMULA" submit-and-exit 'NO_CODE_CHANGE=$(gc bd show' >"$POLECAT_GATE"
 

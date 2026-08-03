@@ -255,11 +255,30 @@ STALE_AFTER="{{awaiting_merge_stale_seconds}}"
 NOW_EPOCH=$(date -u +%s)
 
 # `--limit=0` is unlimited: every parked bead gets polled, not just the first.
+#
+# Capture the reply AND its exit status before anything consumes either. A
+# `gc bd` that crashed and a query that legitimately matched nothing are
+# byte-identical on stdout -- empty -- so stdout cannot tell them apart and the
+# status is the only thing that can. Keep stderr for the same reason the gh call
+# below does: it names WHICH failure this was.
+AWAITING_ERR_FILE=$(mktemp)
 AWAITING=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \\
-  --exclude-type=epic --metadata-field=awaiting_merge=true --limit=0 --json)
-# An unreadable query is not an empty queue, but it must not feed `jq` an empty
-# stdin either -- that errors out noisily and looks like "nothing parked".
-[ -n "$AWAITING" ] || AWAITING='[]'
+  --exclude-type=epic --metadata-field=awaiting_merge=true --limit=0 --json 2>"$AWAITING_ERR_FILE")
+AWAITING_CODE=$?
+AWAITING_ERR=$(sed -n '1p' "$AWAITING_ERR_FILE")
+rm -f "$AWAITING_ERR_FILE"
+if [ "$AWAITING_CODE" -ne 0 ]; then
+  # UNMEASURED. The loop below no-ops on '[]', which is fine -- what must not
+  # happen is that the no-op passes for a poll. This line is the record that
+  # every parked PR went unpolled this patrol.
+  echo "AWAITING_MERGE: UNMEASURED -- gc bd exited $AWAITING_CODE: ${AWAITING_ERR:-no stderr}. Parked PRs were NOT polled; this is not 'nothing parked'."
+  AWAITING='[]'
+else
+  # Measured, so an empty reply is now a real "nothing parked" -- and only now
+  # may it be normalized so `jq` never gets empty stdin, which errors out
+  # noisily and looks like the same thing.
+  [ -n "$AWAITING" ] || AWAITING='[]'
+fi
 
 for AW in $(printf '%s' "$AWAITING" | jq -r '.[].id'); do
   AW_JSON=$(gc bd show "$AW" --json)
@@ -423,11 +442,29 @@ branch_is_empty() {
 }
 
 # `--metadata-field` matches the stored JSON boolean that
-# `--set-metadata no_code_change=true` writes; an unreadable query is not an
-# empty queue, but it must not feed jq empty stdin either.
+# `--set-metadata no_code_change=true` writes.
+#
+# Capture the reply AND its exit status before anything consumes either, for
+# the same reason the awaiting-merge query above does: a `gc bd` that crashed
+# and a query that legitimately matched nothing are byte-identical on stdout --
+# empty -- so the status is the only thing that can tell them apart.
+NO_PATCH_ERR_FILE=$(mktemp)
 NO_PATCH=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \\
-  --exclude-type=epic --metadata-field=no_code_change=true --limit=0 --json)
-[ -n "$NO_PATCH" ] || NO_PATCH='[]'
+  --exclude-type=epic --metadata-field=no_code_change=true --limit=0 --json 2>"$NO_PATCH_ERR_FILE")
+NO_PATCH_CODE=$?
+NO_PATCH_ERR=$(sed -n '1p' "$NO_PATCH_ERR_FILE")
+rm -f "$NO_PATCH_ERR_FILE"
+if [ "$NO_PATCH_CODE" -ne 0 ]; then
+  # UNMEASURED. The loop below no-ops on '[]', which is fine -- what must not
+  # happen is that the no-op passes for a triage pass.
+  echo "NO_PATCH: UNMEASURED -- gc bd exited $NO_PATCH_CODE: ${NO_PATCH_ERR:-no stderr}. No-patch beads were NOT triaged this patrol; this is not 'none parked'."
+  NO_PATCH='[]'
+else
+  # Measured, so an empty reply is now a real "none parked" -- and only now may
+  # it be normalized so `jq` never gets empty stdin, which errors out noisily
+  # and looks like the same thing.
+  [ -n "$NO_PATCH" ] || NO_PATCH='[]'
+fi
 
 for NP in $(printf '%s' "$NO_PATCH" | jq -r '.[].id'); do
   NP_JSON=$(gc bd show "$NP" --json)
@@ -499,11 +536,79 @@ Search for work beads assigned to you with branch metadata, skipping the
 `awaiting_merge` beads step 1 just polled and the `no_code_change` beads step 2
 just triaged:
 ```bash
-WORK=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \
-  --exclude-type=epic --has-metadata-key=branch --limit=0 --json \
-  | jq -r '[.[] | select(((.metadata.awaiting_merge // "") | tostring) != "true")
-                | select(((.metadata.no_code_change // "") | tostring) != "true")][0].id // empty')
+# Assign first, filter second -- NEVER as one pipeline. In
+# `gc bd list ... | jq ...` the shell reports JQ's exit status in `$?`, never
+# gc's, so a crashed `gc bd` arrives here as a clean success carrying empty
+# stdout, and empty stdout is also exactly what a genuinely drained queue looks
+# like. That is the companion trap in gp-2uw: a piped spot-check of this bug
+# comes back green, which is why the assignment and the filter are two
+# statements below and not one.
+#
+# Unreadable is not terminal -- retry it. The reported instance was a ~2min
+# window during a pack-pin bump in which every `gc bd` exited 1 before reaching
+# the ledger, so a second read moments later is likely to be the real answer.
+WORK=""
+WORK_MEASURED=false
+WORK_ERR=""
+WORK_CODE=0
+WORK_TRY=0
+while [ "$WORK_TRY" -lt 3 ]; do
+  WORK_TRY=$((WORK_TRY + 1))
+  WORK_ERR_FILE=$(mktemp)
+  WORK_JSON_RAW=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --assignee=$GC_AGENT --status=open \\
+    --exclude-type=epic --has-metadata-key=branch --limit=0 --json 2>"$WORK_ERR_FILE")
+  WORK_CODE=$?
+  WORK_ERR=$(sed -n '1p' "$WORK_ERR_FILE")
+  rm -f "$WORK_ERR_FILE"
+  if [ "$WORK_CODE" -eq 0 ]; then
+    # Measured. Only now is an empty reply a real "queue is empty", and only
+    # now may it be normalized so jq never gets empty stdin.
+    [ -n "$WORK_JSON_RAW" ] || WORK_JSON_RAW='[]'
+    if WORK=$(printf '%s' "$WORK_JSON_RAW" | jq -r '[.[] | select(((.metadata.awaiting_merge // "") | tostring) != "true")
+                | select(((.metadata.no_code_change // "") | tostring) != "true")][0].id // empty'); then
+      WORK_MEASURED=true
+      break
+    fi
+    # gc exited 0 but handed back something jq could not parse. Still no answer.
+    WORK=""
+    WORK_ERR="gc exited 0 but the reply was not parseable JSON"
+  fi
+  echo "FIND_WORK: read $WORK_TRY/3 did not answer (gc bd exited $WORK_CODE: ${WORK_ERR:-no stderr})."
+  # Back off only when another attempt actually follows; sleeping after the
+  # last one just delays the restart that is already decided.
+  if [ "$WORK_TRY" -lt 3 ]; then sleep $((WORK_TRY * 2)); fi
+done
+
+if [ "$WORK_MEASURED" != "true" ]; then
+  # UNMEASURED -- and this is the reading that decides whether the merge queue
+  # is empty, so it is the one that must never degrade into IDLE. `WORK` is
+  # empty here, byte-identical to "queue drained", and the idle path at the end
+  # of this step would print `IDLE: no work, exiting turn.` and end the turn on
+  # a queue nobody measured. End the turn the other way: restart, which re-reads
+  # formula steps and re-queries a ledger that is probably back by then.
+  echo "FIND_WORK: UNMEASURED after $WORK_TRY reads -- last failure: ${WORK_ERR:-no stderr}."
+  echo "FIND_WORK: the merge queue was NOT read. This is NOT an empty queue, and this turn must NOT end as IDLE."
+  gc runtime request-restart || echo "FIND_WORK: UNMEASURED and request-restart failed; the heartbeat nag is the remaining backstop."
+  exit 0
+fi
 ```
+
+**Empty and unmeasured are different answers, and only one of them may idle.**
+`WORK=""` means "no bead is next" and nothing else. On its own it cannot say
+whether the queue drained or the ledger never answered, and this step ends the
+turn on that value — so the difference has to be carried explicitly, which is
+what `WORK_MEASURED` is for. Discarding stderr is what erased it: with
+`2>/dev/null` there is no value of stdout that distinguishes the two, which
+makes "the queue is empty" not merely wrong under failure but UNFALSIFIABLE.
+The reported instance got the right answer for the wrong reason — the queue
+happened to be empty, so a hard failure read as a clean result BY LUCK, NOT BY
+MEASUREMENT, and with one branch waiting the same patrol would have declared
+IDLE on a full queue with nothing downstream to catch it (gp-2uw).
+
+The restart on UNMEASURED is deliberate and it is the same trade the idle path
+below makes: a ledger that stays down costs repeated visible restarts, which is
+cheap and self-correcting, while idling on an unread queue is silent and
+strands every branch behind it. Prefer the loud failure.
 
 Both exclusions are load-bearing, not cosmetic. `awaiting_merge` beads stay open
 and assigned to the refinery on purpose, so a plain `--limit=1` query would keep
@@ -612,10 +717,28 @@ so it gets a line naming the bead, its branch, and the address it was wearing.
 # Guarded on the "queue empty" verdict, which is exactly the moment a
 # misaddressed handoff is invisible and the refinery would otherwise idle.
 if [ -z "${WORK:-}" ]; then
+  # Status first, stdout second -- and not through a pipe, so `$?` is gc's own.
+  # This sweep is the LAST thing standing between a misaddressed handoff and an
+  # idle turn, so "the ledger did not answer" must not arrive here wearing the
+  # same empty stdout as "nothing is stranded".
+  SWEEP_ERR_FILE=$(mktemp)
   SWEEP=$(gc bd list ${GC_RIG:+--rig="$GC_RIG"} --status=open \\
-    --exclude-type=epic --has-metadata-key=branch --limit=0 --json)
-  # An unreadable query is not an empty ledger, and it must not feed jq an empty
-  # stdin either -- that errors out noisily and looks like "nothing stranded".
+    --exclude-type=epic --has-metadata-key=branch --limit=0 --json 2>"$SWEEP_ERR_FILE")
+  SWEEP_CODE=$?
+  SWEEP_ERR=$(sed -n '1p' "$SWEEP_ERR_FILE")
+  rm -f "$SWEEP_ERR_FILE"
+  if [ "$SWEEP_CODE" -ne 0 ]; then
+    # UNMEASURED, and `WORK` is already empty on this branch -- so falling
+    # through lands on the idle path and prints `IDLE: no work, exiting turn.`
+    # for a ledger that was never read. Take the same exit step 3 takes, for the
+    # same reason and at the same cost: one visible restart beats a silent stall.
+    echo "SWEEP: UNMEASURED -- gc bd exited $SWEEP_CODE: ${SWEEP_ERR:-no stderr}. The ledger was NOT swept; this is not 'nothing stranded', and this turn must NOT end as IDLE."
+    gc runtime request-restart || echo "SWEEP: UNMEASURED and request-restart failed; the heartbeat nag is the remaining backstop."
+    exit 0
+  fi
+  # Measured, so an empty reply really is "nothing stranded" -- and only now may
+  # it be normalized so jq never gets empty stdin, which errors out noisily and
+  # looks like the same thing.
   [ -n "$SWEEP" ] || SWEEP='[]'
 
   # No --assignee anywhere in this pipeline. The assignee string is the thing
@@ -695,9 +818,17 @@ gc bd show $WORK --json | jq '.[0].metadata'
 The bead MUST have `metadata.branch`. If `metadata.target` is missing,
 use {{target_branch}} as default. Note the work bead ID and close this step.
 
-If NO work found — meaning step 3 selected nothing AND the sweep adopted
-nothing — end the turn here, and verify the restart mechanism instead of
-assuming it.
+If NO work found — meaning step 3 selected nothing on a read that MEASURED the
+ledger AND the sweep adopted nothing on a read that measured it too — end the
+turn here, and verify the restart mechanism instead of assuming it.
+
+"Measured" is a precondition of this whole path, not a detail of step 3. Both
+queries end the turn on an empty result, so both of them restart rather than
+idle when they could not read the ledger at all, and neither reaches this point
+unmeasured. If you are here, the queue was read and it was empty. Never write
+the `IDLE:` line on the strength of a query whose exit status you did not check
+— an unmeasured ledger is not an idle refinery, and `IDLE:` is precisely the
+line that makes a stalled merge queue look healthy to everything downstream.
 
 Do NOT sleep, call ScheduleWakeup, or use Monitor. How the turn ends depends on
 whether an idle-sleep policy is actually configured for this session, and you
@@ -725,10 +856,34 @@ answer is readable. Take it from there, not from this file:
 
 ```bash
 SLEEP_POLICY=""
-if [ -n "${GC_SESSION_ID:-}" ]; then SLEEP_POLICY=$(gc bd show "$GC_SESSION_ID" --json 2>/dev/null | jq -r '.[0].metadata.effective_sleep_after_idle // empty'); fi
+# Why this is not `gc bd show ... 2>/dev/null | jq ...`: that spelling discards
+# the one line that says WHY, and `$?` after it belongs to jq rather than gc, so
+# a crashed `gc bd` arrives as a clean empty policy. The restart test below
+# already fails safe on empty, so this does not change WHICH branch is taken --
+# but "the ledger did not answer" and "no policy is configured" are different
+# facts about the city, and the echo below is the only place either is ever
+# reported. Reporting them as one is how the next stall gets misattributed.
+SLEEP_POLICY_SOURCE="no session id in env"
+if [ -n "${GC_SESSION_ID:-}" ]; then
+  SP_ERR_FILE=$(mktemp)
+  SP_JSON=$(gc bd show "$GC_SESSION_ID" --json 2>"$SP_ERR_FILE")
+  SP_CODE=$?
+  SP_ERR=$(sed -n '1p' "$SP_ERR_FILE")
+  rm -f "$SP_ERR_FILE"
+  if [ "$SP_CODE" -ne 0 ]; then
+    SLEEP_POLICY_SOURCE="UNMEASURED: gc bd exited $SP_CODE: ${SP_ERR:-no stderr}"
+  else
+    SLEEP_POLICY=$(printf '%s' "$SP_JSON" | jq -r '.[0].metadata.effective_sleep_after_idle // empty')
+    if [ -n "$SLEEP_POLICY" ]; then
+      SLEEP_POLICY_SOURCE="session bead"
+    else
+      SLEEP_POLICY_SOURCE="measured, but the session bead carries no effective_sleep_after_idle"
+    fi
+  fi
+fi
 NEEDS_RESTART=1
 case "$SLEEP_POLICY" in [0-9]*[nusmh]) NEEDS_RESTART=0 ;; esac
-echo "effective_sleep_after_idle=${SLEEP_POLICY:-<unreadable>} needs_restart=$NEEDS_RESTART"
+echo "effective_sleep_after_idle=${SLEEP_POLICY:-<none>} source=$SLEEP_POLICY_SOURCE needs_restart=$NEEDS_RESTART"
 ```
 
 The test is POSITIVE — restart unless the value is duration-SHAPED (starts with

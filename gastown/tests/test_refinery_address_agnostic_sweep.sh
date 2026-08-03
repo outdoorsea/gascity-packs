@@ -197,7 +197,7 @@ JSON
 # them: the sweep reads the $WORK the selector left behind. Echoes the final
 # bead ($WORK), or "" when the refinery goes idle.
 run_selection() {
-    extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
+    extract_step_block find-work 'WORK_JSON_RAW=$(gc bd list' >"$SANDBOX/select.sh"
     extract_step_block find-work 'ADDRESS_AGNOSTIC_SWEEP' >"$SANDBOX/sweep.sh"
     (cd "${1:-$REPO}" && PATH="$BIN:$PATH" bash -c \
         '. "$1/select.sh"; . "$1/sweep.sh"; printf "%s\n" "${WORK:-}"' \
@@ -208,7 +208,7 @@ run_selection() {
 # Run step 3's selector ALONE and echo what it chose. Used to prove the primary
 # path genuinely cannot see a bead before asserting the sweep rescues it.
 run_primary_only() {
-    extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
+    extract_step_block find-work 'WORK_JSON_RAW=$(gc bd list' >"$SANDBOX/select.sh"
     (cd "$REPO" && PATH="$BIN:$PATH" bash -c \
         '. "$1/select.sh"; printf "%s\n" "${WORK:-}"' _ "$SANDBOX")
 }

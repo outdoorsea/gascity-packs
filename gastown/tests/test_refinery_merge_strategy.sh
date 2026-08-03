@@ -963,7 +963,7 @@ test_awaiting_bead_never_starves_the_merge_queue() {
     # is the bug -- and pinning only the string is how this passed while the
     # merge queue livelocked in production.
     new_sandbox
-    extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
+    extract_step_block find-work 'WORK_JSON_RAW=$(gc bd list' >"$SANDBOX/select.sh"
     GC_LIST_WORK="$SANDBOX/work.json"
     export GC_LIST_WORK
 
@@ -1019,7 +1019,7 @@ test_real_park_path_writes_a_flag_the_selector_excludes() {
         return 0
     fi
     new_sandbox
-    extract_step_block find-work 'WORK=$(gc bd list' >"$SANDBOX/select.sh"
+    extract_step_block find-work 'WORK_JSON_RAW=$(gc bd list' >"$SANDBOX/select.sh"
     GC_LIST_WORK="$SANDBOX/work.json"
     export GC_LIST_WORK
 
