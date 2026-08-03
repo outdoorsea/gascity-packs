@@ -767,6 +767,47 @@ test_wisp_reconcile_is_the_only_implementation() {
     done
 }
 
+test_deacon_wisp_guards_do_not_stop_the_session() {
+    # gp-ahv: `gc runtime drain-ack` reads like a passive acknowledgement, but
+    # it is an imperative — it sets GC_DRAIN_ACK and pokes the controller socket
+    # so the reconciler stops this session. Sitting on the deacon's
+    # next-iteration wisp guards, it converted a failed LOOKUP into a stopped
+    # HEARTBEAT.
+    #
+    # And it was not a rare fault path. `wisp-reconcile current` reports the
+    # running wisp by listing `in_progress` molecules, but a wisp is not
+    # reliably moved to in_progress while you run it — so an ordinary `open`
+    # wisp reads back EMPTY with exit 0, the burn guard took its else branch,
+    # and the town's heartbeat went offline once per cycle with no drain
+    # signalled and no operator error.
+    local formula="$GASTOWN/formulas/mol-deacon-patrol.toml"
+    local step
+    step=$(awk '
+        /id = "next-iteration"/ { f = 1 }
+        f && /^\[\[steps\]\]/ { exit }
+        f { print }
+    ' "$formula")
+    [[ -n "$step" ]] || fail "mol-deacon-patrol: no next-iteration step to check"
+
+    # Matched as a COMMAND line, not a mention. The step now explains in prose
+    # why drain-ack is wrong here, so a plain `grep -F` would be satisfied by
+    # that prose — the same vacuity that once let the --except guard above pass
+    # on a file which had dropped the flag from the actual call.
+    ! printf '%s\n' "$step" |
+        grep -qE '^[[:space:]]*gc runtime drain-ack[[:space:]]*$' ||
+        fail "mol-deacon-patrol next-iteration: a wisp guard runs 'gc runtime drain-ack', which stops the session on a read-side failure; log and continue instead"
+
+    # The over-correction is worse than the bug: burning a wisp with no
+    # guaranteed successor leaves ZERO wisps and the patrol loop dies silently.
+    # So the burn stays conditional, and a failed pour still aborts.
+    printf '%s\n' "$step" | grep -qF 'if [ -n "$CURRENT_WISP" ]; then' ||
+        fail "mol-deacon-patrol next-iteration: the burn is no longer guarded by a non-empty \$CURRENT_WISP; an unguarded burn fires on a wisp it could not name"
+    printf '%s\n' "$step" |
+        grep -A2 -F 'Could not guarantee exactly one next deacon wisp' |
+        grep -qE '^[[:space:]]*exit 1[[:space:]]*$' ||
+        fail "mol-deacon-patrol next-iteration: the ensure-failure guard no longer aborts; without 'exit 1' the patrol burns its wisp with no successor poured"
+}
+
 test_every_close_states_whether_the_fix_is_deployed() {
     # gp-apx: closing a pack bead asserts AUTHORSHIP — the patch is an ancestor of
     # the target branch. It says nothing about DEPLOYMENT. A city runs a commit
@@ -946,6 +987,7 @@ test_parked_session_detector_is_wired_into_the_patrol
 test_orphan_recovery_reconfirms_liveness_before_acting
 test_parked_remedy_is_documented_for_the_witness
 test_wisp_reconcile_is_the_only_implementation
+test_deacon_wisp_guards_do_not_stop_the_session
 test_shutdown_dance_contracts_are_executable
 test_shutdown_dance_lifecycle_and_audit_contracts
 test_composition_is_documented

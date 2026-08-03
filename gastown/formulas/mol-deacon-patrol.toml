@@ -709,27 +709,50 @@ which step 4 is about to burn.
 ```bash
 CURRENT_WISP=$(gc gastown wisp-reconcile current) || {
   echo "Could not resolve the current deacon wisp; not pouring and not burning."
-  gc runtime drain-ack
   exit 1
 }
 NEXT=$(gc gastown wisp-reconcile ensure mol-deacon-patrol --except "$CURRENT_WISP" --var binding_prefix='{{binding_prefix}}') || {
   echo "Could not guarantee exactly one next deacon wisp; not burning."
-  gc runtime drain-ack
   exit 1
 }
 echo "next wisp: $NEXT"
 ```
+
+A non-zero exit means "do not pour and do not burn", never "nothing found".
+Leaving this wisp open is recoverable and visible; burning it without a
+successor stops the patrol loop silently.
+
+**These guards end the TURN, not the SESSION.** `exit 1` aborts this snippet
+and falls through to the idle exit, where the session_sleep policy restarts the
+patrol on its normal interval. Do not reach for `gc runtime drain-ack` here:
+despite the passive-sounding name it is an imperative that tells the controller
+to stop this session, so putting it on a read-side failure path converts a
+failed *lookup* into a stopped *heartbeat*. It belongs only on an actual drain
+signal, which a patrol loop never receives — the deacon is the town's
+heartbeat and has no terminal state to drain into.
 
 **4. Burn this wisp before waiting:**
 ```bash
 if [ -n "$CURRENT_WISP" ]; then
   gc bd mol burn "$CURRENT_WISP" --force
 else
-  echo "Could not resolve current deacon wisp; not burning."
-  gc runtime drain-ack
-  exit 1
+  echo "Could not resolve current deacon wisp; not burning — leaving it open as the wake signal."
 fi
 ```
+
+An empty `$CURRENT_WISP` is the ROUTINE case, not an error. `wisp-reconcile
+current` reports the wisp this session is running by listing `in_progress`
+molecules, and a wisp is not reliably moved to `in_progress` while you run it —
+so an `open` wisp reads back as empty, with exit 0, on an ordinary cycle. Log it
+and continue to the idle exit: the unburned wisp stays assigned and is exactly
+the wake signal the next session resumes from, so the loop is intact.
+
+This branch must not stop the session. It once ran `gc runtime drain-ack; exit
+1`, which took the town's heartbeat offline once per cycle in response to a
+cosmetic read-side resolver bug — no drain was signalled and no operator error
+had occurred (gp-ahv). Skipping a burn you cannot name is the correct, already
+fail-safe response; the surplus is recoverable and `ensure` reconciles it on the
+next pass.
 
 Do not sleep with the current wisp still open. The backoff belongs to the
 already-assigned successor wisp; if the session restarts during the sleep, the
