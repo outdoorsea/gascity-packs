@@ -127,6 +127,22 @@ set_meta() {
     mv "$tmpf" "$BEADS/all.json"
 }
 
+# set_meta_json <id> <key> <json-value> — like set_meta, but stores the value
+# with its JSON type intact. The recall flags are written as real booleans on
+# the live bead (verified read-only on meety-local/ml-94dh, 2026-08-03:
+# `"do_not_merge":true`, not `"true"`), while a hand-stamped or round-tripped
+# one can arrive as a string. The reader normalises both, so both are fixtured —
+# a reader that matched only the string spelling would pass every test written
+# with `set_meta` and do nothing at all in production.
+set_meta_json() {
+    local id="$1" key="$2" val="$3" tmpf
+    tmpf=$(mktemp)
+    jq --arg id "$id" --arg k "$key" --argjson v "$val" \
+        '[.[] | if .id == $id then .metadata += {($k): $v} else . end]' \
+        "$BEADS/all.json" >"$tmpf"
+    mv "$tmpf" "$BEADS/all.json"
+}
+
 git_c() { git -C "$REPO" "$@"; }
 
 commit_all() {
@@ -628,6 +644,12 @@ test_keep_unmerged_says_which_signal_declined() {
     # refusal verdict and refusals are supposed to be common, so a genuinely
     # unpublished tree and a tree the reaper simply could not recognise printed
     # the identical row. They must now read differently.
+    #
+    # gp-qmd: this tree really IS the only copy — nothing was ever pushed — so
+    # the row must say so. It used to say it by ASSERTING "work looks genuinely
+    # unpublished" from a walk of the target, which was right here and wrong on
+    # any tree whose branch was still on origin. The claim is now measured
+    # against origin, and the row reports what the measurement found.
     make_world
     git_c checkout --quiet -b polecat/gp-never origin/main
     echo "unpushed" >"$REPO/never.txt"
@@ -638,8 +660,252 @@ test_keep_unmerged_says_which_signal_declined() {
     bead gp-never closed "$(long_ago)"
     run_reap
 
-    grep -Fq 'genuinely unpublished' <<<"$OUT" ||
-        fail "a tree with no landing signal at all must say so; got: $OUT"
+    grep -Fq 'only copy' <<<"$OUT" ||
+        fail "a tree that really is the only copy must say so; got: $OUT"
+    grep -Fq 'subject check declined' <<<"$OUT" ||
+        fail "the row must still name the clause that declined; got: $OUT"
+}
+
+# --- gp-qmd: the recalled bead no predicate could ever satisfy ---------------
+# C6 and C6b both answer "did this reach the target?", a proxy for the question
+# reaping turns on — "is this directory still the only copy?". For a bead closed
+# with do_not_merge / recalled_by_owner the proxy can NEVER be satisfied: the
+# work is not going to the target by design. The tree leaks permanently, and the
+# refusal asserted something false about it.
+
+test_recalled_and_published_tree_is_collected() {
+    # THE leak. meety-local/ml-94dh, verified read-only 2026-08-03: closed
+    # 2026-07-31, do_not_merge, recalled_by_owner, clean tree, and its branch on
+    # origin at the IDENTICAL sha (a6ec0cb). `git cherry` reports `+` on every
+    # cycle forever, C6b's merge attestation can never arrive because no merge
+    # is ever coming, and nothing else in the city owns that directory's death.
+    make_world
+    git_c checkout --quiet -b polecat/gp-recall origin/main
+    echo "recalled work" >"$REPO/recalled.txt"
+    commit_all "feat: built before the recall was read (gp-recall)"
+    push_branch polecat/gp-recall
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-recall polecat/gp-recall)
+
+    # Both premises, or this passes through a path it is not testing.
+    [ -n "$(git -C "$wt" cherry origin/main HEAD | grep '^+' || true)" ] ||
+        fail "fixture is wrong: the recalled commit must be missing from the target"
+    [ "$(git -C "$wt" rev-parse HEAD)" = \
+      "$(git_c ls-remote origin refs/heads/polecat/gp-recall | awk '{print $1}')" ] ||
+        fail "fixture is wrong: origin must carry this tree's HEAD under its own branch"
+
+    bead gp-recall closed "$(long_ago)"
+
+    # Without the recall this is an ordinary unmerged tree and must stay kept,
+    # so the flip below is unambiguously the recall and not some other
+    # relaxation of C6/C6b.
+    run_reap
+    [ "$(verdict_of gp-recall)" = "keep-unmerged" ] ||
+        fail "precondition: with no recall flag this tree must be kept; got '$(verdict_of gp-recall)'"
+
+    set_meta_json gp-recall do_not_merge true
+    run_reap
+
+    [ "$(verdict_of gp-recall)" = "reap" ] ||
+        fail "a recalled bead whose work is on origin must be collectable; got '$(verdict_of gp-recall)' / rows: $OUT"
+    grep -Fq 'terminal-and-will-never-merge' <<<"$OUT" ||
+        fail "the evidence must name the recall as what authorised it; got: $OUT"
+    grep -Fq 'redundant' <<<"$OUT" ||
+        fail "the evidence must say the tree is redundant, NOT that the work merged; got: $OUT"
+
+    run_reap --reap
+    [ ! -d "$wt" ] || fail "the tree was not actually removed"
+}
+
+test_recall_alone_never_destroys_the_only_copy() {
+    # The cheap version of this fix — "treat do_not_merge on a closed bead as
+    # terminal, so keep-unmerged is skipped outright" — deletes the only copy of
+    # a recalled bead whose branch was never pushed. "Do not merge" is not
+    # "destroy", and a flag on a bead is not evidence about what is on disk.
+    # Recall AUTHORISES; publication MEASURES; neither works alone.
+    make_world
+    git_c checkout --quiet -b polecat/gp-onlycopy origin/main
+    echo "the only copy" >"$REPO/onlycopy.txt"
+    commit_all "feat: never pushed anywhere (gp-onlycopy)"
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-onlycopy polecat/gp-onlycopy)
+    bead gp-onlycopy closed "$(long_ago)"
+    set_meta_json gp-onlycopy do_not_merge true
+    set_meta_json gp-onlycopy recalled_by_owner true
+    run_reap --reap
+
+    [ "$(verdict_of gp-onlycopy)" = "keep-unmerged" ] ||
+        fail "a recalled bead with nothing on origin must be kept; got '$(verdict_of gp-onlycopy)'"
+    [ -d "$wt" ] || fail "recall alone destroyed a tree holding the only copy"
+    [ -f "$wt/onlycopy.txt" ] || fail "the only copy of the recalled work is gone"
+    grep -Fq 'operator disposition needed' <<<"$OUT" ||
+        fail "an uncollectable tree must ask for disposition, not read as a merge still pending; got: $OUT"
+}
+
+test_publication_alone_does_not_authorise_a_reap() {
+    # The mirror refusal. Publication measures redundancy; it does not authorise
+    # removal by itself, because `origin/polecat/*` is a transient handoff
+    # artifact — mol-refinery-patrol's Cleanup step deletes it after a merge. A
+    # reap keyed on it would race another component's garbage collector on work
+    # that never reached a protected ref. Only a bead that will NEVER enter that
+    # queue makes origin a durable copy.
+    make_world
+    git_c checkout --quiet -b polecat/gp-pub origin/main
+    echo "pushed but unmerged" >"$REPO/pub.txt"
+    commit_all "feat: pushed and never merged (gp-pub)"
+    push_branch polecat/gp-pub
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-pub polecat/gp-pub)
+    bead gp-pub closed "$(long_ago)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-pub)" = "keep-unmerged" ] ||
+        fail "publication without a recall must not clear a tree; got '$(verdict_of gp-pub)'"
+    [ -d "$wt" ] || fail "a tree was reaped on publication alone"
+}
+
+test_refusal_never_calls_published_work_unpublished() {
+    # THE wording defect, as distinct from the leak it hid. ml-94dh's row ended
+    # "work looks genuinely unpublished" while origin carried the branch at the
+    # identical sha. That is the sentence an operator reads when deciding
+    # whether removing a tree is safe, so it was wrong in the REASSURING
+    # direction — and the identical wording would understate the risk on a tree
+    # that really was the only copy. The reaper was measuring reachability from
+    # the TARGET and reporting it as publication.
+    make_world
+    git_c checkout --quiet -b polecat/gp-said origin/main
+    echo "published" >"$REPO/said.txt"
+    commit_all "chore: shared cleanup"      # anchorless, so C6b declines first
+    push_branch polecat/gp-said
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-said polecat/gp-said)
+    bead gp-said closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-said)" = "keep-unmerged" ] ||
+        fail "precondition: this tree must be kept; got '$(verdict_of gp-said)'"
+    ! grep -Fq 'genuinely unpublished' <<<"$OUT" ||
+        fail "the row calls published work unpublished — the gp-qmd defect; got: $OUT"
+    ! grep -Fq 'only copy' <<<"$OUT" ||
+        fail "the row claims the tree is the only copy while origin carries it; got: $OUT"
+    grep -Fq 'published: origin/polecat/gp-said' <<<"$OUT" ||
+        fail "the row must report the MEASURED publication state; got: $OUT"
+}
+
+test_publication_requires_origin_to_contain_head() {
+    # A pushed branch is not a published HEAD. If the tree carries commits past
+    # the tip origin has, those commits exist nowhere else — and a check that
+    # merely asked "does this branch exist on origin?" would clear them. This is
+    # why containment is tested against HEAD: every commit `git cherry` flags is
+    # reachable from it, so one ancestry test covers all of them.
+    make_world
+    git_c checkout --quiet -b polecat/gp-ahead origin/main
+    echo "pushed part" >"$REPO/ahead.txt"
+    commit_all "feat: the pushed part (gp-ahead)"
+    push_branch polecat/gp-ahead
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-ahead polecat/gp-ahead)
+    # A further commit that lives ONLY here, leaving the tree clean so C5 passes
+    # and the refusal below is unambiguously the publication check.
+    echo "never pushed" >"$wt/unpushed.txt"
+    git -C "$wt" add -A
+    git -C "$wt" commit --quiet -m "feat: the unpushed part (gp-ahead)"
+
+    bead gp-ahead closed "$(long_ago)"
+    set_meta_json gp-ahead do_not_merge true
+    run_reap --reap
+
+    [ "$(verdict_of gp-ahead)" = "keep-unmerged" ] ||
+        fail "a tree ahead of its published tip must be kept; got '$(verdict_of gp-ahead)'"
+    [ -d "$wt" ] || fail "a recalled tree was reaped holding commits found nowhere else"
+    [ -f "$wt/unpushed.txt" ] || fail "the only copy of the unpushed commit is gone"
+    grep -Fq 'does NOT contain this tree' <<<"$OUT" ||
+        fail "the row must say origin does not carry this HEAD; got: $OUT"
+}
+
+test_publication_binds_to_the_exact_ref_not_a_pattern_match() {
+    # `ls-remote --heads origin polecat/gp-x` matches a PATTERN against the tail
+    # of a ref path on slash boundaries, so `refs/heads/decoy/polecat/gp-x`
+    # matches it too — and the output is sorted by refname, so the decoy is
+    # returned FIRST. Reading the tip positionally therefore binds publication to
+    # a ref this bead does not own. Here the bead's own branch was never pushed,
+    # so the tree holds the only copy under its own name, and a decoy carrying
+    # the same commit must not clear it.
+    make_world
+    git_c checkout --quiet -b polecat/gp-decoy origin/main
+    echo "only copy under its own name" >"$REPO/decoy.txt"
+    commit_all "feat: pushed only under a decoy ref (gp-decoy)"
+    # The same commit under a ref whose tail matches the bead's branch but which
+    # is emphatically not it.
+    git_c push --quiet origin polecat/gp-decoy:refs/heads/decoy/polecat/gp-decoy
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-decoy polecat/gp-decoy)
+
+    # Both premises, or this passes through a path it is not testing.
+    [ -z "$(git_c ls-remote origin refs/heads/polecat/gp-decoy)" ] ||
+        fail "fixture is wrong: the bead's own branch must NOT be on origin"
+    [ "$(git_c ls-remote --heads origin polecat/gp-decoy | awk 'NR == 1 { print $2 }')" \
+      = "refs/heads/decoy/polecat/gp-decoy" ] ||
+        fail "fixture is wrong: the decoy must be the first ref the pattern returns"
+
+    bead gp-decoy closed "$(long_ago)"
+    set_meta_json gp-decoy do_not_merge true
+    run_reap --reap
+
+    [ "$(verdict_of gp-decoy)" = "keep-unmerged" ] ||
+        fail "a decoy ref must never publish a tree; got '$(verdict_of gp-decoy)'"
+    [ -d "$wt" ] || fail "a tree was reaped on the strength of a ref its bead does not own"
+    [ -f "$wt/decoy.txt" ] || fail "the only copy under the bead's own branch is gone"
+    grep -Fq 'NOT measured' <<<"$OUT" ||
+        fail "an unresolvable exact ref must read as NOT measured, not as unpublished; got: $OUT"
+}
+
+test_recall_flags_are_read_in_both_json_spellings() {
+    # Production writes real JSON booleans (ml-94dh: `"do_not_merge":true`),
+    # while a hand stamp or a tool round-trip can yield the string "true". A
+    # reader matching one spelling passes every test written the same way and
+    # does nothing at all live. The `"false"` cases are the sharper hazard: a
+    # jq truthiness test would read the non-empty string "false" as a recall.
+    make_world
+    git_c checkout --quiet -b polecat/gp-spell origin/main
+    echo "spelled" >"$REPO/spell.txt"
+    commit_all "feat: recalled work (gp-spell)"
+    push_branch polecat/gp-spell
+    git_c checkout --quiet main
+    add_tree agentA gp-spell polecat/gp-spell >/dev/null
+    bead gp-spell closed "$(long_ago)"
+
+    set_meta_json gp-spell recalled_by_owner true
+    run_reap
+    [ "$(verdict_of gp-spell)" = "reap" ] ||
+        fail "recalled_by_owner as a JSON boolean must authorise; got '$(verdict_of gp-spell)'"
+
+    set_meta_json gp-spell recalled_by_owner '"true"'
+    run_reap
+    [ "$(verdict_of gp-spell)" = "reap" ] ||
+        fail "recalled_by_owner as the string \"true\" must authorise; got '$(verdict_of gp-spell)'"
+
+    set_meta_json gp-spell recalled_by_owner false
+    run_reap
+    [ "$(verdict_of gp-spell)" = "keep-unmerged" ] ||
+        fail "recalled_by_owner=false must not authorise; got '$(verdict_of gp-spell)'"
+
+    set_meta_json gp-spell recalled_by_owner '"false"'
+    run_reap
+    [ "$(verdict_of gp-spell)" = "keep-unmerged" ] ||
+        fail "recalled_by_owner=\"false\" must not authorise a reap; got '$(verdict_of gp-spell)'"
 }
 
 # --- Refusals: work that must survive --------------------------------------
