@@ -588,6 +588,15 @@ record a reap count for it; treat it as breakage and continue to the next step.
 Anything `unverifiable` was NOT cleared — it abstained. Never "help" it along by
 removing the directory yourself.
 
+`keep-orphaned` is the one refusal that is asking you for something. The tree is
+dirty and its bead is closed, unassigned and cold, so it will be refused on every
+cycle forever — and its INDEX holds content that is on neither HEAD nor the
+target, or could not be measured at all. That content may exist nowhere else
+(measured on meety-local 2026-08-03: ml-cmai held 31 such blobs behind a row that
+read like routine garbage). Keeping it is correct and the reaper will never
+resolve it. Surface it to a human; do NOT remove the directory to make the row go
+away, and do not treat it as a reap failure.
+
 **Why the predicate lives in a script and not in this step.** The two checks
 that carry the safety argument are `git status --porcelain` empty and
 `git cherry <target> HEAD` reporting no `+` commits — together they mean
@@ -627,11 +636,17 @@ when the pattern is worth a human look:
 | Trees reaped, no failures | Log only. Routine. |
 | `reap-failed` rows present | Log + nudge mayor. Removal is broken; disk grows. |
 | `unverifiable` rows persisting across cycles | Log + nudge mayor. Something is wrong with the bead or the ref, and those trees never get collected. |
+| `keep-orphaned` rows present | Log + nudge mayor, naming the paths. A human has to decide what happens to content that exists nowhere else; nothing else in town can. |
 | Exit code 2 | Log + mail mayor. The reaper cannot run at all, so the leak is unbounded again. |
 
 ```bash
-gc session nudge mayor/ "worktree-reap: <n> reaped, <n> failed, <n> unverifiable in $GC_RIG"
+gc session nudge mayor/ "worktree-reap: <n> reaped, <n> failed, <n> unverifiable, <n> orphaned in $GC_RIG"
 ```
+
+An orphaned row repeats every cycle by design — the tree is kept until a human
+acts on it. Nudge on the FIRST cycle one appears and whenever the set changes;
+re-nudging an unchanged set every patrol rebuilds the very noise this verdict
+exists to cut through.
 
 **Exit criteria:** The reaper ran and its rows were read, or it reported
 nothing to do. Continue to `check-unroutable-beads` — do NOT exit the wisp

@@ -240,6 +240,26 @@ add_tree() {
     printf '%s' "$path"
 }
 
+# stage_blob <wt> <file> <content> — write a file inside a per-bead worktree and
+# STAGE it, without committing. This is the shape gp-dgu is about: content that
+# `ls` shows nothing special about, that no commit references, and that only the
+# worktree's own index points at — so removing the directory drops the last
+# reference to it.
+stage_blob() {
+    local wt="$1" file="$2" content="$3"
+    printf '%s\n' "$content" >"$wt/$file"
+    git -C "$wt" add "$file"
+}
+
+# stage_deletion <wt> <file> — stage the removal of a tracked file. Deletions are
+# the half of a staged diff that carries no content: the bytes they remove are by
+# definition still on the ref they were deleted from, so they must never count
+# toward unreachable content. ml-cmai's 59 staged paths were 28 of these.
+stage_deletion() {
+    local wt="$1" file="$2"
+    git -C "$wt" rm --quiet "$file"
+}
+
 # run_reap [args...] — runs the reaper from a neutral cwd so the keep-self
 # guard never fires by accident.
 run_reap() {
@@ -256,6 +276,7 @@ run_reap() {
 }
 
 verdict_of() { printf '%s' "$OUT" | awk -F'\t' -v b="$1" '$2 == b { print $1 }'; }
+detail_of() { printf '%s' "$OUT" | awk -F'\t' -v b="$1" '$2 == b { print $4 }'; }
 
 long_ago() { date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-3H +%Y-%m-%dT%H:%M:%SZ; }
 just_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -693,6 +714,158 @@ test_dirty_tree_is_never_reaped() {
     [ "$(verdict_of gp-dirty)" = "keep-dirty" ] ||
         fail "an untracked file must keep the tree; got '$(verdict_of gp-dirty)'"
     [ -f "$wt/scratch.txt" ] || fail "uncommitted work was destroyed"
+}
+
+# --- gp-dgu: a kept tree still has to be triageable -------------------------
+# C5's refusal is correct and permanent, which is the problem: on a closed,
+# unassigned bead whose polecat is gone it prints the same `keep-dirty` row
+# forever, indistinguishable from a tree dirty for a boring reason. Measured on
+# meety-local (2026-08-03), ml-cmai carried 31 staged blobs on NEITHER HEAD nor
+# origin/main — main.py, api.ts, three test files — behind a row that read like
+# garbage, one "clean up the old worktrees" reflex away from being destroyed.
+#
+# So these pin the SPLIT in both directions. Pinning only the alarm would let a
+# reaper that shouted on every dirty tree pass, which reproduces the original
+# defect with a louder word: an eternal row nobody can triage.
+#
+# They also pin, twice, that the split stays a REPORT. The reachability answer is
+# exactly the line between a tree that is safe to drop and one that is not, which
+# is precisely why it must never become a licence to drop one.
+
+test_staged_content_on_no_ref_is_orphaned_not_dirty() {
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-orphan)
+    stage_blob "$wt" secret.py "the only copy of this content in the world"
+    bead gp-orphan closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-orphan)" = "keep-orphaned" ] ||
+        fail "staged content on neither HEAD nor the target must be distinguishable from routine dirt; got '$(verdict_of gp-orphan)'"
+    grep -Fq '1 staged blob(s) on NEITHER HEAD nor origin/main' <<<"$(detail_of gp-orphan)" ||
+        fail "the row must say how much content is at risk and against what; got '$(detail_of gp-orphan)'"
+}
+
+test_orphaned_tree_survives_reap_mode() {
+    # The whole point of the bead: RECLASSIFY, DO NOT COLLECT. A new verdict that
+    # also became a new authorisation to delete would be strictly worse than the
+    # eternal keep-dirty it replaced.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-orphan)
+    stage_blob "$wt" secret.py "the only copy of this content in the world"
+    bead gp-orphan closed "$(long_ago)"
+    run_reap --reap
+
+    [ "$(verdict_of gp-orphan)" = "keep-orphaned" ] ||
+        fail "--reap must not change the verdict; got '$(verdict_of gp-orphan)'"
+    [ -d "$wt" ] || fail "an orphaned tree was REAPED — the report became an authorisation"
+    [ -f "$wt/secret.py" ] || fail "the unreachable content was destroyed"
+}
+
+test_staged_content_already_on_a_ref_stays_routine_dirty() {
+    # The discriminating case. This blob is staged at a path that exists on no
+    # ref, but its CONTENT is byte-identical to README.md on the target — so
+    # deleting the tree loses nothing, and the row must not cry orphan.
+    # Reachability is asked tree-wide rather than per-path for exactly this
+    # reason: a moved file is not lost content.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-copy)
+    stage_blob "$wt" copy.md "# base"
+    bead gp-copy closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-copy)" = "keep-dirty" ] ||
+        fail "staged content already carried by a surviving ref is routine; got '$(verdict_of gp-copy)' / $(detail_of gp-copy)"
+    grep -Fq 'already on HEAD or origin/main' <<<"$(detail_of gp-copy)" ||
+        fail "the routine row must state what it cleared; got '$(detail_of gp-copy)'"
+}
+
+test_staged_deletions_alone_are_not_unreachable_content() {
+    # 28 of ml-cmai's 59 staged paths were deletions. A deletion removes bytes
+    # that are still on the ref it was deleted from, so counting it as content at
+    # risk would raise an alarm on every tree that ever staged a `git rm`.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-del)
+    stage_deletion "$wt" README.md
+    bead gp-del closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-del)" = "keep-dirty" ] ||
+        fail "a staged deletion destroys no content and must stay routine; got '$(verdict_of gp-del)' / $(detail_of gp-del)"
+}
+
+test_untracked_only_dirt_does_not_claim_the_worktree_was_priced() {
+    # The probe reads the INDEX only. A tree dirty purely with untracked files is
+    # correctly routine by that measure, but the row must not let "routine" be
+    # read as "safe to delete" when the untracked side was never measured.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-scratch)
+    echo "uncommitted" >"$wt/scratch.txt"
+    bead gp-scratch closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-scratch)" = "keep-dirty" ] ||
+        fail "untracked-only dirt is routine by the index measure; got '$(verdict_of gp-scratch)'"
+    grep -Fq 'worktree-side content not priced' <<<"$(detail_of gp-scratch)" ||
+        fail "the row must admit what it did NOT measure; got '$(detail_of gp-scratch)'"
+}
+
+test_unmeasurable_index_never_reads_as_routine() {
+    # Half a reachable universe would report blobs that ARE on the target as
+    # existing nowhere. Refusing to measure is right; reporting the refusal as
+    # routine is the gp-dgu defect in a new place, so it escalates and names why.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-noref)
+    stage_blob "$wt" secret.py "content whose reachability cannot be judged"
+    bead gp-noref closed "$(long_ago)"
+    set_meta gp-noref target nonexistent-branch
+    run_reap
+
+    [ "$(verdict_of gp-noref)" = "keep-orphaned" ] ||
+        fail "an unmeasurable index must not read as routine; got '$(verdict_of gp-noref)'"
+    grep -Fq 'NOT measured' <<<"$(detail_of gp-noref)" ||
+        fail "the row must name that it abstained rather than imply content at risk; got '$(detail_of gp-noref)'"
+    grep -Fq 'origin/nonexistent-branch' <<<"$(detail_of gp-noref)" ||
+        fail "the row must name the ref that failed to resolve; got '$(detail_of gp-noref)'"
+}
+
+test_orphaned_row_carries_the_triage_fields() {
+    # "closed 3d, no owner, N staged" — the operator has to decide whether to go
+    # looking for whoever left this here, and a bare path does not answer that.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-triage)
+    stage_blob "$wt" secret.py "unique content"
+    bead gp-triage closed "$(long_ago)"
+    run_reap
+
+    local d
+    d=$(detail_of gp-triage)
+    grep -Fq 'closed 3h' <<<"$d" || fail "the row must date the closure; got '$d'"
+    grep -Fq 'no owner' <<<"$d" || fail "the row must say whether anyone is left to ask; got '$d'"
+    grep -Fq '1 staged' <<<"$d" || fail "the row must size the staged set; got '$d'"
+}
+
+test_orphaned_row_is_a_finding_not_a_clean_sweep() {
+    # Exit 0 is documented as "nothing to report". An escalation that exits 0 is
+    # an escalation nobody reads — the patrol's own step treats 0 as "reported
+    # nothing to do" and moves on.
+    make_world
+    local wt
+    wt=$(add_tree agentA gp-orphan)
+    stage_blob "$wt" secret.py "the only copy"
+    bead gp-orphan closed "$(long_ago)"
+    run_reap
+
+    [ "$RC" -eq 1 ] ||
+        fail "an orphaned tree is a finding and must exit 1, got $RC"
+    grep -Fq 'orphaned=1' <<<"$ERR" ||
+        fail "the summary must count orphaned trees so a patrol can act on them; got '$ERR'"
 }
 
 test_fuzzy_matched_basename_is_unverifiable_not_reaped() {

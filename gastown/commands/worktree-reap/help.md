@@ -42,7 +42,15 @@ summary on stderr:
                  will resume from this very tree.
   keep-claimed   a non-closed bead points `metadata.work_dir` at this path.
   keep-cooling   closed too recently; inside the grace window.
-  keep-dirty     uncommitted or untracked files are present.
+  keep-dirty     uncommitted or untracked files are present, and every STAGED
+                 blob is already carried by HEAD or the target — losing the
+                 index would lose no content. The detail column names what was
+                 not priced: the untracked and unstaged side is not measured.
+  keep-orphaned  the same permanent refusal as keep-dirty, but this tree's index
+                 holds content that is on NEITHER HEAD nor the target, or its
+                 index could not be measured at all. The content may exist
+                 nowhere else in the world. Reported for a human, never reaped —
+                 see "Why a kept tree still gets graded" below.
   keep-unmerged  commits whose PATCHES are not on the target ref, AND which the
                  subject reconciliation below did not clear either. The detail
                  column names which signal declined, so a genuinely unpublished
@@ -55,8 +63,9 @@ summary on stderr:
                  a failing `git status`. Never reaped.
 
 Exit codes:
-  0   Nothing to report — no candidates, or every one kept.
-  1   Findings on stdout (reapable, reaped, or unverifiable).
+  0   Nothing to report — no candidates, or every one kept for a reason that
+      needs no human.
+  1   Findings on stdout (reapable, reaped, unverifiable, or orphaned).
   2   The reaper could not run — no city, no rig, unresolvable repo, or an
       unreadable worktree list. Nothing was measured. That is NOT the same as
       nothing to reap; escalate the breakage rather than recording a clean
@@ -119,6 +128,29 @@ the work is demonstrably on the target, either by patch-id or by the subject
 reconciliation above. Together they mean reaping cannot lose work. The rest
 answer a different question, "is anyone still using it", and exist to protect
 in-flight work that merely looks finished.
+
+Why a kept tree still gets graded: the dirty check has no terminal exit. On a
+closed, unassigned bead whose polecat is gone, `git status --porcelain` stays
+non-empty forever, so the tree is refused on every cycle the reaper will ever
+run and every refusal prints the same row. Keeping it is right; reporting it as
+routine is not — an eternal row is indistinguishable from a tree dirty for a
+boring reason, and the obvious "clean up the old worktrees" reflex then destroys
+whatever it was holding. Measured on meety-local (2026-08-03), ml-cmai was
+closed and unassigned with 59 staged paths; HEAD was an ancestor of origin/main
+so ZERO commits were at risk, but 31 staged blobs — main.py, api.ts, three test
+files — matched neither HEAD's tree nor origin/main's and existed nowhere else.
+
+So a dirty refusal is graded by one question: is every staged blob already
+carried by HEAD or the target? Staged content is the invisible half of a dirty
+tree — `ls` does not show it, only the index references it, and `rm -rf` takes
+it without a word. Reachability is asked tree-wide rather than per-path, because
+identical bytes at another path mean the content is not lost.
+
+This is a REPORT, not an authorisation. Both verdicts keep the tree and nothing
+downstream reads the answer: the reachability test is exactly the line between a
+tree that is safe to drop and one that is not, which is why it must not become a
+new licence to drop one. `keep-orphaned` counts as a finding for the exit code
+because an escalation that exits 0 is an escalation nobody reads.
 
 Deciding to reap is the witness's, taken in the `reap-landed-worktrees` step of
 mol-witness-patrol, which runs this command with `--reap` after orphan salvage

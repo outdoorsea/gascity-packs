@@ -25,6 +25,11 @@
 #   C6 upstream   `git cherry <target> HEAD` reports no `+` commits — every
 #                 local commit's PATCH is already on the target.
 #
+# C5b is a third check but NOT a third clearance: it grades a tree C5 has already
+# refused, so an operator can tell an eternal refusal holding unrecoverable
+# content from one holding scratch. It can only ever change which refusal is
+# printed. See its section below.
+#
 # The remaining checks answer a different question — "is anyone still using
 # it?" — and exist to protect in-flight work that happens to look finished:
 #
@@ -153,6 +158,50 @@
 # reads as the reaper working correctly, which is how this leak survived three
 # patrol cycles unnoticed.
 #
+# ## C5b: a REFUSED tree still has to be triageable (gp-dgu)
+#
+# C5 has no terminal exit. On a closed, unassigned bead whose polecat is gone,
+# `git status --porcelain` stays non-empty forever, so the tree is refused on
+# every cycle the reaper will ever run and every refusal prints the same
+# `keep-dirty` row. The refusal is CORRECT — keeping the tree is the whole point.
+# Reporting it as routine is not: an eternal row is indistinguishable from a tree
+# that is dirty for a boring reason, and the obvious "clean up the old worktrees"
+# reflex then destroys whatever it was holding.
+#
+# Measured instance, meety-local/ml-cmai (read-only, 2026-08-03): closed, no
+# assignee, its agent gone, 59 staged paths. HEAD was an ancestor of origin/main,
+# so ZERO commits were at risk — but 31 staged blobs matched neither HEAD's tree
+# nor origin/main's. main.py, admin.py, api.ts and three test files existed
+# nowhere else in the world, behind a row that read like garbage.
+#
+# So C5b asks the one question separating a tree whose loss costs nothing from a
+# tree whose loss is unrecoverable: is every STAGED blob already carried by
+# HEAD's tree or the target's? Staged content is the invisible half of a dirty
+# tree — `ls` does not show it, only the index references it, and `rm -rf` takes
+# it without a word.
+#
+#   keep-dirty     dirty, but every staged blob is already on HEAD or the target
+#                  (or nothing is staged). Losing the index loses no content.
+#   keep-orphaned  a staged blob is on NEITHER, or the index could not be
+#                  measured. Content may exist only here.
+#
+# THIS IS A REPORT, NOT AN AUTHORISATION. Both verdicts keep the tree, C5 still
+# `continue`s before any reap logic is reachable, and nothing downstream consults
+# the result — the reachability answer is exactly the line between a tree that is
+# safe to drop and one that is not, which is why it must not become a new licence
+# to drop one. `keep-orphaned` exists to make a human look, which is why it
+# counts as a finding for the exit code: an escalation that exits 0 is an
+# escalation nobody reads.
+#
+# The probe covers the INDEX only, and the row says so. Untracked and unstaged
+# content also keeps the tree via C5, but pricing it means hashing every
+# untracked file — an unbounded walk on any tree carrying a node_modules,
+# charged to every patrol. `git diff-index --cached --raw` hands back index blob
+# shas directly, so the measurement costs one command bounded by index size and
+# hashes nothing. The row prints the total dirty count next to the staged
+# measurement so what was NOT priced stays visible rather than reading as a clean
+# bill of health.
+#
 # ## Why agent liveness is never an input
 #
 # The obvious predicate — "this agent has no session, so its workspace is
@@ -198,7 +247,12 @@
 #   keep-open     <TAB> <bead> <TAB> <path> <TAB> status=<status>
 #   keep-claimed  <TAB> <bead> <TAB> <path> <TAB> claimed by <bead>
 #   keep-cooling  <TAB> <bead> <TAB> <path> <TAB> closed <n>m ago
-#   keep-dirty    <TAB> <bead> <TAB> <path> <TAB> <n> uncommitted paths
+#   keep-dirty    <TAB> <bead> <TAB> <path> <TAB> <n> uncommitted paths, none of
+#                 whose staged content is missing from HEAD or the target
+#   keep-orphaned <TAB> <bead> <TAB> <path> <TAB> closed <age>, <owner>, <n>
+#                 staged, <n> blobs unreachable from HEAD or the target — or
+#                 why the index could NOT be measured. Kept, like every other
+#                 keep-*; escalated, unlike every other keep-*.
 #   keep-unmerged <TAB> <bead> <TAB> <path> <TAB> <n> patches not on <target>,
 #                 plus why C6b did not clear it either — so a genuinely
 #                 unpublished tree is distinguishable from a near-miss
@@ -211,8 +265,10 @@
 # it has been ABSTAINED on. Reaping on an unreadable state is how a reaper
 # eats real work; the leak is the cheaper failure.
 #
-# Exit codes:  0 = nothing to report (no candidates, or every one kept)
-#              1 = findings on stdout (reapable, reaped, or unverifiable)
+# Exit codes:  0 = nothing to report (no candidates, or every one kept for a
+#                  reason that needs no human)
+#              1 = findings on stdout (reapable, reaped, unverifiable, or
+#                  orphaned)
 #              2 = the check could not run — nothing was measured, which is
 #                  NOT the same as nothing to reap
 #
@@ -353,6 +409,142 @@ normalize_target() {
     origin/*|refs/*) printf '%s' "$1" ;;
     *) printf 'origin/%s' "$1" ;;
   esac
+}
+
+# resolve_target — the ref a tree's work is measured against: the CLI override,
+# else the bead's own `metadata.target`, else the tree's origin HEAD, else
+# origin/main. Pure resolution — it never verifies the ref, because C5b and C6
+# want the same ref but do NOT agree on what an unresolvable one means (C5b
+# grades a refusal, C6 abstains from a clearance). Shared so the two checks can
+# never silently drift onto different targets and report contradictory rows for
+# one tree.
+resolve_target() {
+  local wt="$1" meta_target="$2" t
+  t=$(normalize_target "${TARGET_OVERRIDE:-$meta_target}")
+  if [ -z "$t" ]; then
+    t=$(git -C "$wt" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    [ -n "$t" ] || t=origin/main
+  fi
+  printf '%s' "$t"
+}
+
+# age_brief — seconds to a coarse human duration for a triage row. Minutes below
+# an hour, hours below two days, days beyond. The reader's question is "has this
+# been sitting here long enough to be someone's forgotten problem", which no
+# amount of precision answers better than "3d" does.
+age_brief() {
+  local s="$1"
+  if [ "$s" -lt 3600 ]; then printf '%dm' "$((s / 60))"
+  elif [ "$s" -lt 172800 ]; then printf '%dh' "$((s / 3600))"
+  else printf '%dd' "$((s / 86400))"
+  fi
+}
+
+# staged_reachability — C5b. Of the blobs this tree has STAGED, how many exist
+# nowhere but here? See the C5b section in the header for why a refused tree
+# still needs grading and why the probe stops at the index.
+#
+# Sets STAGED_TOTAL, STAGED_DELETIONS and STAGED_UNREACHABLE on success. Returns
+# non-zero when the answer was NOT measured, with REACH_WHY naming what
+# declined — the caller must not read the counters in that case, and must not
+# report the tree as routine either.
+#
+# "Reachable" is: the exact blob appears somewhere in HEAD's tree or somewhere in
+# the target's tree. Tree-wide rather than same-path, because the operator's
+# question is "does this content still exist if I delete the directory", and
+# identical bytes at another path answer it yes. Comparing per-path would report
+# a moved file as unrecoverable and inflate exactly the alarm this check exists
+# to make meaningful.
+staged_reachability() {
+  local wt="$1" target="$2"
+
+  STAGED_TOTAL=0
+  STAGED_DELETIONS=0
+  STAGED_UNREACHABLE=0
+  REACH_WHY=''
+
+  # An unborn HEAD means there is no baseline to diff the index against. Rather
+  # than treat every staged path as unreachable on a technicality, abstain and
+  # say so — the tree is kept either way, and a named abstention is auditable
+  # where an inferred alarm is not.
+  if ! git -C "$wt" rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+    REACH_WHY="this tree has no HEAD commit, so the index has no baseline to be measured against"
+    return 1
+  fi
+
+  if ! git -C "$wt" diff-index --cached --raw HEAD >"$STAGED_RAW_FILE" 2>/dev/null; then
+    REACH_WHY="'git diff-index --cached HEAD' failed here; the index was NOT read"
+    return 1
+  fi
+
+  # An empty index diff is a complete answer on its own: no staged blob can be
+  # unreachable when there is no staged blob. Returning here keeps the common
+  # case — a tree dirty only with untracked scratch — off two `ls-tree` walks,
+  # and stops a target that happens not to resolve from escalating a tree whose
+  # index was never in question.
+  if [ ! -s "$STAGED_RAW_FILE" ]; then
+    return 0
+  fi
+
+  # A target that does not resolve halves the reachable universe, which would
+  # report blobs that ARE on the target as existing nowhere. Refuse to measure
+  # rather than measure against HEAD alone and present the shortfall as
+  # unrecoverable content.
+  if ! git -C "$wt" rev-parse --verify --quiet "$target^{commit}" >/dev/null 2>&1; then
+    REACH_WHY="target ref '$target' does not resolve here, so reachability could only have been half-measured"
+    return 1
+  fi
+
+  # Every blob the two surviving refs already carry. `ls-tree -r` is filtered on
+  # the literal type column rather than trusted positionally, so a submodule
+  # (`commit`) or a subtree entry can never be mistaken for file content.
+  : >"$REACH_BLOBS_FILE"
+  local ref
+  for ref in HEAD "$target"; do
+    if ! git -C "$wt" ls-tree -r "$ref" >"$LS_TREE_FILE" 2>/dev/null; then
+      REACH_WHY="could not read $ref's tree; reachability was NOT measured"
+      return 1
+    fi
+    # Guarded rather than bare: this function is called from an `if !`, which
+    # disables `set -e` for its whole body, so an unguarded failure here would
+    # not abort — it would silently leave the reachable set SHORT and report the
+    # difference as content existing nowhere. A false orphan alarm is the one
+    # way this check could cost a human real time.
+    if ! awk '$2 == "blob" { print $3 }' "$LS_TREE_FILE" >>"$REACH_BLOBS_FILE"; then
+      REACH_WHY="could not collect $ref's blob ids; reachability was NOT measured"
+      return 1
+    fi
+  done
+
+  # `diff-index --raw` emits `:<srcmode> <dstmode> <srcsha> <dstsha> <status>`
+  # before the tab, so fields 1-5 are parseable even when a path contains spaces
+  # or arrives quoted. A staged DELETION carries no content — its dstsha is the
+  # all-zero sentinel — and is counted apart rather than as unreachable: the
+  # bytes it removes are by definition still on the ref it was deleted from.
+  if ! awk -v blobs="$REACH_BLOBS_FILE" '
+    BEGIN {
+      while ((getline b < blobs) > 0) reachable[b] = 1
+    }
+    {
+      total++
+      if ($5 ~ /^D/)            { deletions++; next }
+      if ($4 ~ /^0+$/)          { unmeasured++; next }
+      if (!($4 in reachable))   { unreachable++ }
+    }
+    END {
+      if (unmeasured > 0) exit 3
+      printf "%d %d %d\n", total + 0, deletions + 0, unreachable + 0
+    }
+  ' "$STAGED_RAW_FILE" >"$STAGED_COUNT_FILE" 2>/dev/null; then
+    REACH_WHY="a staged entry carried no blob id, so the index was only partly measured"
+    return 1
+  fi
+
+  read -r STAGED_TOTAL STAGED_DELETIONS STAGED_UNREACHABLE <"$STAGED_COUNT_FILE" || {
+    REACH_WHY="the staged tally could not be read back; NOT measured"
+    return 1
+  }
+  return 0
 }
 
 # origin_branch_state — present | absent | unknown for the branch the refinery
@@ -582,12 +774,24 @@ LOCKED_FILE=$(mktemp)
 # allocating inside the per-candidate loop would leak one pair per tree.
 SUBJ_LOCAL_FILE=$(mktemp)
 SUBJ_TARGET_FILE=$(mktemp)
+# C5b's scratch: the raw staged diff, the reachable blob universe, one ls-tree
+# read at a time, and the tally awk hands back. Hoisted for the same reason as
+# C6b's pair — a mktemp inside the per-candidate loop leaks one set per tree.
+STAGED_RAW_FILE=$(mktemp)
+REACH_BLOBS_FILE=$(mktemp)
+LS_TREE_FILE=$(mktemp)
+STAGED_COUNT_FILE=$(mktemp)
 # C6b's two refusal reasons, written by landed_by_subject and merge_attested and
 # read by the rows they explain. Seeded here so `set -u` cannot turn a future
-# early-return that forgets to set one into an abort mid-scan.
+# early-return that forgets to set one into an abort mid-scan. C5b's counters and
+# its own refusal reason are seeded on the same argument.
 SUBJ_WHY=''
 ATTEST_NOTE=''
-trap 'rm -f "$CLAIMED_FILE" "$RAW_CLAIMED_FILE" "$LIST_FILE" "$CANDIDATES_FILE" "$LOCKED_FILE" "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE"' EXIT
+REACH_WHY=''
+STAGED_TOTAL=0
+STAGED_DELETIONS=0
+STAGED_UNREACHABLE=0
+trap 'rm -f "$CLAIMED_FILE" "$RAW_CLAIMED_FILE" "$LIST_FILE" "$CANDIDATES_FILE" "$LOCKED_FILE" "$SUBJ_LOCAL_FILE" "$SUBJ_TARGET_FILE" "$STAGED_RAW_FILE" "$REACH_BLOBS_FILE" "$LS_TREE_FILE" "$STAGED_COUNT_FILE"' EXIT
 
 # Every stored status that is not `closed`, taken from bd's own enum
 # (open, in_progress, blocked, deferred, closed) rather than guessed. A
@@ -676,7 +880,7 @@ fi
 
 printf 'verdict\tbead\tpath\tdetail\n' >&2
 
-n_reap=0 n_reaped=0 n_failed=0 n_kept=0 n_unverifiable=0
+n_reap=0 n_reaped=0 n_failed=0 n_kept=0 n_unverifiable=0 n_orphaned=0
 
 while IFS= read -r WT; do
   [ -n "$WT" ] || continue
@@ -714,6 +918,11 @@ while IFS= read -r WT; do
 
   STATUS=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].status // empty' 2>/dev/null || true)
   CLOSED_AT=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].closed_at // empty' 2>/dev/null || true)
+  # Reported by C5b only, and never a predicate anywhere: see the liveness
+  # section above for why "nobody owns it" must not authorise anything. It is in
+  # the row because an operator triaging a kept tree needs to know whether there
+  # is anyone left to ask about its contents.
+  ASSIGNEE=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].assignee // empty' 2>/dev/null || true)
   META_TARGET=$(printf '%s' "$BEAD_JSON" | jq -r '.[0].metadata.target // empty' 2>/dev/null || true)
   # The branch the refinery was handed and, on success, deleted. Recorded by
   # the polecat's branch-setup step; the convention is the fallback for a bead
@@ -769,22 +978,49 @@ while IFS= read -r WT; do
     continue
   fi
 
+  # The ref both remaining checks measure against. Resolved once, before either
+  # runs, so C5b's report and C6's clearance can never name different targets for
+  # the same tree. Resolution only — C6 still verifies the ref itself, because
+  # only C6 turns an unresolvable target into an abstention from REMOVING.
+  TARGET=$(resolve_target "$WT" "$META_TARGET")
+
   # C5 clean — load-bearing. Nothing uncommitted or untracked may be discarded.
   if ! DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null); then
     row unverifiable "$BEAD" "$WT" "'git status' failed here; cleanliness NOT measured"
     n_unverifiable=$((n_unverifiable + 1)); continue
   fi
   if [ -n "$DIRTY" ]; then
-    row keep-dirty "$BEAD" "$WT" "$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ') uncommitted or untracked paths"
+    # C5b. The tree is already kept — the only question left is whether this
+    # refusal is routine or an escalation, and NOTHING below reads the answer.
+    DIRTY_N=$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ')
+    AGE_NOTE="closed $(age_brief "$AGE_SECS")"
+    if [ -n "$ASSIGNEE" ]; then OWNER_NOTE="assignee $ASSIGNEE"; else OWNER_NOTE="no owner"; fi
+    if ! staged_reachability "$WT" "$TARGET"; then
+      # Not measured is not a clean bill. It reports as the escalating verdict
+      # naming its own cause, never as the routine one.
+      row keep-orphaned "$BEAD" "$WT" \
+        "$AGE_NOTE, $OWNER_NOTE, $DIRTY_N uncommitted or untracked paths; staged content NOT measured: $REACH_WHY"
+      n_orphaned=$((n_orphaned + 1)); continue
+    fi
+    if [ "$STAGED_UNREACHABLE" -gt 0 ]; then
+      row keep-orphaned "$BEAD" "$WT" \
+        "$AGE_NOTE, $OWNER_NOTE, $DIRTY_N uncommitted or untracked paths, $STAGED_TOTAL staged ($STAGED_DELETIONS deletion(s)); $STAGED_UNREACHABLE staged blob(s) on NEITHER HEAD nor $TARGET — that content exists nowhere else. Do not remove without a human read"
+      n_orphaned=$((n_orphaned + 1)); continue
+    fi
+    if [ "$STAGED_TOTAL" -eq 0 ]; then
+      REACH_NOTE="nothing staged, so no index-only content is at risk"
+    else
+      REACH_NOTE="all $STAGED_TOTAL staged path(s) already on HEAD or $TARGET"
+    fi
+    # Untracked and unstaged content was NOT priced — say so, so the row cannot
+    # be read as "safe to delete" when only the index was cleared.
+    row keep-dirty "$BEAD" "$WT" \
+      "$DIRTY_N uncommitted or untracked paths; $REACH_NOTE (worktree-side content not priced)"
     n_kept=$((n_kept + 1)); continue
   fi
 
-  # C6 upstream — load-bearing, and patch-id rather than ancestry.
-  TARGET=$(normalize_target "${TARGET_OVERRIDE:-$META_TARGET}")
-  if [ -z "$TARGET" ]; then
-    TARGET=$(git -C "$WT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
-    [ -n "$TARGET" ] || TARGET=origin/main
-  fi
+  # C6 upstream — load-bearing, and patch-id rather than ancestry. $TARGET was
+  # resolved above; verifying it is C6's own business.
   if ! git -C "$WT" rev-parse --verify --quiet "$TARGET^{commit}" >/dev/null 2>&1; then
     row unverifiable "$BEAD" "$WT" "target ref '$TARGET' does not resolve; landing NOT measured"
     n_unverifiable=$((n_unverifiable + 1)); continue
@@ -860,10 +1096,15 @@ while IFS= read -r WT; do
   n_reaped=$((n_reaped + 1))
 done <"$CANDIDATES_FILE"
 
-printf '%s: %s candidate(s) under %s — reapable=%s reaped=%s failed=%s kept=%s unverifiable=%s\n' \
-  "$ME" "$TOTAL" "$RIG_WORKTREES" "$n_reap" "$n_reaped" "$n_failed" "$n_kept" "$n_unverifiable" >&2
+printf '%s: %s candidate(s) under %s — reapable=%s reaped=%s failed=%s kept=%s unverifiable=%s orphaned=%s\n' \
+  "$ME" "$TOTAL" "$RIG_WORKTREES" "$n_reap" "$n_reaped" "$n_failed" "$n_kept" "$n_unverifiable" "$n_orphaned" >&2
 
-if [ "$n_reap" -gt 0 ] || [ "$n_reaped" -gt 0 ] || [ "$n_failed" -gt 0 ] || [ "$n_unverifiable" -gt 0 ]; then
+# `orphaned` is a finding for the same reason `unverifiable` is: both name a tree
+# that will still be here next cycle and that no further reaper run can resolve.
+# A rig whose only anomaly is an orphaned tree must not exit 0 — that is the
+# "nothing to report" code, and it is what let an eternal refusal read as routine.
+if [ "$n_reap" -gt 0 ] || [ "$n_reaped" -gt 0 ] || [ "$n_failed" -gt 0 ] \
+   || [ "$n_unverifiable" -gt 0 ] || [ "$n_orphaned" -gt 0 ]; then
   exit 1
 fi
 exit 0
