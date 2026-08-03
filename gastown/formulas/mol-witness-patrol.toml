@@ -696,12 +696,111 @@ fields so the offending path can be traced.
 
 **Exit criteria:** No open+unassigned bead carries a branch without
 routing, excluding deliberate `auto_push=false` halts. Continue to
-`check-refinery` — do NOT exit the wisp here."""
+`check-blocked-beads` — do NOT exit the wisp here."""
+
+[[steps]]
+id = "check-blocked-beads"
+title = "Sweep blocked beads still holding a worktree or pool routing"
+needs = ["check-unroutable-beads"]
+description = """
+Every OTHER step of this patrol selects on open / in_progress / closed. None
+enumerates `status=blocked`, so a blocked bead is invisible to the whole
+patrol — including the steps whose stated purpose is finding work that fell
+out of the flow. A blocked bead can hold a worktree, hold stale routing, and
+park indefinitely with no step responsible for noticing (gp-6ph).
+
+Both live examples were found only by querying `--status=blocked` by hand,
+outside this formula:
+
+- **gp-yjx (P1)** — blocked, unassigned, routed to human, still holding a 17M
+  worktree. `recover-orphaned-beads` skips unassigned beads and never lists
+  blocked. `reap-landed-worktrees` DID see the tree and correctly refused it —
+  `keep-open ... status=blocked; work is still in flight` — because the reaper
+  keys on the bead's terminal state and blocked is not terminal. Nothing was in
+  flight. Both steps behaved correctly and the tree was owned by nobody.
+- **gp-fcd (P2)** — five days at `gc.routed_to=<rig>/gastown.polecat` while
+  blocked. A pool cannot claim a blocked bead, so the routing generated zero
+  demand and was silently inert.
+
+Same failure SHAPE as gp-982, which `check-unroutable-beads` above exists for:
+a bead that looks healthy to every automated check and is therefore never
+surfaced. Different axis — that one is open+unassigned with no routing, this
+one is blocked WITH routing or a tree.
+
+**Step 1: Measure. Do not hand-roll this query.**
+
+```bash
+BLOCKED_OUT=$(mktemp)
+BLOCKED_ERR=$(mktemp)
+gc gastown blocked-sweep >"$BLOCKED_OUT" 2>"$BLOCKED_ERR"
+BLOCKED_RC=$?
+```
+
+One TSV row per blocked bead on stdout, header on stderr:
+
+    verdict  id  priority  worktree  routed_to  title
+
+Verdicts: `parked` (holding nothing — healthy), `holding-worktree` and
+`inert-routing` (findings), `stale-worktree-ref` (`work_dir` set but the
+directory is already gone — reported, not a finding).
+
+One row per bead. A bead tripping both finding axes reports
+`holding-worktree`, but its `routed_to` column still names the pool and the
+stderr summary counts both axes, so read the summary rather than tallying
+verdicts.
+
+Exit codes: 0 = no findings, 1 = findings on stdout, 2 = could not run.
+
+**Step 2: Decide what the exit status means BEFORE reading any rows.**
+
+```bash
+if [ "$BLOCKED_RC" -eq 2 ] || { [ "$BLOCKED_RC" -ne 0 ] && [ ! -s "$BLOCKED_OUT" ]; }; then
+    echo "blocked-sweep DID NOT RUN: $(head -1 "$BLOCKED_ERR")"
+    # Carry this into the patrol summary as UNMEASURED. Never record a clean
+    # blocked layer on the strength of a check that did not run.
+fi
+```
+
+A non-zero exit with empty stdout is `gc` refusing to dispatch the subcommand
+— a city whose pack pin predates this command — not an empty blocked set.
+Collapsing those two restores the exact invisibility this step was added to
+end, just by way of deployment lag instead of a missing query.
+
+**Step 3: Report. Do NOT mutate. This is the whole discipline of this step.**
+
+```bash
+gc session nudge mayor/ "BLOCKED SWEEP: <n> bead(s) holding a worktree, <n> with inert pool routing in $GC_RIG. Report only — no bead was rerouted or unblocked."
+```
+
+Two things must not happen here, and both are tempting:
+
+- **Do not reroute an inert route.** `blocked` + `gc.routed_to=human` is
+  frequently a DELIBERATE park (the 2026-08-03 mayor standing rule on
+  gastownhall/gascity deliverables). Re-routing a parked bead resumes work an
+  operator explicitly stopped — strictly worse than the gap being closed,
+  because it overrides an intent that was stated rather than merely forgotten.
+  That is the same argument the `auto_push=false` exclusion carries in
+  `check-unroutable-beads`.
+- **Do not delete the worktree.** A blocked bead's tree may hold the only copy
+  of unpushed work. Whether a tree is safe to remove is
+  `reap-landed-worktrees`' predicate — `git status --porcelain` empty AND
+  `git cherry` reporting no `+` commits — and that step documents at length why
+  it must not be hand-rolled. The sweep reports existence and nothing more.
+
+A `holding-worktree` row that persists across consecutive patrols is worth
+mail rather than a nudge: it means the bead is parked long-term and the disk
+is not coming back without a human deciding either to unblock the bead or to
+accept the loss of whatever is in the tree.
+
+**Exit criteria:** The sweep ran and its rows were read, or it reported no
+blocked beads. If it DID NOT RUN, say so in the patrol summary — an unmeasured
+blocked layer is not a healthy one. Continue to `check-refinery` — do NOT exit
+the wisp here."""
 
 [[steps]]
 id = "check-refinery"
 title = "Check refinery queue health"
-needs = ["check-unroutable-beads"]
+needs = ["check-blocked-beads"]
 description = """
 Ensure the refinery is processing work and the queue is healthy.
 
