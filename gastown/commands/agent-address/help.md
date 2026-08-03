@@ -45,8 +45,19 @@ right for the session to exist at all. If the roster contradicts SELF, the
 roster wins — it is the definition.
 
 An unreadable roster is NOT treated as an empty one. A daemon blip must not
-condemn a correct address, so it downgrades the result to "unverified" and says
-so on stderr, rather than refusing.
+condemn a correct address, so where SELF can still derive one the result is
+downgraded to "unverified" and says so on stderr, rather than refusing.
+
+An unverified answer still has to rest on something, and only SELF qualifies:
+it comes from an identity the runtime had to get right for this session to
+exist. The candidate never qualifies. It is the value under suspicion, supplied
+precisely so it can be checked, and its SHAPE is not a check — `myrig/refinery`
+is a template that rendered successfully to the WRONG value, so it is
+structurally indistinguishable from the legitimate bare address of a city that
+binds nothing. Only the roster separates them. So with no roster AND no self
+identity there is nothing left to stand on, and this command refuses rather
+than return the candidate unverified (gp-d23). Being unable to check an address
+is not a reason to trust it.
 
 A candidate that loses is always reported. The repair is a symptom fix; the
 cause is a substitution that rendered wrong, and it stays broken at every other

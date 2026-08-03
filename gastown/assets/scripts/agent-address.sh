@@ -47,6 +47,18 @@
 # broken upstream and that must stay visible after this script repairs the
 # symptom.
 #
+# The CANDIDATE is never a fallback (gp-d23). It is only ever ACCEPTED when the
+# roster confirms it, never merely because it looks well-formed. The candidate is
+# the value under suspicion — the caller supplies it precisely so it can be
+# checked — so trusting it when nothing can check it would make this resolver
+# most permissive exactly where its evidence is weakest. When the roster is
+# unreadable, SELF is the only thing that can carry a resolution, because SELF is
+# derived from an identity the runtime had to get right for the session to exist.
+# With no roster AND no self identity, there is nothing to stand on: REFUSE.
+# gp-qmd is what accepting a shaped-but-unverified candidate actually costs — a
+# bead written to `gascity-packs/refinery` (no binding prefix), invisible to both
+# refinery discovery paths, stranded ~2h until a human repaired it by hand.
+#
 # Usage:
 #   agent-address.sh <role> [--candidate <addr>] [--quiet]
 #
@@ -94,7 +106,15 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,70p' "$0"
+            # Print the whole leading comment block, however long it is. This
+            # was a hardcoded `sed -n '2,70p'`, which silently truncated the
+            # moment anything was added above line 70 — and that is exactly what
+            # happened when this header grew (gp-d23): `Output`, `Exit codes`
+            # and `Env` all dropped out of `--help` at once. Losing `Exit codes`
+            # is the worst of those, because "1 = REFUSED, do not write an
+            # assignee" IS this script's contract. Ending at the first
+            # non-comment line keeps help and header in sync by construction.
+            awk 'NR < 2 { next } /^#/ { print; next } { exit }' "$0"
             exit 0
             ;;
         -*)
@@ -240,15 +260,41 @@ elif [ -n "$DERIVED" ] && structurally_sound "$DERIVED"; then
     # session's own identity, not from the template under suspicion.
     RESOLVED="$DERIVED"
     RESOLVED_VIA="self (roster unavailable — unverified)"
-elif [ -n "$CANDIDATE" ] && structurally_sound "$CANDIDATE"; then
-    RESOLVED="$CANDIDATE"
-    RESOLVED_VIA="candidate (roster unavailable, no self identity — unverified)"
 else
+    # There is deliberately NO branch here that accepts an unverified CANDIDATE
+    # (gp-d23). Falling back to the candidate when the roster cannot be read
+    # inverts the evidence ladder: the branch above refuses when the roster IS
+    # readable and disagrees, so accepting one when nothing can be checked at
+    # all makes the resolver most permissive exactly where it knows least.
+    #
+    # `structurally_sound` cannot stand in for the roster here, by construction.
+    # It rejects the shapes a substitution failure produces — an unrendered
+    # `{{...}}`, a leading `/`, an empty local part — i.e. templates that failed
+    # to render. `gascity-packs/refinery` is a template that rendered
+    # SUCCESSFULLY TO THE WRONG VALUE: no braces, no empty part, so it passes
+    # every structural check. Only the roster distinguishes it from the
+    # legitimate bare address of a city that binds nothing, and making the shape
+    # check binding-aware (say, requiring a dot) would false-refuse those cities.
+    #
+    # Refusing is the safe outcome, not a regression. mol-polecat-work's
+    # submit-and-exit halts on a non-zero resolver, leaving the bead in_progress
+    # and assigned to the live session — the state that formula documents as
+    # recoverable, and which also mails the witness. The alternative this
+    # replaces wrote an address no agent answers to, which is invisible to every
+    # discovery path and strands silently (gp-qmd dwelled ~2h before a human
+    # repaired it by hand).
     echo "agent-address: REFUSED — cannot resolve role '$ROLE'." >&2
     echo "  roster:       unreadable ($GC agent list --json)" >&2
     echo "  self-derived: ${DERIVED:-<could not derive: GC_AGENT and GC_TEMPLATE both unset>}" >&2
     echo "  candidate:    ${CANDIDATE:-<none supplied>}" >&2
-    echo "  Do NOT write an assignee." >&2
+    if [ -n "$CANDIDATE" ] && structurally_sound "$CANDIDATE"; then
+        echo "  The candidate is address-SHAPED, but shape is not evidence: a template" >&2
+        echo "  that renders to the wrong value looks identical to a correct one. With" >&2
+        echo "  no roster to check it against and no self identity to derive from," >&2
+        echo "  nothing here can tell them apart." >&2
+    fi
+    echo "  Do NOT write an assignee. A bead assigned to an address no agent" >&2
+    echo "  answers to is invisible to every discovery path and strands silently." >&2
     exit 1
 fi
 

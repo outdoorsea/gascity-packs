@@ -36,6 +36,12 @@
 #      field, including the two degenerate ones (empty prefix, unrendered
 #      template) and the legitimate one this must NOT break (an unbound city,
 #      where an empty prefix is correct).
+#   3b. The resolver never grows MORE permissive as its evidence gets WEAKER
+#      (gp-d23). A candidate is accepted because the roster CONFIRMS it, never
+#      because it merely looks well-formed. Shape is not evidence: a template
+#      that renders to the wrong value is structurally indistinguishable from a
+#      correct address, so with no roster and no self identity the only sound
+#      answer is to refuse.
 #   4. stdout stays capture-safe: exactly one address, no commentary, so
 #      `TARGET=$(...)` cannot swallow a diagnostic and write it as an assignee.
 #   5. The resolver is reachable as a pack command, since a formula can only
@@ -335,6 +341,60 @@ test_no_signal_at_all_refuses() {
     echo "ok: no usable signal anywhere -> refuse"
 }
 
+# 3h. THE REGRESSION (gp-d23): no roster, no identity, and a candidate that is
+#     perfectly well-FORMED. This is 3g's case with the one variable that
+#     mattered flipped, and it is the gap 3g left open: 3g's candidate carries
+#     `{{`, so it is rejected on SHAPE and never reaches the question of whether
+#     an unverifiable candidate may be trusted. This one passes every structural
+#     check, so shape has nothing left to say and only the roster could decide —
+#     and the roster is exactly what is missing.
+#
+#     Observed in production as gp-qmd: a bead written to `gascity-packs/refinery`
+#     (binding prefix silently absent). Nothing queries that form, so it was
+#     invisible to BOTH refinery discovery paths from creation until a human
+#     repaired it ~2h later.
+#
+#     The failure mode this guards is a resolver that grows MORE permissive as
+#     its evidence gets WEAKER: refusing when the roster is readable and
+#     disagrees, while accepting when the roster cannot be consulted at all.
+test_shaped_but_unverifiable_candidate_refuses() {
+    local out status
+    # Deliberately the production shape from gp-qmd: a rig-qualified address with
+    # an empty binding prefix. No braces, no leading/trailing slash, non-empty
+    # local part — it satisfies structurally_sound() completely.
+    local shaped="gascity-packs/refinery"
+
+    set +e
+    out=$(env -u GC_AGENT -u GC_TEMPLATE GC_BIN="$TMP/gc-does-not-exist" GC_RIG=myrig \
+        bash "$RESOLVER" refinery --candidate "$shaped" 2>"$TMP/stderr")
+    status=$?
+    set -e
+
+    [ "$status" -ne 0 ] \
+        || fail "an unverifiable candidate must be REFUSED, not returned unverified (exit was 0, stdout '$out')"
+    [ -z "$out" ] \
+        || fail "a refusal must write NO address to stdout — a caller does TARGET=\$(...) and would assign '$out'"
+    grep -q "REFUSED" "$TMP/stderr" || fail "a refusal must say so on stderr"
+
+    # Prove the refusal is about VERIFIABILITY, not about the candidate being
+    # malformed. Same candidate, same missing self identity — but now a roster
+    # that defines it — must resolve cleanly. Without this the test above would
+    # also pass if someone "fixed" the hole by tightening structurally_sound()
+    # (e.g. requiring a dot in the local part), which would false-refuse every
+    # city that binds nothing. That is explicitly NOT the intended fix; 3d guards
+    # the unbound city, and this pins the reason.
+    local roster_gc="$TMP/gc-defines-bare-refinery"
+    make_stub_gc "$roster_gc" "gascity-packs/refinery" "gascity-packs/witness"
+    local verified
+    verified=$(env -u GC_AGENT -u GC_TEMPLATE GC_BIN="$roster_gc" GC_RIG=gascity-packs \
+        bash "$RESOLVER" refinery --candidate "$shaped" 2>"$TMP/stderr") \
+        || fail "the same candidate must resolve once a roster CONFIRMS it — the refusal above must be about evidence, not shape"
+    [ "$verified" = "$shaped" ] \
+        || fail "roster-confirmed candidate must pass through as '$shaped', got '$verified'"
+
+    echo "ok: shaped-but-unverifiable candidate refused; same candidate accepted once the roster confirms it"
+}
+
 # 4. stdout is capture-safe.
 #
 # Callers use TARGET=$(...). If a diagnostic ever leaked to stdout it would be
@@ -349,6 +409,46 @@ test_stdout_is_capture_safe() {
         *[[:space:]]*) fail "stdout must contain no whitespace: '$out'" ;;
     esac
     echo "ok: stdout is a single bare address, safe to capture"
+}
+
+# 4b. `--help` documents the exit codes it is read for.
+#
+# The refusal contract lives in prose: "1 = REFUSED, do NOT write an assignee".
+# An operator who hits a refusal reads `--help` to find out what it meant, so
+# that section going missing costs exactly the reader who needs it most.
+#
+# It went missing once already, silently. The handler was `sed -n '2,70p'`, and
+# adding the gp-d23 rationale above it pushed `Output`, `Exit codes` and `Env`
+# past line 70 — no error, no test, just shorter help. The handler now ends at
+# the first non-comment line instead of a magic number, and this pins that:
+# whatever the header's length, `--help` must still reach the end of it.
+test_help_covers_the_whole_header() {
+    local help
+    help=$(env -u GC_BIN bash "$RESOLVER" --help) \
+        || fail "--help must exit 0"
+    # NOTE: no `</dev/null` on these greps, deliberately. The usual habit here is
+    # `grep -F -e "$pat" </dev/null` to stop grep blocking on a terminal when the
+    # pattern comes from a variable — but a here-string ALREADY supplies stdin,
+    # and bash applies redirections left to right, so a trailing `</dev/null`
+    # reopens fd 0 and silently discards the `<<<`. grep then reads nothing.
+    # Both assertion directions fail toward a WRONG answer, in opposite ways:
+    # the `||` checks below reported every section missing from a --help that
+    # plainly contained them, and the `&&` check below could never fire at all,
+    # since `grep -v` over zero lines never matches. zsh happens to resolve the
+    # same line the other way, so a hand-check at an interactive prompt agrees
+    # with neither. This file runs under bash; leave stdin to the here-string.
+    local section
+    for section in "Usage:" "Output:" "Exit codes:" "Env:"; do
+        grep -Fq -e "$section" <<<"$help" \
+            || fail "--help dropped the '$section' section — the header outgrew the printed range again"
+    done
+    # The refusal contract specifically, not just its heading.
+    grep -Fq -e "MUST NOT write an assignee" <<<"$help" \
+        || fail "--help must state the exit-1 contract, which is the whole reason to read it"
+    # Ending at the first non-comment line must not start spilling code.
+    grep -qv '^#' <<<"$help" \
+        && fail "--help leaked a non-comment line — it is printing past the header block"
+    echo "ok: --help covers the whole header, including the exit-code contract"
 }
 
 # 5. Reachable as a pack command. A formula cannot call assets/scripts directly
@@ -384,7 +484,9 @@ test_unbound_city_keeps_empty_prefix
 test_unknown_role_refuses
 test_unreadable_roster_degrades_not_refuses
 test_no_signal_at_all_refuses
+test_shaped_but_unverifiable_candidate_refuses
 test_stdout_is_capture_safe
+test_help_covers_the_whole_header
 test_command_is_dispatchable
 
 echo "PASS: refinery handoff address invariants hold"
