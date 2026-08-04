@@ -14,8 +14,11 @@
 #
 # Gas Town's canonical work chain is `worktree -> (push) -> branch -> (merge) ->
 # target`. Each transition moves the canonical copy forward and makes the
-# previous location disposable. This script asserts that the work has reached
-# the target, and only then treats the tree as garbage.
+# previous location disposable. The question a reap turns on is therefore "is
+# this directory still the only copy?" — not "did the work reach the target".
+# The two coincide for work that merges, which is why the target was the
+# original test; they come apart for work that never will, which is the leak
+# C6c closes.
 #
 # Two checks carry the safety argument. They are the ones that answer "can
 # reaping this directory lose work?":
@@ -24,6 +27,11 @@
 #                 untracked is sitting in the tree.
 #   C6 upstream   `git cherry <target> HEAD` reports no `+` commits — every
 #                 local commit's PATCH is already on the target.
+#
+# C6b and C6c are the two fallbacks consulted only after C6 has refused, and
+# each clears on its own terms: C6b that the work landed on the target with its
+# patch adjusted on the way in, C6c that the work is on origin whether or not it
+# ever landed. C6c is the weaker guarantee and says so in its evidence.
 #
 # C5b is a third check but NOT a third clearance: it grades a tree C5 has already
 # refused, so an operator can tell an eternal refusal holding unrecoverable
@@ -203,34 +211,22 @@
 # bill of health.
 #
 # ## C6c: the tree is disposable once the work is PUBLISHED, not only once it
-# ##      is MERGED (gp-qmd)
+# ##      is MERGED (gp-qmd, widened by gp-98n)
 #
 # C6 and C6b both answer "did this work reach the target?". That is a proxy for
 # the question reaping actually turns on — "is this directory still the only
-# copy?" — and for one class of bead the proxy can never be satisfied, because
-# the work is never going to the target BY DESIGN. A bead closed with
-# `do_not_merge` / `recalled_by_owner` is exactly that: its owner recalled it,
-# the refinery will never merge it, so `git cherry` reports `+` on every cycle
-# forever and no predicate in the script can ever collect the tree. Nothing else
-# in the city owns that directory's death, so it leaks permanently.
+# copy?" — and for a whole class of bead the proxy can never be satisfied,
+# because the work is never going to the target at all. Its `git cherry` reports
+# `+` on every cycle forever, no predicate in the script can ever collect the
+# tree, and nothing else in the city owns that directory's death. It leaks
+# permanently — the gp-a7z shape reached by a different route.
 #
-# Measured live (2026-08-03), meety-local's ml-94dh — closed 2026-07-31,
-# do_not_merge=true, recalled_by_owner=true, clean tree:
+# So C6c does not ask about the target. It asks the question directly:
 #
-#   HEAD                                     a6ec0cb
-#   ls-remote origin polecat/ml-94dh         a6ec0cb   <-- identical
-#   cherry origin/main HEAD                  + a6ec0cb
-#   merge-base --is-ancestor HEAD origin/main  no
+#   the tree is CLEAN, and every local commit is reachable from the bead's
+#   branch on origin => the directory is redundant, whatever became of the work.
 #
-# The work is not on main and never will be. It is nonetheless fully backed up:
-# origin carries it under the branch the bead itself records. The canonical
-# chain is `worktree -> (push) -> branch -> (merge) -> target`, and it is the
-# FIRST transition, not the last, that makes the directory redundant.
-#
-# C6c clears a tree only on the CONJUNCTION of two facts, because each fails in
-# the opposite direction on its own.
-#
-# PUBLICATION is the measurement:
+# PUBLICATION is that measurement, and it is exact:
 #
 #   * `ls-remote` the bead's own `metadata.branch` — a LIVE query, never a
 #     remote-tracking ref. A stale `origin/*` ref left behind by a deleted
@@ -238,44 +234,63 @@
 #     is the one direction this script never fails in;
 #   * HEAD must be contained in the tip that query returns. Every commit C6
 #     flagged is reachable from HEAD, so containment covers all of them at once,
-#     and a tree holding local commits past the pushed tip fails it.
+#     and a tree holding local commits past the pushed tip fails it;
+#   * the tip must come from the EXACT ref (see origin_branch_probe) — a pattern
+#     match on a decoy is not a publication.
 #
 # Both facts come from the same `ls-remote` C6b already runs for its merge
 # attestation, so this costs no extra network call.
 #
-# RECALL is the authorisation: `do_not_merge` or `recalled_by_owner` on a bead
-# C2 has already found closed.
+# ### Why disposition is NOT a second conjunct (gp-98n)
 #
-# Neither is sufficient alone, and the asymmetry is the whole design:
+# C6c shipped requiring publication AND a RECALL — `do_not_merge` or
+# `recalled_by_owner` on the closed bead — on the argument that publication
+# alone would reap against `origin/polecat/*`, a transient handoff artifact that
+# mol-refinery-patrol's Cleanup deletes after a merge.
 #
-#   * PUBLICATION ALONE would let any closed bead's tree go the moment its
-#     branch was pushed. But `origin/polecat/*` is a transient handoff artifact,
-#     not a durable copy — mol-refinery-patrol's Cleanup step deletes it after a
-#     merge. Reaping against it would trade a leaked directory for a race with
-#     another component's garbage collector, on work that never reached a
-#     protected ref. The suite pins four such cases as `keep-unmerged` and they
-#     stay pinned.
-#   * RECALL ALONE — the tempting cheap fix, "skip keep-unmerged outright for a
-#     recalled bead" — deletes the ONLY copy of a recalled bead whose branch was
-#     never pushed or has since been deleted. "Do not merge" is not "destroy",
-#     and a flag on a bead is not evidence about what is on disk.
+# That conjunct was dropped, on evidence and on principle.
 #
-# Their INTERSECTION is exactly the class the leak lives in: the refinery will
-# never merge this bead, so it will never run the cleanup that deletes the
-# branch either — which is what makes origin a durable copy here and not in the
-# general case. ml-94dh records that intent on the bead itself:
-# `branch_preserved: polecat/ml-94dh @ a6ec0cb — ... NOT for the merge queue`.
+# On EVIDENCE: those two flags are not the only way a bead becomes terminal, and
+# the leak survived the conjunct by exactly one metadata key. Measured live
+# 2026-08-04, meety-local, both clean, both closed, both refused every cycle:
+#
+#   ml-94dh  50M  gc.work_outcome=no-op      a6ec0cb == origin/polecat/ml-94dh
+#   ml-apes  55M  gc.work_outcome=abandoned  5a88f5e == origin/polecat/ml-apes
+#
+# ml-apes carries NEITHER recall flag, so the recall conjunct vetoed it and 55M
+# of provably-redundant disk stayed parked. Enumerating the dispositions that
+# mean "this will never merge" is a losing game — each new spelling reopens the
+# leak silently, and reading them correctly is a dependency on another
+# component's vocabulary. Redundancy is measurable without asking why.
+#
+# On PRINCIPLE: the branch-deletion objection does not survive being made
+# precise. The deleter named is the refinery's POST-MERGE cleanup, which removes
+# a branch only once its content is on the target — a protected ref. So the
+# sequence "C6c reaps a published tree, refinery later deletes the branch"
+# leaves the content on the target, never nowhere. The hazard would be a sweep
+# that deletes UNMERGED branches, and that is a sequencing constraint on such a
+# sweep rather than a property this script can assert: gp-98n is recorded as
+# BLOCKING gp-9yg (bulk deletion of stale `origin/polecat/*`) for exactly that
+# reason. Deleting origin/polecat/ml-apes first would strand 5a88f5e in a
+# detached-HEAD tree the reaper still refuses — converting a redundant tree into
+# a unique-content one.
+#
+# What was load-bearing in the old conjunct is kept, and it was never the flags:
+# it is that publication must be MEASURED. Every refusal direction below is
+# unchanged — an absent branch, a tip that does not contain HEAD, a decoy ref, a
+# transport failure — because each of those means the tree may hold the only
+# copy. Only the "and the bead said it would never merge" clause is gone.
 #
 # C6c still reaps on a WEAKER guarantee than C6/C6b, and its evidence string
 # says so rather than letting `reap` imply a merge. What it guarantees is
 # redundancy: the directory can be reconstructed with `git fetch` +
 # `git worktree add`.
 #
-# A recalled tree that is NOT published stays kept — correctly, it is the only
-# copy — but its row now says the bead can never merge and no predicate can ever
-# collect it, so an operator can dispose of it instead of reading the row as a
-# merge still pending. That is the bounded-policy half of the fix; the retention
-# is deliberate, only the silence was the bug.
+# RECALL survives as description, not authorisation. A recalled tree that is NOT
+# published stays kept — correctly, it is the only copy — and its row says the
+# bead can never merge and no predicate can ever collect it, so an operator can
+# dispose of it instead of reading the row as a merge still pending. See
+# recall_note.
 #
 # ### "Unpublished" is a claim that must be measured before it is printed
 #
@@ -342,9 +357,9 @@
 #                 keep-*; escalated, unlike every other keep-*.
 #   keep-unmerged <TAB> <bead> <TAB> <path> <TAB> <n> patches not on <target>,
 #                 plus why C6b did not clear it either, plus the MEASURED
-#                 publication state — so a tree that really is the only copy is
-#                 distinguishable from a near-miss, and from one whose work is
-#                 safely on origin
+#                 publication state that C6c also declined on — so a tree that
+#                 really is the only copy is distinguishable from a near-miss,
+#                 and from one whose publication simply could not be measured
 #   keep-locked   <TAB> <bead> <TAB> <path> <TAB> worktree is locked
 #   keep-self     <TAB> <bead> <TAB> <path> <TAB> we are running inside it
 #   unverifiable  <TAB> <bead> <TAB> <path> <TAB> <why it was NOT measured>
@@ -736,17 +751,18 @@ published_state() {
 # the recall path and could reasonably arrive as strings, so both spellings are
 # normalised through `tostring` rather than matched literally.
 #
-# LOAD-BEARING, unlike C5b's grading next door: this is C6c's AUTHORISATION
-# conjunct, so whatever this function returns non-empty for is a tree the reaper
-# may delete. It is not sufficient alone — C6c also requires measured
-# publication, and recall alone would destroy the only copy of a bead whose
-# branch was never pushed — but "insufficient alone" is not "authorises
-# nothing", and adding a flag here or loosening the truthiness test widens what
-# gets removed. Change it with the same care as C6 itself.
+# DESCRIPTIVE, like C5b's grading next door and unlike C6/C6b/C6c: nothing is
+# removed on the strength of what this returns. It was C6c's authorisation
+# conjunct once; gp-98n dropped that, because the flags enumerate only two of
+# the ways a bead becomes terminal and ml-apes — `gc.work_outcome=abandoned`,
+# neither flag set — leaked 55M behind the veto. See the C6c section.
 #
-# On the trees C6c does NOT clear it has a second, purely descriptive use: it
-# lets the refusal say that no predicate will ever collect this tree, so an
-# operator disposes of it rather than reading the row as a merge still pending.
+# What it is for now is the REFUSAL rows: on a tree C6c could not clear it says
+# no predicate will ever collect this one, so an operator disposes of it rather
+# than reading the row as a merge still pending. On a tree C6c did clear it is
+# appended to the evidence as context. Both spellings of the flags are still
+# normalised, because a row that silently stops appearing is a row nobody
+# notices has stopped.
 recall_note() {
   printf '%s' "$1" | jq -r '
     (.[0].metadata // {}) as $m
@@ -1247,64 +1263,55 @@ while IFS= read -r WT; do
   esac
 
   if [ "${AHEAD:-0}" -gt 0 ]; then
-    # C6c runs FIRST and ALWAYS, whatever it concludes: its note is the measured
-    # publication fact every refusal below reports, replacing the sentence that
-    # used to be inferred from the target walk.
-    PUBLISHED=0
-    if published_state "$WT" "$MERGE_BRANCH" "$BRANCH_STATE" "$ORIGIN_TIP"; then
-      PUBLISHED=1
+    # C6b runs FIRST — not because it is cheaper (it is not; it walks the
+    # target's subjects while C6c is one ancestry test) but because it is the
+    # STRONGER claim. Both clearances are equally safe, so the order decides
+    # only which evidence an operator reads, and "the work landed on the target"
+    # is worth more on a row than "the work is also on origin". A merged tree
+    # usually has no branch left on origin anyway, so C6c would abstain on it
+    # and the walk happens either way.
+    #
+    # Every arm reports WHICH signal declined, because a bare `keep-unmerged`
+    # reads as the reaper working correctly and is how the gp-psa leak stayed
+    # invisible for three cycles.
+    KEEP_WHY=''
+    if ! landed_by_subject "$WT" "$TARGET" "$BEAD" "$CHERRY"; then
+      KEEP_WHY="subject check declined: $SUBJ_WHY"
+    elif ! merge_attested "$WT" "$TARGET" "$MERGE_BRANCH" "$BRANCH_STATE" "$META_MERGED_SHA"; then
+      KEEP_WHY="every subject DID land on $TARGET, but no merge is attested: $ATTEST_NOTE"
     fi
 
-    # Publication is the MEASUREMENT; recall is the AUTHORISATION. Both are
-    # required, and neither is sufficient, because they fail in opposite
-    # directions:
-    #
-    #   * publication alone would let any closed bead's tree go as soon as its
-    #     branch was pushed. But `origin/polecat/*` is a transient handoff
-    #     artifact — mol-refinery-patrol's Cleanup deletes it after a merge — so
-    #     it is not the durable copy the target is. Reaping against it would
-    #     trade a leaked directory for a race with another component's garbage
-    #     collector, on work that never reached a protected ref. Four cases in
-    #     the test suite pin that refusal and they stay pinned.
-    #   * recall alone would delete the ONLY copy of a recalled bead whose
-    #     branch was never pushed. "Do not merge" is not "destroy", and a flag
-    #     on a bead is not evidence about what is on disk.
-    #
-    # Their intersection is exactly the class with no applicable predicate: the
-    # refinery will never merge this bead, so it will never run the cleanup that
-    # deletes the branch either, which is what makes origin a durable copy HERE
-    # and not in the general case. ml-94dh says so on the bead itself —
-    # `branch_preserved: polecat/ml-94dh @ a6ec0cb ... NOT for the merge queue`.
-    if [ "$PUBLISHED" -eq 1 ] && [ -n "$RECALLED" ]; then
-      # Deliberately weaker evidence than the merge paths, and worded so `reap`
-      # cannot be misread as "this landed". It says only what was measured:
-      # the tree is redundant with origin, so removing it loses nothing.
-      EVIDENCE="closed $CLOSED_AT; clean; $AHEAD patch(es) NOT on $TARGET and never will be — bead is terminal-and-will-never-merge ($RECALLED); $PUB_NOTE, so the tree is redundant and recoverable with 'git fetch' + 'git worktree add'"
-    else
-      # C6b. Ask the merge question before parking this tree forever. Every arm
-      # reports WHICH signal declined, because a bare `keep-unmerged` reads as
-      # the reaper working correctly and is how this leak stayed invisible for
-      # three cycles. Each row also carries the MEASURED publication state —
-      # never an inference from the target walk.
-      KEEP_WHY=''
-      if ! landed_by_subject "$WT" "$TARGET" "$BEAD" "$CHERRY"; then
-        KEEP_WHY="subject check declined: $SUBJ_WHY"
-      elif ! merge_attested "$WT" "$TARGET" "$MERGE_BRANCH" "$BRANCH_STATE" "$META_MERGED_SHA"; then
-        KEEP_WHY="every subject DID land on $TARGET, but no merge is attested: $ATTEST_NOTE"
-      fi
-      if [ -n "$KEEP_WHY" ]; then
-        DETAIL="$AHEAD commit(s) whose patches are not on $TARGET; $KEEP_WHY; $PUB_NOTE"
-        # A recalled bead can never satisfy any predicate here — the refinery
-        # will not merge it and C6c just found no copy on origin. Saying so is
-        # the difference between a row an operator can act on and one that
-        # reads as a merge still pending, forever.
-        if [ -n "$RECALLED" ]; then
-          DETAIL="$DETAIL; bead is terminal-and-will-never-merge ($RECALLED), so no predicate can ever collect this tree — operator disposition needed"
-        fi
-        row keep-unmerged "$BEAD" "$WT" "$DETAIL"
-        n_kept=$((n_kept + 1)); continue
-      fi
+    if [ -z "$KEEP_WHY" ]; then
       EVIDENCE="closed $CLOSED_AT; clean; $AHEAD patch(es) adjusted on the way in, every subject landed on $TARGET; $ATTEST_NOTE"
+    elif published_state "$WT" "$MERGE_BRANCH" "$BRANCH_STATE" "$ORIGIN_TIP"; then
+      # C6c. The work did not reach the target and may never — but the target was
+      # only ever a proxy for "is this the only copy", and origin answers that
+      # directly. Publication is the whole test: the disposition conjunct this
+      # used to carry vetoed ml-apes for want of a flag while its work sat on
+      # origin at the identical sha (gp-98n). See the C6c section.
+      #
+      # Deliberately weaker evidence than the merge paths, and worded so `reap`
+      # cannot be misread as "this landed". It says only what was measured: the
+      # tree is redundant with origin, so removing it loses nothing. The recall,
+      # when there is one, is context on that row rather than the reason for it.
+      EVIDENCE="closed $CLOSED_AT; clean; $AHEAD patch(es) NOT on $TARGET; $PUB_NOTE, so the tree is redundant and recoverable with 'git fetch' + 'git worktree add'"
+      if [ -n "$RECALLED" ]; then
+        EVIDENCE="$EVIDENCE; bead is terminal-and-will-never-merge ($RECALLED), so it was never going to reach $TARGET"
+      fi
+    else
+      # Neither route cleared it. The row carries both refusals: why the merge
+      # signals declined, and the MEASURED publication state C6c declined on —
+      # never an inference from the target walk.
+      DETAIL="$AHEAD commit(s) whose patches are not on $TARGET; $KEEP_WHY; $PUB_NOTE"
+      # A recalled bead can never satisfy any predicate here — the refinery will
+      # not merge it and C6c just found no copy on origin. Saying so is the
+      # difference between a row an operator can act on and one that reads as a
+      # merge still pending, forever.
+      if [ -n "$RECALLED" ]; then
+        DETAIL="$DETAIL; bead is terminal-and-will-never-merge ($RECALLED), so no predicate can ever collect this tree — operator disposition needed"
+      fi
+      row keep-unmerged "$BEAD" "$WT" "$DETAIL"
+      n_kept=$((n_kept + 1)); continue
     fi
   else
     EVIDENCE="closed $CLOSED_AT; clean; 0 patches ahead of $TARGET; $ORIGIN_NOTE"

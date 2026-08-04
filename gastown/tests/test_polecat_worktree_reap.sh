@@ -31,6 +31,20 @@ SCRIPT="$ROOT/gastown/assets/scripts/polecat-worktree-reap.sh"
 #     origin/polecat/* refs on meety-local, 53 on tallyup, 2026-07-31).
 # Both are now pinned in the permissive direction, and the refusal ROWS are
 # pinned too: a row that names the wrong clause is what kept gp-psa invisible.
+#
+# gp-98n added a fourth: PUBLICATION alone collects a tree. C6c shipped needing
+# publication AND a recall flag, and ml-apes — `gc.work_outcome=abandoned`,
+# neither flag — leaked 55M with its work on origin at the identical sha. Every
+# refusal that guarded the recall conjunct is preserved BELOW the flip, and it
+# is worth saying which ones they are, because relaxing a clearance is where a
+# reaper destroys work: publication must still be measured against the EXACT
+# ref, must still contain the tree's HEAD, and must still keep the tree when
+# `ls-remote` could not answer. What went is only "and the bead said so".
+#
+# The consequence for the C6b fixtures is mechanical and worth knowing before
+# reading them: a tree whose branch is merely pushed is now REAPED, so isolating
+# a C6b arm needs `push_divergent_tip` rather than `push_branch` — origin
+# carrying the ref, but not this tree's work.
 
 fail() {
     echo "FAIL: $*" >&2
@@ -241,6 +255,32 @@ land_adjusted() {
 # is local-only, which is the same shape as "already deleted after merge".
 push_branch() { git_c push --quiet origin "$1"; }
 
+# push_divergent_tip <branch> — put the branch on origin at a commit this tree
+# does NOT contain. The two states a C6b fixture has to hold apart are otherwise
+# unreachable together since gp-98n:
+#
+#   * the branch must be PRESENT on origin, or C6b's branch-absence proxy
+#     attests the merge on its own and whichever arm the test is about is never
+#     consulted;
+#   * the tree must NOT be published, or C6c clears it before the arm under test
+#     can refuse — and then a passing `keep-unmerged` assertion would be pinning
+#     nothing at all.
+#
+# `push_branch` gives the first and destroys the second. This gives both: origin
+# carries the ref, at work that is not this tree's. The shape is a real one — a
+# force-push after a rebase, or a recycled branch name — and it is exactly the
+# state `published_state` must refuse, so the fixtures double as its coverage.
+push_divergent_tip() {
+    local branch="$1" sha
+    git_c checkout --quiet --detach origin/main
+    echo "origin moved on without this tree" >>"$REPO/README.md"
+    git_c add -A
+    git_c commit --quiet -m "chore: an unrelated tip pushed to $branch"
+    sha=$(git_c rev-parse HEAD)
+    git_c push --quiet --force origin "$sha:refs/heads/$branch"
+    git_c checkout --quiet main
+}
+
 # add_tree <agent> <bead> [branch] — a per-bead worktree at the canonical path.
 # With no branch, the tree is detached at origin/main, which is the shape a
 # polecat leaves behind after submit-and-exit detaches and deletes its branch.
@@ -357,14 +397,19 @@ test_adjusted_landing_is_reapable_though_patch_id_differs() {
     [ ! -d "$wt" ] || fail "the tree was not actually removed"
 }
 
-test_adjusted_landing_with_branch_still_on_origin_is_kept() {
-    # The subject signal alone is not a merge. If the branch the refinery
-    # merges is still on origin, no merge has been confirmed — the matching
-    # subject could be a partial landing, or another bead's commit that happens
-    # to name this one. C6b requires the refinery's own after-merge signal too.
+test_subject_match_alone_is_not_a_merge_attestation() {
+    # The subject signal alone is not a merge. If the branch the refinery merges
+    # is still on origin, no merge has been confirmed — the matching subject
+    # could be a partial landing, or another bead's commit that happens to name
+    # this one. C6b requires the refinery's own after-merge signal too.
+    #
+    # The branch is on origin at an unrelated tip rather than at this tree's
+    # work: since gp-98n a genuinely published tree is collected by C6c, so a
+    # plain `push_branch` here would reap for a reason that has nothing to do
+    # with the attestation this test exists to pin.
     make_world
     land_adjusted polecat/gp-live live.txt >/dev/null
-    push_branch polecat/gp-live
+    push_divergent_tip polecat/gp-live
 
     local wt
     wt=$(add_tree agentA gp-live polecat/gp-live)
@@ -372,10 +417,12 @@ test_adjusted_landing_with_branch_still_on_origin_is_kept() {
     run_reap --reap
 
     [ "$(verdict_of gp-live)" = "keep-unmerged" ] ||
-        fail "a subject match with the branch still on origin must be kept; got '$(verdict_of gp-live)'"
+        fail "a subject match with no attestation must be kept; got '$(verdict_of gp-live)'"
     [ -d "$wt" ] || fail "a tree was reaped without the merge ever being confirmed"
     grep -Fq 'still present' <<<"$OUT" ||
         fail "the row must say the branch is still on origin; got: $OUT"
+    grep -Fq 'no merge is attested' <<<"$OUT" ||
+        fail "the row must name the attestation as the clause that declined; got: $OUT"
 }
 
 test_subject_with_no_work_reference_is_never_reaped() {
@@ -448,7 +495,9 @@ test_merged_sha_attests_a_merge_the_branch_state_cannot() {
     # subjects matched. merged_sha is the same fact recorded first-hand.
     make_world
     land_adjusted polecat/gp-sha shaland.txt >/dev/null
-    push_branch polecat/gp-sha           # never deleted: the proxy is unavailable
+    # Present on origin so the branch-absence proxy is unavailable, but not
+    # carrying this tree's work, so C6c does not clear it first (gp-98n).
+    push_divergent_tip polecat/gp-sha
     local landed
     landed=$(git_c rev-parse origin/main)
 
@@ -479,7 +528,7 @@ test_merged_sha_not_on_the_target_does_not_attest() {
     # merge that is not on the target is not a merge.
     make_world
     land_adjusted polecat/gp-stale stale.txt >/dev/null
-    push_branch polecat/gp-stale
+    push_divergent_tip polecat/gp-stale   # proxy unavailable, publication declines
 
     local wt
     wt=$(add_tree agentA gp-stale polecat/gp-stale)
@@ -505,7 +554,7 @@ test_unresolvable_merged_sha_does_not_attest() {
     # simply is not here fails one arm further along.
     make_world
     land_adjusted polecat/gp-unk unknown.txt >/dev/null
-    push_branch polecat/gp-unk
+    push_divergent_tip polecat/gp-unk     # proxy unavailable, publication declines
 
     local wt
     wt=$(add_tree agentA gp-unk polecat/gp-unk)
@@ -666,19 +715,74 @@ test_keep_unmerged_says_which_signal_declined() {
         fail "the row must still name the clause that declined; got: $OUT"
 }
 
-# --- gp-qmd: the recalled bead no predicate could ever satisfy ---------------
+# --- gp-qmd/gp-98n: the tree no predicate could ever satisfy -----------------
 # C6 and C6b both answer "did this reach the target?", a proxy for the question
-# reaping turns on — "is this directory still the only copy?". For a bead closed
-# with do_not_merge / recalled_by_owner the proxy can NEVER be satisfied: the
-# work is not going to the target by design. The tree leaks permanently, and the
-# refusal asserted something false about it.
+# reaping turns on — "is this directory still the only copy?". For work that is
+# never going to the target the proxy can NEVER be satisfied, so the tree leaks
+# permanently and the refusal asserted something false about it.
+#
+# gp-qmd read that class off the bead's recall flags. gp-98n stopped: the flags
+# name only two of the ways a bead becomes terminal, and the tree measured below
+# is collected on what is ON ORIGIN, whatever the bead says about why.
 
-test_recalled_and_published_tree_is_collected() {
-    # THE leak. meety-local/ml-94dh, verified read-only 2026-08-03: closed
-    # 2026-07-31, do_not_merge, recalled_by_owner, clean tree, and its branch on
-    # origin at the IDENTICAL sha (a6ec0cb). `git cherry` reports `+` on every
-    # cycle forever, C6b's merge attestation can never arrive because no merge
-    # is ever coming, and nothing else in the city owns that directory's death.
+test_published_tree_is_collected_whatever_the_disposition() {
+    # THE leak, in the shape that outlived the first fix. meety-local/ml-apes,
+    # mayor-verified 2026-08-04: closed 2026-08-03, clean, DETACHED head at
+    # 5a88f5e, `gc.work_outcome=abandoned`, and NEITHER recall flag — with
+    # origin carrying refs/heads/polecat/ml-apes at that identical sha. 55M of
+    # provably-redundant disk that C6c's recall conjunct vetoed.
+    #
+    # No metadata is stamped here at all beyond what `bead` writes: that is the
+    # point. The clearance must come from the measurement, not from a
+    # disposition this script has to know how to spell.
+    make_world
+    git_c checkout --quiet -b polecat/gp-aband origin/main
+    echo "abandoned work" >"$REPO/abandoned.txt"
+    commit_all "feat: built, then abandoned (gp-aband)"
+    push_branch polecat/gp-aband
+    git_c checkout --quiet main
+
+    local wt
+    wt=$(add_tree agentA gp-aband polecat/gp-aband)
+    # Detached, like the live tree: the polecat's submit step leaves it this way,
+    # so publication must be measured against HEAD rather than a checked-out
+    # branch name.
+    git -C "$wt" checkout --quiet --detach HEAD
+
+    # Every premise, or this passes through a path it is not testing.
+    [ -n "$(git -C "$wt" cherry origin/main HEAD | grep '^+' || true)" ] ||
+        fail "fixture is wrong: the abandoned commit must be missing from the target"
+    [ "$(git -C "$wt" rev-parse HEAD)" = \
+      "$(git_c ls-remote origin refs/heads/polecat/gp-aband | awk '{print $1}')" ] ||
+        fail "fixture is wrong: origin must carry this tree's HEAD under its own branch"
+    [ -z "$(git -C "$wt" symbolic-ref -q HEAD || true)" ] ||
+        fail "fixture is wrong: the tree must be detached, like the measured one"
+
+    bead gp-aband closed "$(long_ago)"
+    run_reap
+
+    [ "$(verdict_of gp-aband)" = "reap" ] ||
+        fail "a published tree must be collectable with no recall flag at all; got '$(verdict_of gp-aband)' / rows: $OUT"
+    grep -Fq 'redundant' <<<"$OUT" ||
+        fail "the evidence must say the tree is redundant; got: $OUT"
+    # The wording pin: C6c reaps on a WEAKER guarantee than the merge paths and
+    # the row must not let `reap` be read as "this landed". An operator who
+    # believes the work merged will not go looking for it on origin.
+    ! grep -Fq 'landed on origin/main' <<<"$OUT" ||
+        fail "a publication reap must not claim the work reached the target; got: $OUT"
+    grep -Fq 'published: origin/polecat/gp-aband' <<<"$OUT" ||
+        fail "the evidence must name the measurement that cleared it; got: $OUT"
+
+    run_reap --reap
+    [ ! -d "$wt" ] || fail "the tree was not actually removed"
+}
+
+test_recall_is_context_on_the_row_not_the_authorisation() {
+    # meety-local/ml-94dh: the case gp-qmd measured, closed 2026-07-31 with
+    # do_not_merge, recalled_by_owner AND `gc.work_outcome=no-op`, its branch on
+    # origin at the identical sha. It is still collected — but the flag must no
+    # longer be what does it, or the next terminal disposition nobody thought to
+    # enumerate leaks exactly as ml-apes did.
     make_world
     git_c checkout --quiet -b polecat/gp-recall origin/main
     echo "recalled work" >"$REPO/recalled.txt"
@@ -688,32 +792,23 @@ test_recalled_and_published_tree_is_collected() {
 
     local wt
     wt=$(add_tree agentA gp-recall polecat/gp-recall)
-
-    # Both premises, or this passes through a path it is not testing.
-    [ -n "$(git -C "$wt" cherry origin/main HEAD | grep '^+' || true)" ] ||
-        fail "fixture is wrong: the recalled commit must be missing from the target"
-    [ "$(git -C "$wt" rev-parse HEAD)" = \
-      "$(git_c ls-remote origin refs/heads/polecat/gp-recall | awk '{print $1}')" ] ||
-        fail "fixture is wrong: origin must carry this tree's HEAD under its own branch"
-
     bead gp-recall closed "$(long_ago)"
 
-    # Without the recall this is an ordinary unmerged tree and must stay kept,
-    # so the flip below is unambiguously the recall and not some other
-    # relaxation of C6/C6b.
+    # The flip gp-98n is: publication clears this BEFORE any flag is read.
     run_reap
-    [ "$(verdict_of gp-recall)" = "keep-unmerged" ] ||
-        fail "precondition: with no recall flag this tree must be kept; got '$(verdict_of gp-recall)'"
+    [ "$(verdict_of gp-recall)" = "reap" ] ||
+        fail "publication alone must collect this tree; got '$(verdict_of gp-recall)'"
+    ! grep -Fq 'terminal-and-will-never-merge' <<<"$OUT" ||
+        fail "with no flag set the row must not claim a recall; got: $OUT"
 
+    # With the flag, the same verdict — plus the context. Losing this note would
+    # be invisible: the verdict does not change, so only the row does.
     set_meta_json gp-recall do_not_merge true
     run_reap
-
     [ "$(verdict_of gp-recall)" = "reap" ] ||
-        fail "a recalled bead whose work is on origin must be collectable; got '$(verdict_of gp-recall)' / rows: $OUT"
-    grep -Fq 'terminal-and-will-never-merge' <<<"$OUT" ||
-        fail "the evidence must name the recall as what authorised it; got: $OUT"
-    grep -Fq 'redundant' <<<"$OUT" ||
-        fail "the evidence must say the tree is redundant, NOT that the work merged; got: $OUT"
+        fail "a recall must not change the verdict; got '$(verdict_of gp-recall)'"
+    grep -Fq 'terminal-and-will-never-merge (do_not_merge)' <<<"$OUT" ||
+        fail "the row must carry the recall as context; got: $OUT"
 
     run_reap --reap
     [ ! -d "$wt" ] || fail "the tree was not actually removed"
@@ -724,7 +819,12 @@ test_recall_alone_never_destroys_the_only_copy() {
     # terminal, so keep-unmerged is skipped outright" — deletes the only copy of
     # a recalled bead whose branch was never pushed. "Do not merge" is not
     # "destroy", and a flag on a bead is not evidence about what is on disk.
-    # Recall AUTHORISES; publication MEASURES; neither works alone.
+    #
+    # gp-98n makes this MORE load-bearing rather than less. The disposition is no
+    # longer half of a conjunction that publication would have vetoed anyway; it
+    # is read only for the row. So the only thing standing between this tree and
+    # deletion is the measurement, and a future "the bead says it is terminal, so
+    # just skip the refusal" shortcut has nothing left to catch it but this test.
     make_world
     git_c checkout --quiet -b polecat/gp-onlycopy origin/main
     echo "the only copy" >"$REPO/onlycopy.txt"
@@ -746,58 +846,49 @@ test_recall_alone_never_destroys_the_only_copy() {
         fail "an uncollectable tree must ask for disposition, not read as a merge still pending; got: $OUT"
 }
 
-test_publication_alone_does_not_authorise_a_reap() {
-    # The mirror refusal. Publication measures redundancy; it does not authorise
-    # removal by itself, because `origin/polecat/*` is a transient handoff
-    # artifact — mol-refinery-patrol's Cleanup step deletes it after a merge. A
-    # reap keyed on it would race another component's garbage collector on work
-    # that never reached a protected ref. Only a bead that will NEVER enter that
-    # queue makes origin a durable copy.
+test_a_deleted_origin_branch_is_not_a_publication() {
+    # The hazard gp-98n's widening introduces, and the reason publication is a
+    # LIVE `ls-remote` rather than a look at `refs/remotes/origin/*`. Once
+    # publication alone collects a tree, a stale remote-tracking ref left behind
+    # by a branch that origin no longer has would authorise deleting the only
+    # copy of work — reading a ref that says where origin USED to be as evidence
+    # about where it is now.
+    #
+    # The branch here is pushed, fetched (so the tracking ref exists locally),
+    # then deleted from origin, and the work never landed. Every copy is in this
+    # directory.
     make_world
-    git_c checkout --quiet -b polecat/gp-pub origin/main
-    echo "pushed but unmerged" >"$REPO/pub.txt"
-    commit_all "feat: pushed and never merged (gp-pub)"
-    push_branch polecat/gp-pub
+    git_c checkout --quiet -b polecat/gp-gone origin/main
+    echo "the only copy" >"$REPO/gone.txt"
+    commit_all "feat: pushed, then unpushed (gp-gone)"
+    push_branch polecat/gp-gone
+    git_c fetch --quiet origin
+    # Deleted ON ORIGIN rather than via `push --delete`, which would prune this
+    # clone's tracking ref as a side effect and leave nothing stale to be fooled
+    # by. Another machine's cleanup is what actually produces this state.
+    git -C "$ORIGIN" update-ref -d refs/heads/polecat/gp-gone
     git_c checkout --quiet main
 
     local wt
-    wt=$(add_tree agentA gp-pub polecat/gp-pub)
-    bead gp-pub closed "$(long_ago)"
+    wt=$(add_tree agentA gp-gone polecat/gp-gone)
+
+    # The premise that makes this a test and not a tautology: the stale tracking
+    # ref really is still here, pointing at the tree's work.
+    [ "$(git_c rev-parse refs/remotes/origin/polecat/gp-gone 2>/dev/null)" \
+      = "$(git -C "$wt" rev-parse HEAD)" ] ||
+        fail "fixture is wrong: the stale remote-tracking ref must survive the delete"
+    [ -z "$(git_c ls-remote origin refs/heads/polecat/gp-gone)" ] ||
+        fail "fixture is wrong: origin must no longer carry the branch"
+
+    bead gp-gone closed "$(long_ago)"
     run_reap --reap
 
-    [ "$(verdict_of gp-pub)" = "keep-unmerged" ] ||
-        fail "publication without a recall must not clear a tree; got '$(verdict_of gp-pub)'"
-    [ -d "$wt" ] || fail "a tree was reaped on publication alone"
-}
-
-test_refusal_never_calls_published_work_unpublished() {
-    # THE wording defect, as distinct from the leak it hid. ml-94dh's row ended
-    # "work looks genuinely unpublished" while origin carried the branch at the
-    # identical sha. That is the sentence an operator reads when deciding
-    # whether removing a tree is safe, so it was wrong in the REASSURING
-    # direction — and the identical wording would understate the risk on a tree
-    # that really was the only copy. The reaper was measuring reachability from
-    # the TARGET and reporting it as publication.
-    make_world
-    git_c checkout --quiet -b polecat/gp-said origin/main
-    echo "published" >"$REPO/said.txt"
-    commit_all "chore: shared cleanup"      # anchorless, so C6b declines first
-    push_branch polecat/gp-said
-    git_c checkout --quiet main
-
-    local wt
-    wt=$(add_tree agentA gp-said polecat/gp-said)
-    bead gp-said closed "$(long_ago)"
-    run_reap
-
-    [ "$(verdict_of gp-said)" = "keep-unmerged" ] ||
-        fail "precondition: this tree must be kept; got '$(verdict_of gp-said)'"
-    ! grep -Fq 'genuinely unpublished' <<<"$OUT" ||
-        fail "the row calls published work unpublished — the gp-qmd defect; got: $OUT"
-    ! grep -Fq 'only copy' <<<"$OUT" ||
-        fail "the row claims the tree is the only copy while origin carries it; got: $OUT"
-    grep -Fq 'published: origin/polecat/gp-said' <<<"$OUT" ||
-        fail "the row must report the MEASURED publication state; got: $OUT"
+    [ "$(verdict_of gp-gone)" = "keep-unmerged" ] ||
+        fail "a deleted origin branch must not publish a tree; got '$(verdict_of gp-gone)'"
+    [ -d "$wt" ] || fail "a tree was reaped on a stale remote-tracking ref"
+    [ -f "$wt/gone.txt" ] || fail "the only copy of the unlanded work is gone"
+    grep -Fq 'only copy' <<<"$OUT" ||
+        fail "the row must say this tree may hold the only copy; got: $OUT"
 }
 
 test_publication_requires_origin_to_contain_head() {
@@ -822,15 +913,25 @@ test_publication_requires_origin_to_contain_head() {
     git -C "$wt" commit --quiet -m "feat: the unpushed part (gp-ahead)"
 
     bead gp-ahead closed "$(long_ago)"
-    set_meta_json gp-ahead do_not_merge true
     run_reap --reap
 
     [ "$(verdict_of gp-ahead)" = "keep-unmerged" ] ||
         fail "a tree ahead of its published tip must be kept; got '$(verdict_of gp-ahead)'"
-    [ -d "$wt" ] || fail "a recalled tree was reaped holding commits found nowhere else"
+    [ -d "$wt" ] || fail "a tree holding commits found nowhere else was reaped"
     [ -f "$wt/unpushed.txt" ] || fail "the only copy of the unpushed commit is gone"
     grep -Fq 'does NOT contain this tree' <<<"$OUT" ||
         fail "the row must say origin does not carry this HEAD; got: $OUT"
+
+    # The gp-qmd wording defect, pinned on the refusals that outlived it. The row
+    # used to end "work looks genuinely unpublished" — a claim about ORIGIN
+    # inferred from a walk of the TARGET, and the sentence an operator reads when
+    # deciding whether removing a tree is safe. Every refusal must report what it
+    # MEASURED against origin instead, including a partial publication like this
+    # one, where saying either "published" or "unpublished" would mislead.
+    ! grep -Fq 'genuinely unpublished' <<<"$OUT" ||
+        fail "the row asserts publication it did not measure — the gp-qmd defect; got: $OUT"
+    grep -Fq "origin/polecat/gp-ahead is at" <<<"$OUT" ||
+        fail "the row must report the MEASURED publication state; got: $OUT"
 }
 
 test_publication_binds_to_the_exact_ref_not_a_pattern_match() {
@@ -861,7 +962,6 @@ test_publication_binds_to_the_exact_ref_not_a_pattern_match() {
         fail "fixture is wrong: the decoy must be the first ref the pattern returns"
 
     bead gp-decoy closed "$(long_ago)"
-    set_meta_json gp-decoy do_not_merge true
     run_reap --reap
 
     [ "$(verdict_of gp-decoy)" = "keep-unmerged" ] ||
@@ -876,36 +976,40 @@ test_recall_flags_are_read_in_both_json_spellings() {
     # Production writes real JSON booleans (ml-94dh: `"do_not_merge":true`),
     # while a hand stamp or a tool round-trip can yield the string "true". A
     # reader matching one spelling passes every test written the same way and
-    # does nothing at all live. The `"false"` cases are the sharper hazard: a
-    # jq truthiness test would read the non-empty string "false" as a recall.
+    # does nothing at all live. The `"false"` cases are the sharper hazard: a jq
+    # truthiness test reads the non-empty string "false" as a recall.
+    #
+    # Since gp-98n this decides a ROW, not a verdict — which makes it easier to
+    # break unnoticed, not harder, because a regression changes nothing an
+    # operator greps for. The tree below is kept either way: unpublished, so the
+    # only question is whether its refusal says a human must dispose of it or
+    # leaves it reading as a merge still pending, forever.
     make_world
     git_c checkout --quiet -b polecat/gp-spell origin/main
     echo "spelled" >"$REPO/spell.txt"
     commit_all "feat: recalled work (gp-spell)"
-    push_branch polecat/gp-spell
     git_c checkout --quiet main
     add_tree agentA gp-spell polecat/gp-spell >/dev/null
     bead gp-spell closed "$(long_ago)"
 
-    set_meta_json gp-spell recalled_by_owner true
-    run_reap
-    [ "$(verdict_of gp-spell)" = "reap" ] ||
-        fail "recalled_by_owner as a JSON boolean must authorise; got '$(verdict_of gp-spell)'"
+    local spelling
+    for spelling in true '"true"'; do
+        set_meta_json gp-spell recalled_by_owner "$spelling"
+        run_reap
+        [ "$(verdict_of gp-spell)" = "keep-unmerged" ] ||
+            fail "an unpublished tree must be kept whatever the flag says; got '$(verdict_of gp-spell)'"
+        grep -Fq 'operator disposition needed' <<<"$OUT" ||
+            fail "recalled_by_owner=$spelling must be read as a recall; got: $OUT"
+    done
 
-    set_meta_json gp-spell recalled_by_owner '"true"'
-    run_reap
-    [ "$(verdict_of gp-spell)" = "reap" ] ||
-        fail "recalled_by_owner as the string \"true\" must authorise; got '$(verdict_of gp-spell)'"
-
-    set_meta_json gp-spell recalled_by_owner false
-    run_reap
-    [ "$(verdict_of gp-spell)" = "keep-unmerged" ] ||
-        fail "recalled_by_owner=false must not authorise; got '$(verdict_of gp-spell)'"
-
-    set_meta_json gp-spell recalled_by_owner '"false"'
-    run_reap
-    [ "$(verdict_of gp-spell)" = "keep-unmerged" ] ||
-        fail "recalled_by_owner=\"false\" must not authorise a reap; got '$(verdict_of gp-spell)'"
+    for spelling in false '"false"'; do
+        set_meta_json gp-spell recalled_by_owner "$spelling"
+        run_reap
+        [ "$(verdict_of gp-spell)" = "keep-unmerged" ] ||
+            fail "the verdict must not move with the flag; got '$(verdict_of gp-spell)'"
+        ! grep -Fq 'operator disposition needed' <<<"$OUT" ||
+            fail "recalled_by_owner=$spelling must NOT be read as a recall; got: $OUT"
+    done
 }
 
 # --- Refusals: work that must survive --------------------------------------

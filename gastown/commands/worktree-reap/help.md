@@ -52,12 +52,12 @@ summary on stderr:
                  nowhere else in the world. Reported for a human, never reaped —
                  see "Why a kept tree still gets graded" below.
   keep-unmerged  commits whose PATCHES are not on the target ref, AND which
-                 neither the subject reconciliation nor the recall exit below
-                 cleared. The detail column names which signal declined and
-                 reports the MEASURED publication state, so a tree that really
-                 is the only copy reads differently both from one whose patch
-                 was merely adjusted on the way in and from one whose work is
-                 sitting safely on origin.
+                 neither the subject reconciliation nor the publication exit
+                 below cleared. The detail column names which signal declined
+                 and reports the MEASURED publication state, so a tree that
+                 really is the only copy reads differently both from one whose
+                 patch was merely adjusted on the way in and from one whose
+                 publication simply could not be measured.
   keep-locked    the worktree is locked.
   keep-self      the reaper is running inside this tree.
   unverifiable   the tree was NOT measured — unreadable bead, a basename that
@@ -114,33 +114,42 @@ transport reasons rather than a missing ref — keeps the tree.
 
 Why "not merged" is not the end of it: both checks above ask whether the work
 reached the TARGET, which is a proxy for the question reaping actually turns on
-— is this directory still the only copy? For a bead closed with `do_not_merge`
-or `recalled_by_owner` the proxy can NEVER be satisfied: the work is not going
-to the target by design, so `git cherry` reports `+` on every cycle forever and
-no merge attestation is ever coming. The tree leaks permanently with no owner.
-Measured on meety-local (2026-08-03), ml-94dh: closed 2026-07-31, recalled,
-clean, `git cherry origin/main HEAD` = `+ a6ec0cb` — and `ls-remote origin
-polecat/ml-94dh` = a6ec0cb, the identical sha. The work was never at risk.
+— is this directory still the only copy? Whenever the work is never going to
+the target, the proxy can NEVER be satisfied: `git cherry` reports `+` on every
+cycle forever and no merge attestation is ever coming, so the tree leaks
+permanently with no owner. Measured on meety-local (2026-08-04): ml-94dh, 50M,
+closed with `gc.work_outcome=no-op`, and ml-apes, 55M, closed with
+`gc.work_outcome=abandoned` — both clean, both refused every cycle, and both
+sitting on origin at the identical sha under their own branches. 105M of
+provably-redundant disk.
 
-Such a tree is collected only on BOTH facts together, because each fails in the
-opposite direction alone. PUBLICATION is the measurement: a LIVE `ls-remote` of
-the bead's own `metadata.branch` — never a remote-tracking ref, which can be
-stale — whose tip must CONTAIN this tree's HEAD. RECALL is the authorisation.
-Publication alone would clear any closed bead's tree the moment its branch was
-pushed, but `origin/polecat/*` is a transient handoff artifact that the
-refinery's own cleanup deletes after a merge, so reaping against it would race
-another component's collector on work that never reached a protected ref. Recall
-alone would delete the only copy of a recalled bead whose branch was never
-pushed — "do not merge" is not "destroy". Their intersection is precisely the
-class with no applicable predicate: a bead the refinery will never merge is one
-whose branch that cleanup will never delete, which is what makes origin durable
-here and not in general. Such a reap is reported with weaker evidence that says
-the tree is REDUNDANT rather than implying the work landed.
+Such a tree is collected on PUBLICATION alone: a LIVE `ls-remote` of the bead's
+own `metadata.branch` — never a remote-tracking ref, which can be stale — whose
+tip must CONTAIN this tree's HEAD, read from the EXACT ref rather than a pattern
+match. Nothing about the bead's disposition is consulted. That is deliberate:
+this exit first shipped requiring a `do_not_merge` / `recalled_by_owner` flag as
+well, and ml-apes carries neither, so 55M stayed parked behind a veto while its
+work sat safely on origin. Enumerating the dispositions that mean "this will
+never merge" is a losing game — each new spelling reopens the leak silently —
+and redundancy is measurable without asking why.
 
-A recalled tree that is NOT published stays kept — correctly, it is the only
-copy — and its row says the bead can never merge and no predicate can ever
-collect it, so an operator can dispose of it rather than reading the refusal as
-a merge still pending.
+The objection that argued for the flag was that `origin/polecat/*` is a
+transient handoff artifact the refinery's own cleanup deletes. It does — AFTER
+merging, so what it deletes is a branch whose content is on the target, a
+protected ref. A sweep that deleted UNMERGED branches would be a different
+matter, and that is a sequencing constraint on such a sweep rather than
+something this command can assert.
+
+Such a reap is reported with weaker evidence that says the tree is REDUNDANT
+rather than implying the work landed: what it guarantees is that the directory
+can be rebuilt with `git fetch` + `git worktree add`.
+
+Every refusal direction is unchanged. A branch absent from origin, a tip that
+does not contain this HEAD, a decoy ref, an `ls-remote` that failed — each means
+the tree may hold the only copy, and each keeps it. A tree that is NOT published
+stays kept, and when its bead does carry a recall flag the row says so: the bead
+can never merge and no predicate can ever collect this tree, so an operator can
+dispose of it rather than reading the refusal as a merge still pending.
 
 Why agent liveness is never an input: "this agent has no session, so its
 workspace is garbage" is wrong in both directions, both observed live. A
@@ -160,10 +169,10 @@ using the bead's own `closed_at` rather than an inference about the agent.
 
 Two checks carry the safety argument — `git status --porcelain` is empty, and
 the work demonstrably survives the tree's removal: on the target by patch-id or
-by the subject reconciliation, or on origin under the bead's own branch when
-that bead will never be merged. Together they mean reaping cannot lose work. The
-rest answer a different question, "is anyone still using it", and exist to
-protect in-flight work that merely looks finished.
+by the subject reconciliation, or on origin under the bead's own branch. Together
+they mean reaping cannot lose work. The rest answer a different question, "is
+anyone still using it", and exist to protect in-flight work that merely looks
+finished.
 
 Every refusal reports the publication state it MEASURED. It is the sentence an
 operator reads when deciding whether removing a tree is safe, so it is never
