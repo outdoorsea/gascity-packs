@@ -216,9 +216,14 @@ SIGNALS=""
 HEAVY=0
 
 if [ "$TOKENS_USABLE" -eq 1 ]; then
-  STALE=0
-  if [ "$TOKEN_AGE" != "-" ] && [ "$TOKEN_AGE" -gt "$TOKENS_MAX_AGE" ]; then
-    STALE=1
+  # An age we could not compute counts as STALE, not as fresh. A row whose `at`
+  # is missing or unparseable says nothing about when it was written, and
+  # resolving that unknown to "recent" — thereby granting health — is the
+  # reassuring-answer reflex this command exists to remove. Default to stale and
+  # let only a positively-measured age clear it.
+  STALE=1
+  if [ "$TOKEN_AGE" != "-" ] && [ "$TOKEN_AGE" -le "$TOKENS_MAX_AGE" ]; then
+    STALE=0
   fi
   if [ "$TOKENS" -ge "$LIMIT_TOKENS" ]; then
     # Over the limit counts whether fresh or stale: between compactions context

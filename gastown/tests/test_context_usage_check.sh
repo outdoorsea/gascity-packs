@@ -258,6 +258,25 @@ test_stale_tokens_fall_back_to_rss() {
     [ "$(code_of "$r")" = "0" ] || fail "rss under limit should exit 0, got $(code_of "$r")"
 }
 
+# An age that cannot be computed must resolve to stale, not fresh. Defaulting
+# an unknown to "recent" would grant health on a reading whose currency was
+# never established.
+test_unknown_age_counts_as_stale() {
+    : >"$PS_TABLE"
+    : >"$SINK"
+    printf '{"kind":"model","session_id":"tok8","input_tokens":0,"cache_read_tokens":100000,"cache_creation_tokens":0}\n' >>"$SINK"
+
+    local r
+    r=$(run_check GC_SESSION_NAME= GC_SESSION_ID=tok8)
+    [ "$(field "$r" 4)" = "-" ] || fail "an unparseable age should render '-', got '$(field "$r" 4)'"
+    [ "$(code_of "$r")" = "2" ] || fail "an unknown age must not grant health, got exit $(code_of "$r")"
+
+    # ...but it is still a reading, so an unknown-age value OVER the limit trips
+    # for the same reason a stale one does.
+    r=$(run_check GC_SESSION_NAME= GC_SESSION_ID=tok8 GASTOWN_CONTEXT_LIMIT_TOKENS=50000)
+    [ "$(code_of "$r")" = "1" ] || fail "unknown-age over-limit must still trip, got exit $(code_of "$r")"
+}
+
 test_both_signals_reported() {
     printf '100 1 532480\n' >"$PS_TABLE"
     : >"$SINK"
@@ -370,6 +389,7 @@ test_empty_selector_matches_nothing
 test_stale_over_limit_still_trips
 test_stale_under_limit_is_discarded
 test_stale_tokens_fall_back_to_rss
+test_unknown_age_counts_as_stale
 test_both_signals_reported
 test_unmeasured_is_not_ok
 test_missing_pane_is_unmeasured
@@ -379,4 +399,4 @@ test_formulas_dropped_the_inert_snippet
 test_patrols_wire_restart_to_exit_1
 test_command_is_dispatchable
 
-echo "PASS: context-usage-check (20 checks)"
+echo "PASS: context-usage-check (21 checks)"
