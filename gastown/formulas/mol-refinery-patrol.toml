@@ -141,9 +141,31 @@ needs = ["validate-identity"]
 description = """
 **1. Context check (FIRST — before any work):**
 
-If context feels heavy (multi-hour session, large recent diffs, or you notice
-yourself taking shortcuts or summarizing prematurely), pour and assign the next
-wisp, burn the current wisp, then request a restart:
+Measure before you judge:
+```bash
+gc gastown context-usage
+CONTEXT_STATUS=$?
+```
+
+Exit 1 means your context is measurably heavy — restart. Exit 0 means measured
+headroom. Exit 2 means the check could not measure: say so and carry on. Exit 2
+is not a clean bill of health, and it is deliberately not a restart, because a
+city with metering off and no tmux is permanently unmeasurable and would
+restart-loop on every patrol.
+
+The check trips on either of two independent signals: the prompt-side token
+count of your newest model call in the city's usage sink, and the RSS of the
+tmux pane process that actually holds your conversation. Do NOT hand-roll this
+from `ps -o rss= -p $$` — `$$` is the shell the harness forks per tool call,
+not the runtime, so it reads ~2 MB however deep the conversation is. The
+witness and deacon patrols carried exactly that snippet against a 1500 MB gate;
+it could not fire at any context depth, and the step reported CLEAN forever
+(gp-ay9).
+
+If `CONTEXT_STATUS` is 1 — or context feels heavy (multi-hour session, large
+recent diffs, or you notice yourself taking shortcuts or summarizing
+prematurely) — pour and assign the next wisp, burn the current wisp, then
+request a restart:
 ```bash
 CURRENT_WISP=$(gc gastown wisp-reconcile current) || {
   echo "Could not resolve the current wisp; not pouring and not burning."

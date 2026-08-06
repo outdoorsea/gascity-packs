@@ -89,18 +89,33 @@ title = "Context check, then mail"
 description = """
 **1. Context check (FIRST — before any work):**
 ```bash
-RSS=$(ps -o rss= -p $$ | tr -d ' ')
-RSS_MB=$((RSS / 1024))
+gc gastown context-usage
+case $? in
+  1) gc runtime request-restart ;;
+  2) echo "CONTEXT: UNMEASURED — context pressure was not evaluated. Not health; continuing." ;;
+esac
 ```
 
-If RSS > 1500 MB or context feels heavy, request a restart:
-```bash
-gc runtime request-restart
-```
-This sets `GC_RESTART_REQUESTED` metadata on the session and blocks
-forever. The controller will kill and restart the session on the next
-reconcile tick. The current wisp stays assigned and the new session
-the new session re-reads formula steps and resumes from context.
+The check measures two independent signals and trips on either: the
+prompt-side token count of your newest model call in the city's usage sink,
+and the RSS of the tmux pane process that actually holds your conversation.
+
+Do NOT hand-roll this from `ps -o rss= -p $$`. `$$` is the shell the harness
+forks per tool call, not the runtime — it reads ~2 MB however deep the
+conversation is, so the 1500 MB gate that used to sit here could not fire at
+any context depth and this step reported CLEAN forever (gp-ay9). Pointing that
+threshold at the right process is not enough either: the live fleet runs
+267-547 MB, so 1500 MB is unreachable even when measured correctly.
+
+Exit 1 means restart. `gc runtime request-restart` sets `GC_RESTART_REQUESTED`
+metadata on the session and blocks forever. The controller will kill and
+restart the session on the next reconcile tick. The current wisp stays
+assigned and the new session re-reads formula steps and resumes from context.
+
+Exit 2 means the check could not measure — say so and carry on. It is not a
+clean bill of health, and it is deliberately NOT a restart: a city with
+metering off and no tmux is permanently unmeasurable, and restarting on exit 2
+would put every patrol into a restart loop.
 
 **2. Check mail:**
 ```bash
