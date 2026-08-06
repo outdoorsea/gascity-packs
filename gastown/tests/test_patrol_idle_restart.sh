@@ -45,6 +45,17 @@
 #   5. The `IDLE: no work, exiting turn.` literal survives for the configured
 #      branch -- test_parked_session_check.sh uses that exact pane shape to
 #      represent a healthy idle witness.
+#   6. For patrols marked `yes` in the PATROLS table: a duration-shaped value is
+#      only honoured when gc ATTRIBUTED it to a config layer and the session may
+#      sleep. gp-s41 is why. The refinery carried a well-formed `300s` and the
+#      step reported a kept promise on the strength of its shape alone; the
+#      value's shape says what somebody typed, never whether anything stands
+#      behind it. gc answers that directly in `sleep_policy_source` (`agent`,
+#      `rig`, `city`, `template` -- versus `legacy_off`/`default`, which are its
+#      own fallbacks) and in `sleep_capability`. The step had ignored both while
+#      publishing a homegrown "source" of its own whose values described the
+#      READ, not the config -- which is how gp-s41 came to be filed against a
+#      root cause that measurement does not support.
 #
 # One discipline runs through all of it: assertions about what a step DOES are
 # made against its FENCED CODE BLOCKS, never against the description. A formula
@@ -57,7 +68,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
-# label | formula basename | step id owning the idle exit
+# label | formula basename | step id owning the idle exit | attribution contract
 #
 # The step differs by role and that is not incidental. The witness and the deacon
 # idle out of `next-iteration`, after pouring a successor and burning the current
@@ -65,10 +76,18 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # -- the still-open wisp is its wake signal -- and whose `next-iteration` never
 # idles at all, because it burns and re-reads within the same session. Pin the
 # step per patrol rather than guessing a common name.
+#
+# The fourth field is whether the patrol is held to the ATTRIBUTION contract:
+# that a duration-shaped value only takes the quiet IDLE path when gc actually
+# attributed it to a config layer and the session may sleep. The refinery reads
+# it (gp-s41); the witness and deacon still classify on the value's shape alone.
+# It is declared here rather than detected from the classifier so that deleting
+# the guard FAILS instead of quietly opting the patrol out -- and flipping a row
+# to `yes` is the whole diff needed to hold the next patrol to it.
 PATROLS=(
-    "witness|mol-witness-patrol|next-iteration"
-    "deacon|mol-deacon-patrol|next-iteration"
-    "refinery|mol-refinery-patrol|find-work"
+    "witness|mol-witness-patrol|next-iteration|no"
+    "deacon|mol-deacon-patrol|next-iteration|no"
+    "refinery|mol-refinery-patrol|find-work|yes"
 )
 
 fail() {
@@ -226,11 +245,20 @@ test_idle_literal_survives_for_the_configured_branch() {
 }
 
 # Run the EXTRACTED decision logic over a table of policy values.
+#
+# Source and capability default to a CONFIGURED, CAPABLE session -- `agent` is
+# what gc reports for a policy set in an agent.toml, and `full` is what every
+# session in a healthy city reports. Defaulting them this way keeps the value
+# table below testing exactly what it always tested: given a real policy behind
+# it, does the VALUE alone select the right branch. A patrol whose classifier
+# does not read these two is unaffected, since it never references them.
 decide() {
-    local policy="$1"
+    local policy="$1" policy_source="${2-agent}" capability="${3-full}"
     (
         set +u
         SLEEP_POLICY="$policy"
+        SLEEP_SOURCE="$policy_source"
+        SLEEP_CAPABILITY="$capability"
         # shellcheck disable=SC1090
         . "$DECIDE"
         printf '%s' "$NEEDS_RESTART"
@@ -279,6 +307,65 @@ test_decision_is_not_the_inverted_spelling() {
     fi
 }
 
+test_defaulted_policy_does_not_pass_as_configured() {
+    # Opt-in is declared in the PATROLS table, NOT sniffed out of the classifier.
+    # The obvious spelling -- `grep -q SLEEP_SOURCE "$DECIDE" || return 0` -- is
+    # self-disabling: deleting the guard also deletes the token the opt-in looks
+    # for, so the test skips itself and the mutation that removes the contract
+    # passes. Verified by mutation, not by reading. Keying on the table means
+    # dropping the guard from a patrol marked `yes` fails, which is the point.
+    if [ "$ATTRIBUTION" != "yes" ]; then
+        # Keep the table honest in the other direction too: a patrol that gains
+        # the guard without flipping its row would silently go unguarded.
+        if grep -q 'SLEEP_SOURCE' "$DECIDE"; then
+            fail "[$LABEL] classifier reads SLEEP_SOURCE but its PATROLS row says attribution=no; flip the row so this contract is actually enforced"
+        fi
+        return 0
+    fi
+
+    grep -q 'SLEEP_SOURCE' "$DECIDE" \
+        || fail "[$LABEL] PATROLS row claims attribution=yes but the classifier never reads SLEEP_SOURCE; the value's shape alone is back to deciding (gp-s41)"
+
+    # A duration-shaped value is a WISH. gp-s41 was filed because the refinery
+    # carried a well-formed `300s` and the step reported it as a kept promise on
+    # the strength of its shape alone. `legacy_off` is gc's no-config fallback
+    # and `default` its built-in: both can sit beside a duration, and neither
+    # means anyone configured one.
+    local unbacked=(
+        ""            # resolver did not say
+        "legacy_off"  # gc's no-config fallback
+        "legacy_new"  # any future legacy_* fallback
+        "default"     # gc's built-in default -- backed by nobody
+    )
+    local v got
+    for v in "${unbacked[@]}"; do
+        got=$(decide "300s" "$v")
+        [ "$got" = "1" ] \
+            || fail "[$LABEL] a duration policy attributed to '${v:-<none>}' took the quiet IDLE path (needs_restart=$got); an unattributed value is a default, not a promise (gp-s41)"
+    done
+
+    # The mirror case matters just as much: a policy a config layer really did
+    # set must still be left alone, or this degenerates into an unconditional
+    # restart and the refinery can never stay up between merges.
+    local backed=("agent" "rig" "city" "template")
+    for v in "${backed[@]}"; do
+        got=$(decide "300s" "$v")
+        [ "$got" = "0" ] \
+            || fail "[$LABEL] a duration policy configured by '$v' forced a restart (needs_restart=$got); a real policy must be left to do its job"
+    done
+
+    # Attribution is necessary, not sufficient: a session that may not sleep
+    # will not be restarted by a policy however well attributed it is.
+    for v in "" "none" "disabled" "partial"; do
+        got=$(decide "300s" "agent" "$v")
+        [ "$got" = "1" ] \
+            || fail "[$LABEL] capability '${v:-<none>}' still took the quiet IDLE path (needs_restart=$got); only a session that can sleep may rely on a sleep policy"
+    done
+    got=$(decide "300s" "agent" "full")
+    [ "$got" = "0" ] \
+        || fail "[$LABEL] capability 'full' with a configured duration forced a restart (needs_restart=$got)"
+}
+
 test_read_is_guarded_on_session_id() {
     # An unset GC_SESSION_ID under `set -u` would abort the step mid-cycle,
     # after the successor wisp was poured and this one burned.
@@ -290,7 +377,11 @@ test_read_is_guarded_on_session_id() {
 # listed here without one fails at extraction, which is the correct outcome:
 # the table is the claim that this patrol has an idle exit to guard.
 for entry in "${PATROLS[@]}"; do
-    IFS='|' read -r LABEL FORMULA STEP_ID <<<"$entry"
+    IFS='|' read -r LABEL FORMULA STEP_ID ATTRIBUTION <<<"$entry"
+    case "$ATTRIBUTION" in
+        yes|no) ;;
+        *) fail "[$LABEL] PATROLS row has attribution='$ATTRIBUTION'; must be yes or no" ;;
+    esac
     FORMULA_PATH="$ROOT/gastown/formulas/$FORMULA.toml"
     [ -f "$FORMULA_PATH" ] || fail "[$LABEL] formula not found: $FORMULA_PATH"
 
@@ -313,6 +404,7 @@ for entry in "${PATROLS[@]}"; do
     test_idle_literal_survives_for_the_configured_branch
     test_decision_is_failsafe
     test_decision_is_not_the_inverted_spelling
+    test_defaulted_policy_does_not_pass_as_configured
     test_read_is_guarded_on_session_id
 
     echo "  ok: $LABEL ($FORMULA:$STEP_ID)"

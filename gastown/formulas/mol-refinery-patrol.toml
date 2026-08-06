@@ -852,10 +852,16 @@ refinery-specific number before believing it; the whole point of this defect is
 that it produces no signal anyone would go looking for.
 
 The reconciler mirrors the resolved policy onto your own session bead, so the
-answer is readable. Take it from there, not from this file:
+answer is readable. Take it from there, not from this file.
+
+Read three fields, not one. The resolver publishes the VALUE, its ATTRIBUTION,
+and whether this session may sleep at all; the value alone cannot distinguish a
+policy someone configured from one gc is merely defaulting to:
 
 ```bash
 SLEEP_POLICY=""
+SLEEP_SOURCE=""
+SLEEP_CAPABILITY=""
 # Why this is not `gc bd show ... 2>/dev/null | jq ...`: that spelling discards
 # the one line that says WHY, and `$?` after it belongs to jq rather than gc, so
 # a crashed `gc bd` arrives as a clean empty policy. The restart test below
@@ -863,7 +869,17 @@ SLEEP_POLICY=""
 # but "the ledger did not answer" and "no policy is configured" are different
 # facts about the city, and the echo below is the only place either is ever
 # reported. Reporting them as one is how the next stall gets misattributed.
-SLEEP_POLICY_SOURCE="no session id in env"
+#
+# SLEEP_READ_STATUS reports only whether the READ worked. It is deliberately not
+# called a "source": this step used to build a homegrown source string whose
+# values were things like "session bead", which answers "where did I read it
+# from" while looking exactly like an answer to "who configured it". A witness
+# investigating a suspected stall read that diagnostic, went looking for the
+# provenance it implied, guessed a field name that does not exist, got null, and
+# filed gp-s41 concluding the refinery's 300s was an unbacked default. It is not
+# — gc attributes it to `agent`, from gastown/agents/refinery/agent.toml. The
+# real attribution is one jq path away in JSON this step already has in hand.
+SLEEP_READ_STATUS="no session id in env"
 if [ -n "${GC_SESSION_ID:-}" ]; then
   SP_ERR_FILE=$(mktemp)
   SP_JSON=$(gc bd show "$GC_SESSION_ID" --json 2>"$SP_ERR_FILE")
@@ -871,27 +887,53 @@ if [ -n "${GC_SESSION_ID:-}" ]; then
   SP_ERR=$(sed -n '1p' "$SP_ERR_FILE")
   rm -f "$SP_ERR_FILE"
   if [ "$SP_CODE" -ne 0 ]; then
-    SLEEP_POLICY_SOURCE="UNMEASURED: gc bd exited $SP_CODE: ${SP_ERR:-no stderr}"
+    SLEEP_READ_STATUS="UNMEASURED: gc bd exited $SP_CODE: ${SP_ERR:-no stderr}"
   else
     SLEEP_POLICY=$(printf '%s' "$SP_JSON" | jq -r '.[0].metadata.effective_sleep_after_idle // empty')
+    SLEEP_SOURCE=$(printf '%s' "$SP_JSON" | jq -r '.[0].metadata.sleep_policy_source // empty')
+    SLEEP_CAPABILITY=$(printf '%s' "$SP_JSON" | jq -r '.[0].metadata.sleep_capability // empty')
     if [ -n "$SLEEP_POLICY" ]; then
-      SLEEP_POLICY_SOURCE="session bead"
+      SLEEP_READ_STATUS="measured"
     else
-      SLEEP_POLICY_SOURCE="measured, but the session bead carries no effective_sleep_after_idle"
+      SLEEP_READ_STATUS="measured, but the session bead carries no effective_sleep_after_idle"
     fi
   fi
 fi
-NEEDS_RESTART=1
-case "$SLEEP_POLICY" in [0-9]*[nusmh]) NEEDS_RESTART=0 ;; esac
-echo "effective_sleep_after_idle=${SLEEP_POLICY:-<none>} source=$SLEEP_POLICY_SOURCE needs_restart=$NEEDS_RESTART"
 ```
 
-The test is POSITIVE — restart unless the value is duration-SHAPED (starts with
-a digit, ends in a duration unit). Do not invert it into "restart only when the
-value is `off` or empty". The two differ exactly on a malformed or unrecognized
-value, and that is the case that must select the restart: a policy string this
-step cannot parse is a policy it cannot rely on, and treating it as configured
-resurrects the silent stall in a form no measurement would attribute to it.
+Then classify. This block is pure computation over the three values above —
+keep it that way, because the test battery extracts it verbatim and sources it:
+
+```bash
+NEEDS_RESTART=1
+case "$SLEEP_POLICY" in [0-9]*[nusmh]) NEEDS_RESTART=0 ;; esac
+case "$SLEEP_SOURCE" in ''|legacy_*|default) NEEDS_RESTART=1 ;; esac
+[ "$SLEEP_CAPABILITY" = "full" ] || NEEDS_RESTART=1
+echo "effective_sleep_after_idle=${SLEEP_POLICY:-<none>} source=${SLEEP_SOURCE:-<none>} capability=${SLEEP_CAPABILITY:-<none>} read=$SLEEP_READ_STATUS needs_restart=$NEEDS_RESTART"
+```
+
+The value test is POSITIVE — restart unless the value is duration-SHAPED (starts
+with a digit, ends in a duration unit). Do not invert it into "restart only when
+the value is `off` or empty". The two differ exactly on a malformed or
+unrecognized value, and that is the case that must select the restart: a policy
+string this step cannot parse is a policy it cannot rely on, and treating it as
+configured resurrects the silent stall in a form no measurement would attribute
+to it.
+
+The two tests after it exist because a duration-shaped value is a WISH, not a
+promise. Shape tells you what somebody typed; only the resolver's own
+attribution tells you whether anything stands behind it:
+
+- **`sleep_policy_source`** — `legacy_off` is gc's no-config fallback and
+  `default` is its built-in, so neither is a configured policy no matter how
+  well-formed the value beside it looks. `agent`, `rig`, `city` and `template`
+  name a real config layer. Empty means gc did not say, which is not a promise
+  either. This is the check gp-s41 asked for, against the field that exists:
+  distrust the DEFAULTED value rather than the duration-shaped one.
+- **`sleep_capability`** — a session that may not sleep will not be restarted by
+  any policy, however well attributed. Anything other than `full` fails toward
+  the restart, per the doctrine below; every session in this city reads `full`,
+  so this is verified as a no-op today rather than assumed to be one.
 
 **Policy configured** — `NEEDS_RESTART=0`. The promise holds. Write exactly:
 ```
